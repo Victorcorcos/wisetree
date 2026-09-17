@@ -54,12 +54,11 @@ use crate::services::split::{
     parse_split_run, patch_for_units, provisional_split_title, render_materialization,
     render_publication, render_split_drafting, render_split_plan, split_branch_name, split_chains,
     split_draft_cache_path, split_draft_job_id, split_publication_bases,
-    split_reuses_source_branch, validate_manifest as validate_split_manifest,
-    validate_split_publication, SplitDraftJobStatus, SplitDraftProgress, SplitDraftRecord,
-    SplitDraftingRecord, SplitIdentity, SplitMaterialization, SplitMaterializedLayer, SplitPlan,
-    SplitPlanResult, SplitPreflight, SplitPreflightRequest, SplitPublication,
-    SplitPublishedPullRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY, SPLIT_DRAFT_DIRECTORY,
-    SPLIT_PLAN_ARCHIVE_PREFIX, SPLIT_PLAN_FILE,
+    validate_manifest as validate_split_manifest, validate_split_publication, SplitDraftJobStatus,
+    SplitDraftProgress, SplitDraftRecord, SplitDraftingRecord, SplitIdentity, SplitMaterialization,
+    SplitMaterializedLayer, SplitPlan, SplitPlanResult, SplitPreflight, SplitPreflightRequest,
+    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot, SPLIT_DIRECTORY,
+    SPLIT_DRAFT_DIRECTORY, SPLIT_PLAN_ARCHIVE_PREFIX, SPLIT_PLAN_FILE,
 };
 use crate::services::{AiCommand, AiPermission, AiRunMode, AiRunRequest, AiRunner};
 use crate::worktree::WorktreeService;
@@ -5715,22 +5714,12 @@ impl DashboardService {
                 ))
             })?;
         if let Some(metadata) = &pr_metadata {
-            let resumed_unpublished_top = persisted_materialization
-                .as_ref()
-                .and_then(|materialization| materialization.layers.last())
-                .is_some_and(|layer| {
-                    layer.branch == source_branch && layer.commit_sha == source_head
-                })
-                && persisted_run
-                    .as_ref()
-                    .is_some_and(|record| metadata.head_ref_oid == record.identity.source_head);
             if metadata.state != "OPEN" {
                 return Err(WisetreeError::validation(
                     "The source pull request is no longer open; refresh the dashboard before planning.",
                 ));
             }
             if metadata.head_ref_oid != source_head
-                && !resumed_unpublished_top
                 && run_command(
                     &self.git_binary,
                     &[
@@ -5840,16 +5829,7 @@ impl DashboardService {
                 .next()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0);
-            let expected_unpublished_rewrite = persisted_materialization
-                .as_ref()
-                .and_then(|materialization| materialization.layers.last())
-                .is_some_and(|layer| {
-                    layer.branch == source_branch && layer.commit_sha == source_head
-                })
-                && persisted_run
-                    .as_ref()
-                    .is_some_and(|record| remote_head == record.identity.source_head);
-            if remote_only > 0 && !expected_unpublished_rewrite {
+            if remote_only > 0 {
                 return Err(WisetreeError::validation(
                     "The remote source branch has commits absent from the selected source HEAD. Synchronize it before Split.",
                 ));
@@ -5894,14 +5874,7 @@ impl DashboardService {
         };
         validate_split_manifest(&live_identity, &units)?;
         let identity = if let Some(record) = persisted_run {
-            let materialized_head = persisted_materialization
-                .as_ref()
-                .and_then(|materialization| materialization.layers.last())
-                .filter(|layer| layer.branch == live_identity.source_branch)
-                .map(|layer| layer.commit_sha.as_str());
-            let source_head_matches = live_identity.source_head == record.identity.source_head
-                || materialized_head == Some(live_identity.source_head.as_str());
-            let input_matches = source_head_matches
+            let input_matches = live_identity.source_head == record.identity.source_head
                 && live_identity.repository == record.identity.repository
                 && live_identity.remote == record.identity.remote
                 && live_identity.base_ref == record.identity.base_ref
@@ -5926,7 +5899,7 @@ impl DashboardService {
                 )));
             } else if !input_matches {
                 return Err(WisetreeError::validation(
-                    "Persisted Split input no longer matches the live repository or harness-created top layer. Reconcile the recorded artifacts before retrying.",
+                    "Persisted Split input no longer matches the live repository. Reconcile the recorded artifacts before retrying.",
                 ));
             } else {
                 record.identity
@@ -5953,14 +5926,7 @@ impl DashboardService {
         let final_head = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
             .await
             .map_err(WisetreeError::other)?;
-        let expected_live_head = persisted_materialization
-            .as_ref()
-            .and_then(|materialization| materialization.layers.last())
-            .filter(|layer| layer.branch == identity.source_branch)
-            .map_or(identity.source_head.as_str(), |layer| {
-                layer.commit_sha.as_str()
-            });
-        if final_head != expected_live_head {
+        if final_head != identity.source_head {
             return Err(WisetreeError::validation(
                 "Source HEAD changed during Split preflight; retry from the dashboard.",
             ));
@@ -6171,9 +6137,8 @@ impl DashboardService {
         self.materialize_split_stack(preflight, plan).await
     }
 
-    /// Build and verify the local layers. Lower responsibilities receive
-    /// dedicated worktrees; the selected source advances only by the final
-    /// tree-preserving commit that gives the top PR correct ancestry.
+    /// Build and verify the local layers in dedicated worktrees, leaving the
+    /// selected source branch and its pull request unchanged.
     pub async fn materialize_split_stack(
         &self,
         preflight: &SplitPreflight,
@@ -6232,14 +6197,7 @@ impl DashboardService {
                 "Existing Split artifacts belong to a different source identity.",
             ));
         }
-        let expected_live_head = materialization
-            .layers
-            .last()
-            .filter(|layer| layer.branch == preflight.identity.source_branch)
-            .map_or(preflight.identity.source_head.as_str(), |layer| {
-                layer.commit_sha.as_str()
-            });
-        self.verify_split_source(preflight, &source, expected_live_head)
+        self.verify_split_source(preflight, &source, &preflight.identity.source_head)
             .await?;
 
         let mut worktrees = WorktreeService::new(Some(source.clone()));
@@ -6250,20 +6208,7 @@ impl DashboardService {
         // forest of chains.
         let mut chain_branch = preflight.identity.base_ref.clone();
         let mut chain_sha = preflight.identity.base_sha.clone();
-        // The source branch may only become the chain tip when a single chain
-        // owns every change unit, because `commit_split_top` bakes the whole
-        // source tree into that commit. As soon as the plan splits into more
-        // than one chain each is a strict subset of the source, so every layer
-        // gets its own worktree and the source branch is left exactly where the
-        // developer put it.
-        let reuse_source = split_reuses_source_branch(plan);
-        let lower_count = if reuse_source {
-            plan.responsibilities.len() - 1
-        } else {
-            plan.responsibilities.len()
-        };
-
-        for responsibility in plan.responsibilities.iter().take(lower_count) {
+        for responsibility in &plan.responsibilities {
             let order = responsibility.order;
             let (parent_branch, parent_sha) = if responsibility.independent {
                 (
@@ -6390,122 +6335,15 @@ impl DashboardService {
             chain_sha = commit_sha;
         }
 
-        if !reuse_source {
-            self.verify_split_source(preflight, &source, &preflight.identity.source_head)
-                .await?;
-            if self.split_source_status(&source).await? != source_status {
-                return Err(WisetreeError::validation(
-                    "Split stopped because the selected source worktree or index changed during materialization.",
-                ));
-            }
-            self.verify_split_partition(preflight, plan, &materialization, &source)
-                .await?;
-            return self
-                .save_split_materialization(preflight, plan, &materialization)
-                .await;
-        }
-
-        // Reuse mode only: the chain holds every layer below the top, and the
-        // source branch is about to become the tip.
-        let (parent_branch, parent_sha) = (chain_branch, chain_sha);
-        let top = plan.responsibilities.last().expect("validated Split plan");
-        let top_units = top.units.iter().cloned().collect::<BTreeSet<_>>();
-        let expected_top = patch_for_units(&frozen_diff, &top_units)?;
-        if let Some(recorded) = materialization.layers.get(lower_count) {
-            self.verify_recorded_split_layer(
-                git,
-                recorded,
-                top,
-                &preflight.identity.source_branch,
-                &preflight.worktree_path,
-                &parent_branch,
-                &parent_sha,
-                &expected_top,
-                false,
-            )
-            .await
-            .map_err(|error| {
-                WisetreeError::validation(format!("Split layer {}: {error}", top.order))
-            })?;
-            return Ok(());
-        }
-        let actual_top = git
-            .diff_at(
-                &source,
-                &format!("{}..{}", parent_sha, preflight.identity.source_head),
-            )
-            .await?;
-        if normalized_patch(&actual_top) != normalized_patch(&expected_top) {
-            return Err(WisetreeError::validation(format!(
-                "Split top layer {} does not represent exactly its assigned units; revise the plan.",
-                top.order
-            )));
-        }
         self.verify_split_source(preflight, &source, &preflight.identity.source_head)
-            .await?;
-        let subject = format!("split: {}", top.name);
-        let top_commit = git
-            .commit_split_top(
-                &source,
-                &preflight.identity.source_branch,
-                &preflight.identity.source_head,
-                &parent_sha,
-                &subject,
-            )
-            .await?;
-        if !git.is_ancestor(&source, &parent_sha, &top_commit).await
-            || git.resolve_at(&source, &format!("{top_commit}^")).await? != parent_sha
-        {
-            return Err(WisetreeError::validation(
-                "Split top layer has the wrong first-parent ancestry.",
-            ));
-        }
-        let top_range = format!("{parent_sha}..{top_commit}");
-        if normalized_patch(&git.diff_at(&source, &top_range).await?)
-            != normalized_patch(&expected_top)
-        {
-            return Err(WisetreeError::validation(
-                "Split top layer no longer matches its assigned change units.",
-            ));
-        }
-        let (top_additions, top_deletions) =
-            parse_numstat_totals(&git.numstat_at(&source, &top_range).await?);
-        self.verify_split_source(preflight, &source, &top_commit)
             .await?;
         if self.split_source_status(&source).await? != source_status {
             return Err(WisetreeError::validation(
                 "Split stopped because the selected source worktree or index changed during materialization.",
             ));
         }
-        let top_record = SplitMaterializedLayer {
-            order: top.order,
-            responsibility: top.name.clone(),
-            branch: preflight.identity.source_branch.clone(),
-            worktree_path: preflight.worktree_path.clone(),
-            parent_branch,
-            parent_sha,
-            commit_sha: top_commit,
-            tree_sha: git
-                .resolve_at(
-                    &source,
-                    &format!("{}^{{tree}}", preflight.identity.source_head),
-                )
-                .await?,
-            units: top.units.clone(),
-            additions: top_additions,
-            deletions: top_deletions,
-            ready_for_publication: true,
-        };
-        match materialization.layers.get(lower_count) {
-            Some(recorded) if recorded == &top_record => {}
-            Some(_) => {
-                return Err(WisetreeError::validation(format!(
-                    "Split top layer {} recorded identity no longer matches.",
-                    top.order
-                )));
-            }
-            None => materialization.layers.push(top_record),
-        }
+        self.verify_split_partition(preflight, plan, &materialization, &source)
+            .await?;
         self.save_split_materialization(preflight, plan, &materialization)
             .await
     }
@@ -6538,28 +6376,19 @@ impl DashboardService {
                 "Split cannot publish an incomplete or unverified local stack.",
             ));
         }
-        let reuse_source = split_reuses_source_branch(plan);
-        // With an independent layer the source branch was never moved, so the
-        // expected head is the developer's own commit rather than a chain tip.
-        let expected_source_head = if reuse_source {
-            materialization
-                .layers
-                .last()
-                .map(|layer| layer.commit_sha.as_str())
-                .ok_or_else(|| WisetreeError::validation("Split stack has no top layer."))?
-        } else {
-            preflight.identity.source_head.as_str()
-        };
-        self.verify_split_source(preflight, source, expected_source_head)
+        self.verify_split_source(preflight, source, &preflight.identity.source_head)
             .await?;
         let branches = materialization
             .layers
             .iter()
             .map(|layer| layer.branch.clone())
             .collect::<Vec<_>>();
-        if reuse_source && branches.last() != Some(&preflight.identity.source_branch) {
+        if branches
+            .iter()
+            .any(|branch| branch == &preflight.identity.source_branch)
+        {
             return Err(WisetreeError::validation(
-                "Split cannot publish because the source branch is not the verified top layer.",
+                "Split cannot publish because a generated layer reuses the source branch.",
             ));
         }
         let trunk = preflight
@@ -7582,15 +7411,9 @@ impl DashboardService {
         Ok(())
     }
 
-    /// Prove that a forest of layers still reproduces the source exactly.
-    ///
-    /// When the source branch is reused as the chain tip, integrity is implied:
-    /// `commit_split_top` builds that commit from the source tree itself, so
-    /// tip and source are byte-identical by construction. An independent layer
-    /// breaks that — the chain no longer carries every change unit — so the
-    /// guarantee is re-established per path instead: every leaf must already
-    /// hold the source's final content for each path it owns, and the plan
-    /// guarantees the leaves partition the changed paths between them.
+    /// Prove that the generated layers still reproduce the source exactly.
+    /// Every chain leaf must hold the source's final content for each path it
+    /// owns, and the plan guarantees the leaves partition the changed paths.
     async fn verify_split_partition(
         &self,
         preflight: &SplitPreflight,

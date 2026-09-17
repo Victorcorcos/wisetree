@@ -315,18 +315,13 @@ pub fn validate_split_publication(
             )));
         }
     }
-    // Only the all-stacked shape ends on the source branch. With an independent
-    // layer the source branch was never moved and never published, so demanding
-    // it here would reject every correct forest.
-    if split_reuses_source_branch(plan)
-        && publication
-            .pull_requests
-            .last()
-            .map(|pull_request| pull_request.branch.as_str())
-            != Some(preflight.identity.source_branch.as_str())
+    if publication
+        .pull_requests
+        .iter()
+        .any(|pull_request| pull_request.branch == preflight.identity.source_branch)
     {
         return Err(WisetreeError::validation(
-            "Split drafting requires the source branch to be the top published layer.",
+            "Split drafting cannot reuse the source branch for a generated pull request.",
         ));
     }
     Ok(())
@@ -1260,14 +1255,6 @@ pub fn split_chains(plan: &SplitPlan) -> Vec<Vec<usize>> {
         }
     }
     chains
-}
-
-/// The source branch may only be reused as the chain tip when the chain holds
-/// every change unit — that is what makes its tree identical to the source
-/// tree. As soon as one layer leaves the stack, the chain is a strict subset
-/// of the source and every layer is materialized in its own worktree instead.
-pub fn split_reuses_source_branch(plan: &SplitPlan) -> bool {
-    split_chains(plan).len() == 1
 }
 
 pub fn build_plan_prompt(

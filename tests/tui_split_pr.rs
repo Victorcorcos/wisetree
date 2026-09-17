@@ -163,7 +163,7 @@ fn focus_confirm(screen: &mut SplitPullRequestScreen) {
 }
 
 #[test]
-fn overview_names_the_full_sequence_roles_max_and_new_top_pr() {
+fn overview_names_the_full_sequence_roles_max_and_preserved_source() {
     let mut screen = SplitPullRequestScreen::new(request(None), config());
     let (text, split_colored) = render(&mut screen, 120, 52);
     assert!(
@@ -175,9 +175,10 @@ fn overview_names_the_full_sequence_roles_max_and_new_top_pr() {
         "Revalidate the worktree",
         "SRP stack",
         "Approve or reject the plan",
-        "local branches and worktrees",
+        "new local branch and worktree",
         "flag layers over",
         "gh stack link",
+        "leave the source pull request intact",
         "concurrently",
         "Apply the final metadata",
         // Centered AI roles table, one row per configured role.
@@ -192,18 +193,18 @@ fn overview_names_the_full_sequence_roles_max_and_new_top_pr() {
         "MAX",
         "1000",
         "a guideline",
-        "create a new top pull request",
+        "create pull requests only for generated branches",
     ] {
         assert!(text.contains(expected), "missing {expected:?}:\n{text}");
     }
 }
 
 #[test]
-fn active_source_pr_is_shown_as_the_reused_top_pr() {
+fn active_source_pr_is_shown_as_preserved() {
     let mut screen = SplitPullRequestScreen::new(request(Some(91)), config());
     let (text, _) = render(&mut screen, 120, 52);
-    assert!(text.contains("Top PR"), "{text}");
-    assert!(text.contains("reuse #91 — Large change"), "{text}");
+    assert!(text.contains("Source PR"), "{text}");
+    assert!(text.contains("preserve #91 — Large change"), "{text}");
     assert!(
         text.contains("https://github.com/acme/repo/pull/91"),
         "{text}"
