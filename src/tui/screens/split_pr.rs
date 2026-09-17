@@ -897,7 +897,7 @@ impl SplitPullRequestScreen {
                             .iter()
                             .find(|record| record.order == pull_request.order);
                         let relation = if index + 1 == publication.pull_requests.len() {
-                            "current top PR"
+                            "top of generated stack"
                         } else {
                             "dependency of later PRs"
                         };
@@ -1382,9 +1382,9 @@ impl SplitPullRequestScreen {
                 "Revalidate the worktree, base, committed diff, and source pull request.",
                 "Plan an SRP stack with the planning AI in an embedded terminal (`Tab` focuses it).",
                 "Approve or reject the plan; rejection feedback regenerates one proposal.",
-                "Materialize the stack as local branches and worktrees, then advance the source branch.",
+                "Materialize every layer as a new local branch and worktree; preserve the source branch.",
                 "Verify every parent-to-child diff and flag layers over `MAX` instead of splitting them.",
-                "Publish the stack with `gh stack link`, reusing the active pull request as the top PR.",
+                "Publish only the generated branches with `gh stack link`; leave the source pull request intact.",
                 "Draft a title and description for every resulting pull request, concurrently.",
                 "Apply the final metadata and report each branch, worktree, and pull request.",
             ])
@@ -1451,10 +1451,10 @@ impl SplitPullRequestScreen {
         ));
         lines.push(match self.request.number {
             Some(number) => labeled_spans(
-                "Top PR",
+                "Source PR",
                 vec![
                     Span::styled(
-                        format!("reuse #{number}"),
+                        format!("preserve #{number}"),
                         Style::default()
                             .fg(colors::INFO)
                             .add_modifier(Modifier::BOLD),
@@ -1480,9 +1480,9 @@ impl SplitPullRequestScreen {
                 ],
             ),
             None => labeled_line(
-                "Top PR",
+                "Source PR",
                 Span::styled(
-                    "create a new top pull request for this branch".to_string(),
+                    "none; create pull requests only for generated branches".to_string(),
                     Style::default().fg(colors::EMPHASIS),
                 ),
                 None,

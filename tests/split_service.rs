@@ -14,11 +14,11 @@ use wisetree::services::{
     parse_split_drafting, parse_split_plan, parse_split_plan_transcript, parse_split_run,
     patch_for_units, provisional_split_title, render_publication, render_split_drafting,
     render_split_plan, split_chains, split_draft_cache_path, split_draft_job_id, split_layer_bases,
-    split_layer_sizes, split_publication_bases, split_reuses_source_branch, validate_split_body,
-    validate_split_manifest, validate_split_publication, validate_split_resume, ChangeUnit,
-    ChangeUnitKind, DashboardService, SplitDraft, SplitDraftRecord, SplitDraftingRecord,
-    SplitIdentity, SplitLayerBase, SplitPlan, SplitPreflight, SplitPublication,
-    SplitPublishedPullRequest, SplitRepositorySnapshot, SplitResponsibility,
+    split_layer_sizes, split_publication_bases, validate_split_body, validate_split_manifest,
+    validate_split_publication, validate_split_resume, ChangeUnit, ChangeUnitKind,
+    DashboardService, SplitDraft, SplitDraftRecord, SplitDraftingRecord, SplitIdentity,
+    SplitLayerBase, SplitPlan, SplitPreflight, SplitPublication, SplitPublishedPullRequest,
+    SplitRepositorySnapshot, SplitResponsibility,
 };
 
 mod support;
@@ -272,11 +272,7 @@ fn published_stack() -> SplitPublication {
         pull_requests: (1..=3)
             .map(|order| SplitPublishedPullRequest {
                 order,
-                branch: if order == 3 {
-                    "duv4091_change".into()
-                } else {
-                    format!("duv4091_change.{order}_layer")
-                },
+                branch: format!("duv4091_change.{order}_layer"),
                 expected_base: match order {
                     1 => "main".into(),
                     2 => "duv4091_change.1_layer".into(),
@@ -387,8 +383,10 @@ fn publication_gate_rejects_missing_or_misordered_canonical_urls() {
     let plan = parse_split_plan(valid_response(), &preflight).unwrap();
     let mut publication = published_stack();
     publication.pull_requests.truncate(2);
-    publication.pull_requests[1].branch = "duv4091_change".into();
     assert!(validate_split_publication(&preflight, &plan, &publication).is_ok());
+    let mut reused_source = publication.clone();
+    reused_source.pull_requests[1].branch = preflight.identity.source_branch.clone();
+    assert!(validate_split_publication(&preflight, &plan, &reused_source).is_err());
     publication.pull_requests.swap(0, 1);
     assert!(validate_split_publication(&preflight, &plan, &publication).is_err());
     publication.pull_requests[0].url = "https://github.com/owner/repo/pull/999".into();
@@ -819,7 +817,7 @@ if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   case "$*" in
     *"--head feature.1_first-hunk "*) printf '[{{"number":41,"url":"https://github.com/example/repo/pull/41","state":"OPEN","isDraft":false,"headRefName":"feature.1_first-hunk","baseRefName":"main"}}]' ;;
     *"--head feature.2_second-hunk "*) printf '[{{"number":42,"url":"https://github.com/example/repo/pull/42","state":"OPEN","isDraft":false,"headRefName":"feature.2_second-hunk","baseRefName":"feature.1_first-hunk"}}]' ;;
-    *"--head feature "*) printf '[{{"number":43,"url":"https://github.com/example/repo/pull/43","state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"feature.2_second-hunk"}}]' ;;
+    *"--head feature.3_third-hunk "*) printf '[{{"number":43,"url":"https://github.com/example/repo/pull/43","state":"OPEN","isDraft":false,"headRefName":"feature.3_third-hunk","baseRefName":"feature.2_second-hunk"}}]' ;;
   esac
   exit 0
 fi
@@ -852,7 +850,7 @@ exit 1
             .lines()
             .filter(|line| line.starts_with("stack link "))
             .collect::<Vec<_>>(),
-        ["stack link --base main --remote origin --open feature.1_first-hunk feature.2_second-hunk feature"]
+        ["stack link --base main --remote origin --open feature.1_first-hunk feature.2_second-hunk feature.3_third-hunk"]
     );
     assert_eq!(
         gh_calls
@@ -973,11 +971,7 @@ exit 1
     assert_eq!(fs::read_to_string(&ai_log).unwrap().lines().count(), 3);
 
     let source_head = git_stdout(&fixture.source, &["rev-parse", "HEAD"]);
-    assert_ne!(source_head, fixture.head);
-    assert!(!git_succeeds(
-        &fixture.source,
-        &["merge-base", "--is-ancestor", &fixture.head, &source_head]
-    ));
+    assert_eq!(source_head, fixture.head);
     assert_eq!(
         fs::read(fixture.source.join("tests/shared.txt")).unwrap(),
         source_before
@@ -1004,6 +998,16 @@ exit 1
         fs::read(second_path.join("tests/shared.txt")).unwrap(),
         b"ONE\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\n"
     );
+    let third_path = fixture
+        .repo
+        .parent()
+        .unwrap()
+        .join("repo.worktree")
+        .join("feature.3_third-hunk");
+    assert_eq!(
+        fs::read(third_path.join("tests/shared.txt")).unwrap(),
+        source_before
+    );
     let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
     let persisted = parse_materialization(&document).unwrap().unwrap();
     let published = parse_publication(&document).unwrap().unwrap();
@@ -1017,7 +1021,8 @@ exit 1
         "https://github.com/example/repo/pull/43"
     );
     assert_eq!(persisted.layers.len(), 3);
-    assert_eq!(persisted.layers[2].commit_sha, source_head);
+    assert_eq!(persisted.layers[2].branch, "feature.3_third-hunk");
+    assert_ne!(persisted.layers[2].commit_sha, source_head);
     assert!(git_succeeds(
         &fixture.source,
         &[
@@ -1133,17 +1138,19 @@ async fn materializes_deletion_rename_and_binary_and_rejects_moved_artifacts() {
     let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
     let persisted = parse_materialization(&document).unwrap().unwrap();
     assert_eq!(persisted.layers.len(), plan.responsibilities.len());
-    for layer in persisted.layers.iter().take(persisted.layers.len() - 1) {
+    for layer in &persisted.layers {
         assert!(Path::new(&layer.worktree_path).join(".env").exists());
         assert!(git_stdout(
             Path::new(&layer.worktree_path),
             &["ls-tree", "--name-only", "HEAD", ".env"]
         )
         .is_empty());
+        assert_ne!(layer.worktree_path, preflight.worktree_path);
+        assert_ne!(layer.branch, preflight.identity.source_branch);
     }
     assert_eq!(
         git_stdout(&fixture.source, &["rev-parse", "HEAD"]),
-        persisted.layers.last().unwrap().commit_sha
+        fixture.head
     );
     assert!(git_stdout(&fixture.source, &["diff"]).is_empty());
     assert!(git_stdout(&fixture.source, &["diff", "--cached"]).is_empty());
@@ -1296,7 +1303,6 @@ fn a_chain_that_touches_nobody_elses_paths_keeps_its_own_root() {
 
     assert!(parsed.responsibilities[2].independent);
     assert_eq!(split_chains(&parsed), vec![vec![0, 1], vec![2]]);
-    assert!(!split_reuses_source_branch(&parsed));
     assert_eq!(
         split_layer_bases(&parsed),
         vec![
@@ -1336,7 +1342,6 @@ fn a_collision_absorbs_every_chain_down_to_the_one_it_collides_with() {
     let parsed = parse_split_plan(&serde_json::to_string(&plan).unwrap(), &preflight).unwrap();
 
     assert_eq!(split_chains(&parsed), vec![vec![0, 1, 2]]);
-    assert!(split_reuses_source_branch(&parsed));
 }
 
 #[test]
@@ -1359,11 +1364,10 @@ fn a_rename_keeps_both_of_its_paths_out_of_an_independence_claim() {
         !parsed.responsibilities[1].independent,
         "the retired side of a rename collides with layer 1 and must demote the claim"
     );
-    assert!(split_reuses_source_branch(&parsed));
 }
 
 #[test]
-fn a_plan_with_no_independent_layer_keeps_reusing_the_source_branch() {
+fn a_plan_with_no_independent_layer_stays_one_chain() {
     let units = vec![
         independence_unit("CU0001", "src/a.rs"),
         independence_unit("CU0002", "src/b.rs"),
@@ -1378,7 +1382,6 @@ fn a_plan_with_no_independent_layer_keeps_reusing_the_source_branch() {
 
     let parsed = parse_split_plan(&serde_json::to_string(&plan).unwrap(), &preflight).unwrap();
 
-    assert!(split_reuses_source_branch(&parsed));
     assert_eq!(
         split_layer_bases(&parsed),
         vec![SplitLayerBase::ResolvedBase, SplitLayerBase::Layer(1)]
@@ -1531,7 +1534,7 @@ async fn two_chains_and_a_leaf_materialize_side_by_side_off_the_base() {
     let layers = parse_materialization(&document).unwrap().unwrap().layers;
     assert_eq!(layers.len(), 5);
 
-    // No single chain owns every unit, so the source branch is never reused.
+    // Every shape preserves the source branch; all layers use dedicated branches.
     assert_eq!(
         git_stdout(&fixture.source, &["rev-parse", "HEAD"]),
         fixture.head
@@ -1642,7 +1645,6 @@ fn two_chains_each_root_at_the_trunk_instead_of_collapsing_into_one_line() {
             SplitLayerBase::Layer(6),
         ]
     );
-    assert!(!split_reuses_source_branch(&plan));
 }
 
 #[test]
@@ -1729,7 +1731,6 @@ fn two_chains_that_share_a_path_are_absorbed_into_one() {
         "a chain colliding with an earlier chain must be absorbed into it"
     );
     assert_eq!(split_chains(&parsed), vec![vec![0, 1, 2, 3]]);
-    assert!(split_reuses_source_branch(&parsed));
 }
 
 /// A `gh` stand-in that remembers the pull requests it opens, so a test can
