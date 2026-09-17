@@ -139,7 +139,11 @@ impl From<OpencodeTurn> for AiTurn {
 /// this deliberately narrower than generic "token limit" wording: context
 /// window failures require changing the prompt/session and are not cured by
 /// waiting in the existing PTY.
-fn is_usage_limit_error(message: &str) -> bool {
+///
+/// Shared with the captured runner ([`super::ai_run`]), which uses it to
+/// back off and retry a non-interactive CLI invocation until the allowance
+/// resets instead of failing the surrounding pipeline.
+pub(crate) fn is_usage_limit_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("usage limit")
         || message.contains("session limit")
@@ -868,6 +872,11 @@ mod tests {
         ));
         assert!(!is_usage_limit_error(
             "This model's context token limit was exceeded"
+        ));
+        // The exact captured-run wording opencode prints when a model's
+        // allowance is exhausted, ANSI escapes and all.
+        assert!(is_usage_limit_error(
+            " > plan · gpt-5.6-sol \x1b[91m\x1b[1mError:\x1b[0m The usage limit has been reached"
         ));
     }
 }
