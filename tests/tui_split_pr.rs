@@ -722,6 +722,15 @@ fn approve_is_green_and_reject_is_red_in_both_border_and_label() {
     );
 }
 
+#[test]
+fn review_buttons_center_their_labels() {
+    let mut screen = review_screen();
+    let (text, _) = render(&mut screen, 100, 30);
+
+    assert!(text.contains("│  Approve  │"), "{text}");
+    assert!(text.contains("│  Reject  │"), "{text}");
+}
+
 /// The drafting stage fans out one AI call per pull request, so the only way
 /// to know which PRs already carry their new metadata is the per-PR row. Every
 /// state must read as plain language and carry a distinguishing color.

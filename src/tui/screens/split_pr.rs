@@ -1103,9 +1103,9 @@ impl SplitPullRequestScreen {
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Min(0),
-                Constraint::Length(15),
+                Constraint::Length("Approve".chars().count() as u16 + 6),
                 Constraint::Length(2),
-                Constraint::Length(15),
+                Constraint::Length("Reject".chars().count() as u16 + 6),
                 Constraint::Min(0),
             ])
             .split(chunks[1]);
