@@ -5565,6 +5565,13 @@ impl App {
             SplitAction::Approved => {
                 self.start_split_approval(tx);
             }
+            SplitAction::OpenUrl(url) => match open_url(&url) {
+                Ok(()) => self.show_toast(ToastVariant::Info, format!("Opened pull request {url}")),
+                Err(err) => self.show_toast(
+                    ToastVariant::Error,
+                    format!("Failed to open pull request: {err}"),
+                ),
+            },
         }
     }
 

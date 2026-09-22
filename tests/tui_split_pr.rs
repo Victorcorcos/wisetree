@@ -7,8 +7,9 @@ use wisetree::config::schema::{AiHarness, AiModelConfig, AiSplitConfig};
 use wisetree::messages::colors;
 use wisetree::services::{
     parse_split_plan, ChangeUnit, ChangeUnitKind, SplitDraft, SplitDraftJobStatus,
-    SplitDraftProgress, SplitDraftRecord, SplitIdentity, SplitPlanResult, SplitPreflight,
-    SplitPublication, SplitPublishedPullRequest, SplitRepositorySnapshot,
+    SplitDraftProgress, SplitDraftRecord, SplitIdentity, SplitMaterialization,
+    SplitMaterializedLayer, SplitPlanResult, SplitPreflight, SplitPublication,
+    SplitPublishedPullRequest, SplitRepositorySnapshot,
 };
 use wisetree::tui::screens::dashboard::SplitRequest;
 use wisetree::tui::screens::split_pr::{SplitAction, SplitPullRequestScreen, SplitStep};
@@ -155,6 +156,56 @@ fn publication() -> SplitPublication {
             },
         ],
     }
+}
+
+/// Point the screen at `worktree` and leave there the same materialization
+/// record the approval step writes, so the done page reports real per-layer
+/// worktrees and diffs instead of falling back to "not recorded".
+fn materialize(screen: &mut SplitPullRequestScreen, worktree: &std::path::Path) {
+    let mut preflight = screen.preflight().expect("preflight").clone();
+    preflight.worktree_path = worktree.to_string_lossy().into_owned();
+    screen.set_preflight(preflight);
+
+    let layer = |order: usize, branch: &str, parent: &str, additions: u64, deletions: u64| {
+        SplitMaterializedLayer {
+            order,
+            responsibility: format!("layer {order}"),
+            branch: branch.into(),
+            worktree_path: format!("/tmp/stack/{branch}"),
+            parent_branch: parent.into(),
+            parent_sha: "parent-sha".into(),
+            commit_sha: format!("commit-{order}"),
+            tree_sha: format!("tree-{order}"),
+            units: Vec::new(),
+            additions,
+            deletions,
+            ready_for_publication: true,
+        }
+    };
+    let materialization = SplitMaterialization {
+        source_branch: "feature/large-change".into(),
+        source_head: "source-sha".into(),
+        base_sha: "base-sha".into(),
+        layers: vec![
+            layer(1, "feature/large-change.1_foundation", "main", 4, 1),
+            layer(
+                2,
+                "feature/large-change",
+                "feature/large-change.1_foundation",
+                4,
+                1,
+            ),
+        ],
+    };
+    std::fs::create_dir_all(worktree.join(".wisetree")).expect("plan directory");
+    std::fs::write(
+        worktree.join(".wisetree/split_plan.md"),
+        format!(
+            "<!-- wisetree-split-materialization {} -->",
+            serde_json::to_string(&materialization).expect("materialization json")
+        ),
+    )
+    .expect("plan file");
 }
 
 fn focus_confirm(screen: &mut SplitPullRequestScreen) {
@@ -483,6 +534,10 @@ fn publication_progress_and_verified_stack_are_visible() {
     let (selected, _) = render(&mut screen, 100, 20);
     assert!(selected.contains("Launching the selected drafting AI"));
 
+    // Split writes the materialized layers into the worktree's plan file, and
+    // the done page reads them back for its per-PR worktree and diff rows.
+    let worktree = tempfile::tempdir().expect("worktree");
+    materialize(&mut screen, worktree.path());
     screen.finish_drafting(vec![SplitDraftRecord {
         job_id: "source-layer-1-pr-91".into(),
         source_head: "source-sha".into(),
@@ -500,24 +555,46 @@ fn publication_progress_and_verified_stack_are_visible() {
         error: None,
     }]);
     assert_eq!(screen.step(), SplitStep::Complete);
-    let (done, _) = render(&mut screen, 100, 20);
-    assert!(done.contains("Published and verified 2 stacked pull requests"));
-    assert!(
-        done.contains("https://github.com/acme/repo/pull/91"),
-        "{done}"
+    let (done, _) = render(&mut screen, 110, 40);
+    for expected in [
+        "Split complete · published and verified",
+        "2 stacked pull requests",
+        "acme/repo",
+        "+8 -2 = 10 changed lines",
+        "MAX 10 per layer · every layer within it ✓",
+        // One bordered group per published pull request, titled with what is
+        // live on GitHub right now and chipped with its number.
+        "╭─ PR 1 · Foundation (1/2)",
+        "#91",
+        "https://github.com/acme/repo/pull/91",
+        "feature/large-change.1_foundation",
+        "dependency of the later pull requests",
+        "top of the generated stack",
+        "/tmp/stack/feature/large-change.1_foundation",
+        "+4 -1 = 5 · within MAX 10 ✓",
+        "AI title + description applied ✓",
+        "not drafted — still the provisional title on GitHub",
+        // Footer names both ways to reach a pull request.
+        "Open that pull request (or click its link)",
+    ] {
+        assert!(done.contains(expected), "missing {expected:?}:\n{done}");
+    }
+    // Digits open the matching pull request; clicking its link row does too.
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Char('2'))),
+        SplitAction::OpenUrl("https://github.com/acme/repo/pull/92".into())
     );
-    assert!(done.contains("feature/large-change.1_foundation"), "{done}");
-    assert!(
-        done.contains("MAX 10 per layer: every layer within it"),
-        "{done}"
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Char('9'))),
+        SplitAction::Continue
     );
-    // The done page names the title that is now live on GitHub, per PR, so
-    // "which PRs got their metadata rewritten" is answerable at a glance.
-    assert!(done.contains("title: Foundation (1/2)"), "{done}");
-    assert!(done.contains("AI title + description applied"), "{done}");
-    assert!(
-        done.contains("not drafted — still the provisional title on GitHub"),
-        "{done}"
+    let link_row = done
+        .lines()
+        .position(|line| line.contains("https://github.com/acme/repo/pull/91"))
+        .expect("first link row") as u16;
+    assert_eq!(
+        screen.handle_mouse_click(ratatui::layout::Position::new(40, link_row)),
+        SplitAction::OpenUrl("https://github.com/acme/repo/pull/91".into())
     );
     assert_eq!(
         screen.handle_key(key(KeyCode::Enter)),
@@ -720,6 +797,67 @@ fn approve_is_green_and_reject_is_red_in_both_border_and_label() {
         border_colors.contains(&colors::MUTED),
         "unfocused Reject border is muted"
     );
+}
+
+/// The page closes on a summary and a hint row, and both must read as part of
+/// the same design: the aggregate repeats the per-layer color grammar
+/// (additions green, deletions red, verdict teal) and the shortcuts use the
+/// key-in-accent / action-muted footer every other command renders, separated
+/// from the summary by a blank line.
+#[test]
+fn aggregate_integrity_and_shortcuts_follow_the_command_palette() {
+    let mut screen = review_screen();
+    render(&mut screen, 110, 44);
+    screen.handle_key(key(KeyCode::End));
+    let buffer = render_buffer(&mut screen, 110, 44);
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    let page = rows.join("\n");
+    let row_with = |needle: &str| {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?}:\n{page}"))
+    };
+    let color_of = |y: usize, needle: &str| {
+        let offset = rows[y].find(needle).expect("needle on row");
+        buffer[(rows[y][..offset].chars().count() as u16, y as u16)].fg
+    };
+
+    let aggregate = row_with("changed sections accounted for");
+    assert!(
+        rows[aggregate].contains(
+            "2 responsibilities · all 4 changed sections accounted for ✓ · +8 -2 = 10 source lines"
+        ),
+        "{page}"
+    );
+    assert_eq!(color_of(aggregate, "2 responsibilities"), colors::WHITE);
+    assert_eq!(color_of(aggregate, "responsibilities"), colors::MUTED);
+    assert_eq!(color_of(aggregate, "all 4 changed"), colors::INFO);
+    assert_eq!(color_of(aggregate, "✓"), colors::INFO);
+    assert_eq!(color_of(aggregate, "+8"), colors::SUCCESS);
+    assert_eq!(color_of(aggregate, "-2"), colors::ERROR);
+    assert_eq!(color_of(aggregate, "= 10 source lines"), colors::EMPHASIS);
+
+    let shortcuts = row_with("PgUp/PgDn");
+    assert!(
+        rows[shortcuts].contains("PgUp/PgDn Scroll  ·  Home/End Jump to top/bottom  ·  Esc Cancel"),
+        "{page}"
+    );
+    assert!(
+        rows[shortcuts - 1].trim().is_empty(),
+        "shortcuts need a blank line above them:\n{page}"
+    );
+    assert_eq!(color_of(shortcuts, "PgUp/PgDn"), colors::BRAND);
+    assert_eq!(color_of(shortcuts, "Scroll"), colors::MUTED);
+    assert_eq!(color_of(shortcuts, "Home/End"), colors::BRAND);
+    assert_eq!(color_of(shortcuts, "Jump"), colors::MUTED);
+    assert_eq!(color_of(shortcuts, "Esc"), colors::ERROR);
+    assert_eq!(color_of(shortcuts, "Cancel"), colors::MUTED);
 }
 
 #[test]

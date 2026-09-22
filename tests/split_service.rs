@@ -13,12 +13,12 @@ use wisetree::services::{
     parse_materialization, parse_numstat_totals, parse_publication, parse_split_draft,
     parse_split_drafting, parse_split_plan, parse_split_plan_transcript, parse_split_run,
     patch_for_units, provisional_split_title, render_publication, render_split_drafting,
-    render_split_plan, split_chains, split_draft_cache_path, split_draft_job_id, split_layer_bases,
-    split_layer_sizes, split_publication_bases, validate_split_body, validate_split_manifest,
-    validate_split_publication, validate_split_resume, ChangeUnit, ChangeUnitKind,
-    DashboardService, SplitDraft, SplitDraftRecord, SplitDraftingRecord, SplitIdentity,
-    SplitLayerBase, SplitPlan, SplitPreflight, SplitPublication, SplitPublishedPullRequest,
-    SplitRepositorySnapshot, SplitResponsibility,
+    render_split_plan, split_branch_name, split_chains, split_draft_cache_path, split_draft_job_id,
+    split_layer_bases, split_layer_sizes, split_publication_bases, validate_split_body,
+    validate_split_manifest, validate_split_publication, validate_split_resume, ChangeUnit,
+    ChangeUnitKind, DashboardService, SplitDraft, SplitDraftRecord, SplitDraftingRecord,
+    SplitIdentity, SplitLayerBase, SplitPlan, SplitPreflight, SplitPublication,
+    SplitPublishedPullRequest, SplitRepositorySnapshot, SplitResponsibility,
 };
 
 mod support;
@@ -625,6 +625,28 @@ fn parser_rejects_prose_unknown_duplicate_missing_and_ai_arithmetic() {
     .is_err());
 }
 
+/// Generated branches and worktrees join their parts with `_`, so a planner
+/// that answers in kebab-case still produces `feature.1_shared_foundation`
+/// rather than a name that mixes both separators.
+#[test]
+fn a_hyphenated_branch_slug_is_normalized_into_a_snake_case_branch() {
+    let preflight = fixture();
+    let plan = parse_split_plan(
+        &valid_response()
+            .replace("\"foundation\"", "\"shared-foundation\"")
+            .replace("\"consumer\"", "\"foundation-consumer\""),
+        &preflight,
+    )
+    .expect("valid plan");
+
+    assert_eq!(plan.responsibilities[0].branch_slug, "shared_foundation");
+    assert_eq!(plan.responsibilities[1].branch_slug, "foundation_consumer");
+    assert_eq!(
+        split_branch_name("feature", 1, &plan.responsibilities[0].branch_slug),
+        "feature.1_shared_foundation"
+    );
+}
+
 /// MAX yields to the semantic boundary: an oversized responsibility — even an
 /// indivisible change larger than MAX on its own — plans, sizes and renders
 /// with its overflow and its reason instead of failing.
@@ -854,9 +876,9 @@ if [ "$1" = "stack" ] && [ "$2" = "link" ]; then exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then exit 0; fi
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   case "$*" in
-    *"--head feature.1_first-hunk "*) printf '[{{"number":41,"url":"https://github.com/example/repo/pull/41","state":"OPEN","isDraft":false,"headRefName":"feature.1_first-hunk","baseRefName":"main"}}]' ;;
-    *"--head feature.2_second-hunk "*) printf '[{{"number":42,"url":"https://github.com/example/repo/pull/42","state":"OPEN","isDraft":false,"headRefName":"feature.2_second-hunk","baseRefName":"feature.1_first-hunk"}}]' ;;
-    *"--head feature.3_third-hunk "*) printf '[{{"number":43,"url":"https://github.com/example/repo/pull/43","state":"OPEN","isDraft":false,"headRefName":"feature.3_third-hunk","baseRefName":"feature.2_second-hunk"}}]' ;;
+    *"--head feature.1_first_hunk "*) printf '[{{"number":41,"url":"https://github.com/example/repo/pull/41","state":"OPEN","isDraft":false,"headRefName":"feature.1_first_hunk","baseRefName":"main"}}]' ;;
+    *"--head feature.2_second_hunk "*) printf '[{{"number":42,"url":"https://github.com/example/repo/pull/42","state":"OPEN","isDraft":false,"headRefName":"feature.2_second_hunk","baseRefName":"feature.1_first_hunk"}}]' ;;
+    *"--head feature.3_third_hunk "*) printf '[{{"number":43,"url":"https://github.com/example/repo/pull/43","state":"OPEN","isDraft":false,"headRefName":"feature.3_third_hunk","baseRefName":"feature.2_second_hunk"}}]' ;;
   esac
   exit 0
 fi
@@ -889,7 +911,7 @@ exit 1
             .lines()
             .filter(|line| line.starts_with("stack link "))
             .collect::<Vec<_>>(),
-        ["stack link --base main --remote origin --open feature.1_first-hunk feature.2_second-hunk feature.3_third-hunk"]
+        ["stack link --base main --remote origin --open feature.1_first_hunk feature.2_second_hunk feature.3_third_hunk"]
     );
     assert_eq!(
         gh_calls
@@ -1022,7 +1044,7 @@ exit 1
         .parent()
         .unwrap()
         .join("repo.worktree")
-        .join("feature.1_first-hunk");
+        .join("feature.1_first_hunk");
     assert_eq!(
         fs::read(lower_path.join("tests/shared.txt")).unwrap(),
         b"ONE\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n"
@@ -1032,7 +1054,7 @@ exit 1
         .parent()
         .unwrap()
         .join("repo.worktree")
-        .join("feature.2_second-hunk");
+        .join("feature.2_second_hunk");
     assert_eq!(
         fs::read(second_path.join("tests/shared.txt")).unwrap(),
         b"ONE\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\n"
@@ -1042,7 +1064,7 @@ exit 1
         .parent()
         .unwrap()
         .join("repo.worktree")
-        .join("feature.3_third-hunk");
+        .join("feature.3_third_hunk");
     assert_eq!(
         fs::read(third_path.join("tests/shared.txt")).unwrap(),
         source_before
@@ -1052,7 +1074,7 @@ exit 1
     let published = parse_publication(&document).unwrap().unwrap();
     assert_eq!(
         published.pull_requests[2].expected_base,
-        "feature.2_second-hunk"
+        "feature.2_second_hunk"
     );
     assert_eq!(published.pull_requests[2].number, 43);
     assert_eq!(
@@ -1060,7 +1082,7 @@ exit 1
         "https://github.com/example/repo/pull/43"
     );
     assert_eq!(persisted.layers.len(), 3);
-    assert_eq!(persisted.layers[2].branch, "feature.3_third-hunk");
+    assert_eq!(persisted.layers[2].branch, "feature.3_third_hunk");
     assert_ne!(persisted.layers[2].commit_sha, source_head);
     assert!(git_succeeds(
         &fixture.source,
@@ -1071,7 +1093,7 @@ exit 1
             &persisted.layers[2].commit_sha,
         ],
     ));
-    assert_eq!(persisted.layers[0].branch, "feature.1_first-hunk");
+    assert_eq!(persisted.layers[0].branch, "feature.1_first_hunk");
     assert!(persisted.layers[0].ready_for_publication);
 
     if let Some(value) = previous_home {
@@ -1311,7 +1333,7 @@ fn independence_layer(order: usize, unit: &ChangeUnit, independent: bool) -> Spl
     SplitResponsibility {
         order,
         name: format!("Change {}", unit.path),
-        branch_slug: format!("layer-{order}"),
+        branch_slug: format!("layer_{order}"),
         rationale: "Test responsibility.".into(),
         units: vec![unit.id.clone()],
         test_units: Vec::new(),
@@ -1353,7 +1375,7 @@ fn a_chain_that_touches_nobody_elses_paths_keeps_its_own_root() {
 
     let rendered = render_split_plan(&preflight, &parsed, "awaiting approval");
     assert!(rendered.contains("independent — starts a new chain on `origin/main`"));
-    assert!(rendered.contains("| 2 | Change src/shared.rs | `layer-2` | layer 1 |"));
+    assert!(rendered.contains("| 2 | Change src/shared.rs | `layer_2` | layer 1 |"));
 }
 
 #[test]
@@ -1690,7 +1712,7 @@ fn two_chains_each_root_at_the_trunk_instead_of_collapsing_into_one_line() {
 fn a_mixed_stack_resolves_every_base_and_keeps_the_source_branch_unpublished() {
     let (preflight, plan) = two_chains_and_two_leaves();
     let branches = (1..=7)
-        .map(|order| format!("feature.{order}_layer-{order}"))
+        .map(|order| format!("feature.{order}_layer_{order}"))
         .collect::<Vec<_>>();
     let bases = split_publication_bases(&plan, &branches, "main");
     assert_eq!(

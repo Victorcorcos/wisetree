@@ -22,6 +22,7 @@ use crate::services::{
 };
 use crate::tui::screens::dashboard::SplitRequest;
 use crate::tui::screens::update_pr::key_event_to_pty_bytes;
+use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
     code_style, labeled_line, labeled_spans, spinner_frame, AiRoleRow, ConfirmationChoice,
     ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt, OptionsGroup,
@@ -59,6 +60,7 @@ pub enum SplitAction {
     RetryPublication,
     RetryDrafting,
     Finished,
+    OpenUrl(String),
     WritePty(Vec<u8>),
 }
 
@@ -106,6 +108,9 @@ pub struct SplitPullRequestScreen {
     drafting_error: Option<String>,
     selected_draft: usize,
     draft_row_rects: Cell<Vec<Rect>>,
+    /// Where each published pull request's link row landed on the done page,
+    /// so clicking it opens that pull request in the browser.
+    pr_link_rects: Cell<Vec<(Rect, String)>>,
     pub tick: usize,
 }
 
@@ -159,6 +164,7 @@ impl SplitPullRequestScreen {
             drafting_error: None,
             selected_draft: 0,
             draft_row_rects: Cell::new(Vec::new()),
+            pr_link_rects: Cell::new(Vec::new()),
             tick: 0,
         }
     }
@@ -596,6 +602,16 @@ impl SplitPullRequestScreen {
             },
             SplitStep::Complete => match key.code {
                 KeyCode::Enter | KeyCode::Esc => SplitAction::Finished,
+                // `1`…`9` open that pull request in the browser, matching the
+                // order the stack is listed in.
+                KeyCode::Char(digit @ '1'..='9') => self
+                    .publication
+                    .as_ref()
+                    .and_then(|publication| {
+                        publication.pull_requests.get(digit as usize - '1' as usize)
+                    })
+                    .map(|pull_request| SplitAction::OpenUrl(pull_request.url.clone()))
+                    .unwrap_or(SplitAction::Continue),
                 KeyCode::PageUp => {
                     self.scroll = self.scroll.saturating_sub(5);
                     SplitAction::Continue
@@ -628,6 +644,15 @@ impl SplitPullRequestScreen {
     }
 
     pub fn handle_mouse_click(&mut self, position: Position) -> SplitAction {
+        if self.step == SplitStep::Complete {
+            let links = self.pr_link_rects.take();
+            let clicked = links
+                .iter()
+                .find(|(area, _)| contains(*area, position))
+                .map(|(_, url)| SplitAction::OpenUrl(url.clone()));
+            self.pr_link_rects.set(links);
+            return clicked.unwrap_or(SplitAction::Continue);
+        }
         if self.step == SplitStep::Drafting {
             if let Some(index) = self
                 .draft_row_rects
@@ -867,95 +892,314 @@ impl SplitPullRequestScreen {
         );
     }
 
+    /// The done page is the record of what Split just created, so it is laid
+    /// out like the review page it mirrors: a labeled summary block, then one
+    /// bordered group per published pull request. Every value carries the
+    /// color of what it means (additions green, deletions red, verdicts teal,
+    /// pending metadata yellow) instead of one flat wall of accent text.
     fn render_published(&self, frame: &mut Frame, area: Rect) {
-        let text = self.publication.as_ref().map_or_else(
-            || "Split publication completed.".to_string(),
-            |publication| {
-                let max = self
-                    .preflight
-                    .as_ref()
-                    .map(|preflight| preflight.identity.max)
-                    .unwrap_or(0);
-                let over_max = self.materialization.as_ref().map_or(0, |materialization| {
-                    materialization
-                        .layers
-                        .iter()
-                        .filter(|layer| layer.additions.saturating_add(layer.deletions) > max)
-                        .count()
-                });
-                let pull_requests = publication
-                    .pull_requests
-                    .iter()
-                    .enumerate()
-                    .map(|(index, pull_request)| {
-                        let layer = self
-                            .materialization
-                            .as_ref()
-                            .and_then(|materialization| materialization.layers.get(index));
-                        let record = self
-                            .draft_records
-                            .iter()
-                            .find(|record| record.order == pull_request.order);
-                        let relation = if index + 1 == publication.pull_requests.len() {
-                            "top of generated stack"
-                        } else {
-                            "dependency of later PRs"
-                        };
-                        let changed = layer
-                            .map(|layer| layer.additions.saturating_add(layer.deletions))
-                            .unwrap_or(0);
-                        let size = if changed > max {
-                            format!(" ({} over MAX {max}, kept whole)", changed - max)
-                        } else {
-                            String::new()
-                        };
-                        format!(
-                            "{}. {} ({relation})\n   branch: {} → base: {}\n   worktree: {}\n   diff: +{} -{}{size}\n   title: {}\n   metadata: {}",
-                            pull_request.order,
-                            pull_request.url,
-                            pull_request.branch,
-                            pull_request.expected_base,
-                            layer.map(|layer| layer.worktree_path.as_str()).unwrap_or("unknown"),
-                            layer.map(|layer| layer.additions).unwrap_or(0),
-                            layer.map(|layer| layer.deletions).unwrap_or(0),
-                            record
-                                .and_then(|record| record.final_title.as_deref())
-                                .unwrap_or(pull_request.provisional_title.as_str()),
-                            if record.is_some_and(|record| record.applied) {
-                                "AI title + description applied"
-                            } else if record.and_then(|record| record.final_title.as_ref()).is_some() {
-                                "drafted but not applied — still the provisional title on GitHub"
-                            } else {
-                                "not drafted — still the provisional title on GitHub"
-                            }
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(area);
+        let width = chunks[0].width.saturating_sub(2).max(1) as usize;
+        let (lines, links) = self.published_lines(width);
+        let max_scroll = (lines.len() as u16).saturating_sub(chunks[0].height);
+        self.max_scroll.set(max_scroll);
+        let scroll = self.scroll.min(max_scroll);
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), chunks[0]);
+        // Remember where each link row landed on screen so a click on it
+        // opens that pull request in the browser.
+        self.pr_link_rects.set(
+            links
+                .into_iter()
+                .filter_map(|(index, url)| {
+                    let offset = (index as u16).checked_sub(scroll)?;
+                    (offset < chunks[0].height).then(|| {
+                        (
+                            Rect::new(chunks[0].x, chunks[0].y + offset, chunks[0].width, 1),
+                            url,
                         )
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!(
-                    "Published and verified {} stacked pull requests (bottom to top). Split complete.\nSource: +{} -{} = {} changed lines · MAX {max} per layer: {}.\nThe selected source tree is unchanged; its branch now carries the verified top-layer commit.\n\n{pull_requests}\n\nEnter returns to the refreshed dashboard.",
-                    publication.pull_requests.len(),
-                    self.preflight.as_ref().map(|value| value.identity.additions).unwrap_or(0),
-                    self.preflight.as_ref().map(|value| value.identity.deletions).unwrap_or(0),
-                    self.preflight.as_ref().map(|value| value.identity.additions + value.identity.deletions).unwrap_or(0),
-                    if over_max == 0 {
-                        "every layer within it".to_string()
-                    } else {
-                        format!("{over_max} layer(s) kept whole past it to preserve a responsibility")
-                    },
-                )
-            },
+                })
+                .collect(),
         );
-        let logical_lines = text.lines().count() as u16;
-        let max_scroll = logical_lines.saturating_sub(area.height);
-        self.max_scroll.set(max_scroll);
         frame.render_widget(
-            Paragraph::new(text)
-                .style(Style::default().fg(colors::SPLIT))
-                .scroll((self.scroll.min(max_scroll), 0))
-                .wrap(Wrap { trim: true }),
-            area,
+            Paragraph::new(vec![
+                Line::default(),
+                published_shortcuts_line(self.published_count()),
+            ]),
+            chunks[1],
         );
+    }
+
+    fn published_count(&self) -> usize {
+        self.publication
+            .as_ref()
+            .map_or(0, |publication| publication.pull_requests.len())
+    }
+
+    /// Returns the rendered page plus, for every pull request, the index of
+    /// the line carrying its URL so the caller can make that row clickable.
+    fn published_lines(&self, width: usize) -> (Vec<Line<'static>>, Vec<(usize, String)>) {
+        let Some(publication) = self.publication.as_ref() else {
+            return (
+                vec![Line::from(Span::styled(
+                    "Split publication completed.",
+                    Style::default().fg(colors::SPLIT),
+                ))],
+                Vec::new(),
+            );
+        };
+        let identity = self.preflight.as_ref().map(|preflight| &preflight.identity);
+        let max = identity.map(|identity| identity.max).unwrap_or(0);
+        let additions = identity.map(|identity| identity.additions).unwrap_or(0);
+        let deletions = identity.map(|identity| identity.deletions).unwrap_or(0);
+        let over_max = self.materialization.as_ref().map_or(0, |materialization| {
+            materialization
+                .layers
+                .iter()
+                .filter(|layer| layer.additions.saturating_add(layer.deletions) > max)
+                .count()
+        });
+
+        let mut lines = vec![section_line("Split complete · published and verified")];
+        push_review_table_styled_row(
+            &mut lines,
+            "Stack",
+            vec![
+                (
+                    format!("{} stacked pull requests", publication.pull_requests.len()),
+                    Style::default()
+                        .fg(colors::WHITE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                (
+                    "· bottom to top · every parent-to-child diff verified".to_string(),
+                    Style::default().fg(colors::MUTED),
+                ),
+            ],
+            width,
+        );
+        push_review_table_styled_row(
+            &mut lines,
+            "Repository",
+            vec![
+                (publication.repository.clone(), code_style()),
+                ("· trunk".to_string(), Style::default().fg(colors::MUTED)),
+                (publication.trunk.clone(), code_style()),
+            ],
+            width,
+        );
+        push_review_table_styled_row(
+            &mut lines,
+            "Source diff",
+            vec![
+                (
+                    format!("+{additions}"),
+                    Style::default().fg(colors::SUCCESS),
+                ),
+                (format!("-{deletions}"), Style::default().fg(colors::ERROR)),
+                (
+                    format!("= {} changed lines", additions + deletions),
+                    Style::default().fg(colors::EMPHASIS),
+                ),
+            ],
+            width,
+        );
+        push_review_table_styled_row(
+            &mut lines,
+            "Size guideline",
+            if over_max == 0 {
+                vec![(
+                    format!("MAX {max} per layer · every layer within it ✓"),
+                    Style::default().fg(colors::INFO),
+                )]
+            } else {
+                vec![
+                    (
+                        format!("MAX {max} per layer ·"),
+                        Style::default().fg(colors::INFO),
+                    ),
+                    (
+                        format!(
+                            "{over_max} layer(s) kept whole past it to preserve a responsibility"
+                        ),
+                        Style::default().fg(colors::WARNING),
+                    ),
+                ]
+            },
+            width,
+        );
+        push_review_table_styled_row(
+            &mut lines,
+            "Source branch",
+            vec![
+                (publication.source_branch.clone(), code_style()),
+                (
+                    "· unchanged tree; now carries the verified top-layer commit".to_string(),
+                    Style::default().fg(colors::MUTED),
+                ),
+            ],
+            width,
+        );
+        lines.push(Line::default());
+
+        let mut links = Vec::new();
+        let inner_width = width.saturating_sub(4).max(1);
+        for (index, pull_request) in publication.pull_requests.iter().enumerate() {
+            let layer = self
+                .materialization
+                .as_ref()
+                .and_then(|materialization| materialization.layers.get(index));
+            let record = self
+                .draft_records
+                .iter()
+                .find(|record| record.order == pull_request.order);
+            let (layer_additions, layer_deletions) = layer
+                .map(|layer| (layer.additions, layer.deletions))
+                .unwrap_or((0, 0));
+            let changed = layer_additions.saturating_add(layer_deletions);
+
+            let mut group = Vec::new();
+            push_review_table_styled_row(
+                &mut group,
+                "Pull request",
+                vec![
+                    (
+                        format!("#{}", pull_request.number),
+                        Style::default()
+                            .fg(colors::WHITE)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    (
+                        pull_request.url.clone(),
+                        Style::default()
+                            .fg(colors::INFO)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                ],
+                inner_width,
+            );
+            push_review_table_styled_row(
+                &mut group,
+                "Stack position",
+                if pull_request.independent {
+                    vec![(
+                        "independent — targets the trunk and merges on its own".to_string(),
+                        Style::default().fg(colors::SUCCESS),
+                    )]
+                } else if index + 1 == publication.pull_requests.len() {
+                    vec![(
+                        "top of the generated stack".to_string(),
+                        Style::default().fg(colors::INFO),
+                    )]
+                } else {
+                    vec![(
+                        "dependency of the later pull requests".to_string(),
+                        Style::default().fg(colors::MUTED),
+                    )]
+                },
+                inner_width,
+            );
+            push_review_table_styled_row(
+                &mut group,
+                "Branch",
+                vec![
+                    (pull_request.branch.clone(), code_style()),
+                    ("→".to_string(), Style::default().fg(colors::MUTED)),
+                    (pull_request.expected_base.clone(), code_style()),
+                ],
+                inner_width,
+            );
+            match layer {
+                Some(layer) => push_review_table_row(
+                    &mut group,
+                    "Worktree",
+                    &fold_home(&layer.worktree_path),
+                    inner_width,
+                    Style::default().fg(colors::EMPHASIS),
+                ),
+                // Without the materialization record on disk there is nothing
+                // to report — saying so beats printing a path and a diff that
+                // were never measured.
+                None => push_review_table_row(
+                    &mut group,
+                    "Worktree",
+                    "not recorded",
+                    inner_width,
+                    Style::default().fg(colors::MUTED),
+                ),
+            }
+            if layer.is_none() {
+                push_review_table_row(
+                    &mut group,
+                    "Integrity",
+                    "not recorded",
+                    inner_width,
+                    Style::default().fg(colors::MUTED),
+                );
+            } else if changed > max {
+                push_over_max_integrity_table_row(
+                    &mut group,
+                    layer_additions,
+                    layer_deletions,
+                    changed,
+                    changed - max,
+                    max,
+                    inner_width,
+                );
+            } else {
+                push_integrity_table_row(
+                    &mut group,
+                    layer_additions,
+                    layer_deletions,
+                    changed,
+                    max,
+                );
+            }
+            push_review_table_styled_row(
+                &mut group,
+                "Metadata",
+                if record.is_some_and(|record| record.applied) {
+                    vec![(
+                        "AI title + description applied ✓".to_string(),
+                        Style::default().fg(colors::SUCCESS),
+                    )]
+                } else if record
+                    .and_then(|record| record.final_title.as_ref())
+                    .is_some()
+                {
+                    vec![(
+                        "drafted but not applied — still the provisional title on GitHub"
+                            .to_string(),
+                        Style::default().fg(colors::WARNING),
+                    )]
+                } else {
+                    vec![(
+                        "not drafted — still the provisional title on GitHub".to_string(),
+                        Style::default().fg(colors::WARNING),
+                    )]
+                },
+                inner_width,
+            );
+
+            // The URL is the first content row, so it lands right under the
+            // group's top border.
+            links.push((lines.len() + 1, pull_request.url.clone()));
+            push_review_group(
+                &mut lines,
+                group,
+                width,
+                pull_request.order,
+                record
+                    .and_then(|record| record.final_title.as_deref())
+                    .unwrap_or(pull_request.provisional_title.as_str()),
+                &format!("#{}", pull_request.number),
+            );
+            lines.push(Line::default());
+        }
+        (lines, links)
     }
 
     fn render_planning(&mut self, frame: &mut Frame, area: Rect) {
@@ -1292,19 +1536,51 @@ impl SplitPullRequestScreen {
             lines.push(Line::default());
         }
         lines.push(section_line("Aggregate integrity"));
-        push_wrapped(
-            &mut lines,
-            &format!(
-                "{} responsibilities · all {} changed sections accounted for · +{} -{} = {} source lines",
-                plan.responsibilities.len(),
-                preflight.units.len(),
-                preflight.identity.additions,
-                preflight.identity.deletions,
-                preflight.identity.additions + preflight.identity.deletions
-            ),
+        // Same color grammar as a layer's `Integrity` row — additions green,
+        // deletions red, the verdict in info teal — so the stack total reads
+        // as the sum of the rows above it instead of one flat sentence.
+        for detail in wrap_styled_segments(
+            vec![
+                (
+                    plan.responsibilities.len().to_string(),
+                    Style::default()
+                        .fg(colors::WHITE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                (
+                    "responsibilities ·".to_string(),
+                    Style::default().fg(colors::MUTED),
+                ),
+                (
+                    format!(
+                        "all {} changed sections accounted for ✓",
+                        preflight.units.len()
+                    ),
+                    Style::default().fg(colors::INFO),
+                ),
+                ("·".to_string(), Style::default().fg(colors::MUTED)),
+                (
+                    format!("+{}", preflight.identity.additions),
+                    Style::default().fg(colors::SUCCESS),
+                ),
+                (
+                    format!("-{}", preflight.identity.deletions),
+                    Style::default().fg(colors::ERROR),
+                ),
+                (
+                    format!(
+                        "= {} source lines",
+                        preflight.identity.additions + preflight.identity.deletions
+                    ),
+                    Style::default().fg(colors::EMPHASIS),
+                ),
+            ],
             width,
-        );
-        lines.push(Line::from("PgUp/PgDn/Home/End scroll · Esc cancel"));
+        ) {
+            lines.push(Line::from(detail));
+        }
+        lines.push(Line::default());
+        lines.push(shortcuts_line());
         lines
     }
 
@@ -1514,8 +1790,54 @@ fn section_line(text: &str) -> Line<'static> {
     ))
 }
 
-fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize) {
-    push_wrapped_styled(lines, text, width, Style::default().fg(colors::EMPHASIS));
+/// The done page's keyboard hints, in the same footer grammar as the review
+/// page. The digit range names how many pull requests can be opened, which is
+/// also the discovery path for the clickable link rows.
+fn published_shortcuts_line(count: usize) -> Line<'static> {
+    let separator = Span::styled("  ·  ", Style::default().fg(colors::MUTED));
+    let mut spans = vec![
+        Span::styled("Enter ", Style::default().fg(colors::BRAND)),
+        Span::styled("Back to the dashboard", Style::default().fg(colors::MUTED)),
+    ];
+    if count > 0 {
+        spans.push(separator.clone());
+        spans.push(Span::styled(
+            if count == 1 {
+                "1 ".to_string()
+            } else {
+                format!("1-{count} ")
+            },
+            Style::default().fg(colors::BRAND),
+        ));
+        spans.push(Span::styled(
+            "Open that pull request (or click its link)",
+            Style::default().fg(colors::MUTED),
+        ));
+    }
+    spans.push(separator);
+    spans.push(Span::styled(
+        "PgUp/PgDn ",
+        Style::default().fg(colors::BRAND),
+    ));
+    spans.push(Span::styled("Scroll", Style::default().fg(colors::MUTED)));
+    Line::from(spans)
+}
+
+/// The plan review's keyboard hints, styled like every other footer in the
+/// pull-request commands: the key in the brand accent (error pink for the
+/// cancelling one) and its action muted.
+fn shortcuts_line() -> Line<'static> {
+    let separator = Span::styled("  ·  ", Style::default().fg(colors::MUTED));
+    Line::from(vec![
+        Span::styled("PgUp/PgDn ", Style::default().fg(colors::BRAND)),
+        Span::styled("Scroll", Style::default().fg(colors::MUTED)),
+        separator.clone(),
+        Span::styled("Home/End ", Style::default().fg(colors::BRAND)),
+        Span::styled("Jump to top/bottom", Style::default().fg(colors::MUTED)),
+        separator,
+        Span::styled("Esc ", Style::default().fg(colors::ERROR)),
+        Span::styled("Cancel", Style::default().fg(colors::MUTED)),
+    ])
 }
 
 fn describe_change_unit(unit: &ChangeUnit) -> String {
@@ -1736,30 +2058,60 @@ fn push_review_table_styled_row(
     let field_style = Style::default()
         .fg(colors::GRAY_DARK)
         .add_modifier(Modifier::BOLD);
-    let mut detail = Vec::new();
+
+    for (index, detail) in wrap_styled_segments(segments, detail_width)
+        .into_iter()
+        .enumerate()
+    {
+        push_styled_review_line(lines, field, index == 0, field_style, detail);
+    }
+}
+
+/// Splits one unbreakable word into `width`-sized chunks; shorter words are
+/// returned untouched.
+fn split_word(word: &str, width: usize) -> Vec<String> {
+    if word.chars().count() <= width {
+        return vec![word.to_string()];
+    }
+    let characters: Vec<char> = word.chars().collect();
+    characters
+        .chunks(width.max(1))
+        .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
+/// Word-wraps styled segments to `width`, keeping each segment's own style.
+fn wrap_styled_segments(segments: Vec<(String, Style)>, width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    let mut detail: Vec<Span<'static>> = Vec::new();
     let mut detail_len = 0;
-    let mut first_line = true;
 
     for (text, style) in segments {
-        for word in text.split_whitespace() {
+        // Branch names, worktree paths and URLs have no spaces to break on,
+        // so anything longer than the line is split by character instead —
+        // otherwise it would overflow the bordered group it sits in.
+        for word in text
+            .split_whitespace()
+            .flat_map(|word| split_word(word, width))
+        {
             let separator = usize::from(detail_len > 0);
-            if detail_len + separator + word.chars().count() > detail_width && !detail.is_empty() {
-                push_styled_review_line(lines, field, first_line, field_style, detail);
-                detail = Vec::new();
+            if detail_len + separator + word.chars().count() > width && !detail.is_empty() {
+                wrapped.push(std::mem::take(&mut detail));
                 detail_len = 0;
-                first_line = false;
             }
             if detail_len > 0 {
                 detail.push(Span::raw(" "));
                 detail_len += 1;
             }
-            detail.push(Span::styled(word.to_string(), style));
             detail_len += word.chars().count();
+            detail.push(Span::styled(word, style));
         }
     }
     if !detail.is_empty() {
-        push_styled_review_line(lines, field, first_line, field_style, detail);
+        wrapped.push(detail);
     }
+    wrapped
 }
 
 fn push_styled_review_line(
@@ -1782,15 +2134,18 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut wrapped = Vec::new();
     let mut current = String::new();
-    for word in text.split_whitespace() {
+    for word in text
+        .split_whitespace()
+        .flat_map(|word| split_word(word, width))
+    {
         if current.is_empty() {
-            current.push_str(word);
+            current.push_str(&word);
         } else if current.chars().count() + 1 + word.chars().count() <= width {
             current.push(' ');
-            current.push_str(word);
+            current.push_str(&word);
         } else {
             wrapped.push(current);
-            current = word.to_string();
+            current = word;
         }
     }
     if !current.is_empty() {

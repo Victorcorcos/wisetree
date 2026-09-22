@@ -1390,7 +1390,13 @@ pub fn parse_split_plan(response: &str, preflight: &SplitPreflight) -> Result<Sp
             "Split plan must contain at least two responsibilities.",
         ));
     }
-    let slug = Regex::new(r"^[a-z0-9]+(?:-[a-z0-9]+)*$").expect("static slug regex");
+    // Generated branches and worktrees join their parts with `_`, so a
+    // hyphenated slug from the planner is normalized rather than rejected:
+    // `feature.1_add-equinor-sync` becomes `feature.1_add_equinor_sync`.
+    for responsibility in &mut plan.responsibilities {
+        responsibility.branch_slug = responsibility.branch_slug.replace('-', "_");
+    }
+    let slug = Regex::new(r"^[a-z0-9]+(?:_[a-z0-9]+)*$").expect("static slug regex");
     let manifest = preflight
         .units
         .iter()

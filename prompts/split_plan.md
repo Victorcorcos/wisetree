@@ -37,7 +37,7 @@ Keep the user-facing fields simple and distinct:
 
 - `name` is the responsibility: a short, plain-language description of exactly what this pull request does. Make it intuitive without reading the diff. Prefer a concrete action such as "Add split-plan validation"; never use vague labels such as "Foundation", "Consumer", "Changes", or "Part 1".
 - `rationale` is the dependency: one short sentence saying what this pull request depends on and why. For the first layer, say that it applies directly to the resolved base and has no stack dependency. Do not repeat the responsibility.
-- `branch_slug` is a short lowercase kebab-case version of the responsibility.
+- `branch_slug` is a short lowercase snake_case version of the responsibility: words joined with `_`, never `-`.
 - `independent` is `true` when this pull request starts a new chain: it applies straight onto the resolved base instead of onto the responsibility below it. Set it `false` whenever you are unsure — the default is to stack.
 
 Responsibilities form one or more chains. A responsibility with `independent: false` stacks on the one directly below it; a responsibility with `independent: true` starts a fresh chain at the resolved base. **Order the responsibilities so each chain is contiguous** — emit a whole chain bottom to top, then start the next one. Chains merge independently of each other, so use a new chain whenever a group of responsibilities has nothing to do with the groups before it.
@@ -50,4 +50,4 @@ Do not supply or calculate additions, deletions, totals, integrity data, or whic
 
 Reply with exactly one JSON object and no Markdown fences or prose. Use this exact schema; do not add fields:
 
-{"responsibilities":[{"order":1,"name":"short plain-language description of what this pull request does","branch_slug":"short-kebab-slug","rationale":"one short sentence identifying the layer below (or resolved base) and why this pull request depends on it","independent":false,"units":["CU0001"],"paths":["path/from/manifest"]}]}
+{"responsibilities":[{"order":1,"name":"short plain-language description of what this pull request does","branch_slug":"short_snake_slug","rationale":"one short sentence identifying the layer below (or resolved base) and why this pull request depends on it","independent":false,"units":["CU0001"],"paths":["path/from/manifest"]}]}
