@@ -13,10 +13,40 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::schema::{AiHarness, AiModelConfig};
-use crate::errors::{AiErrorCode, Result, WisetreeError};
+use crate::errors::{user_friendly_message, AiErrorCode, Result, WisetreeError};
+
+use super::ai_turn::is_usage_limit_error;
 
 const CLAUDE_STREAMING_MIN_VERSION: (u64, u64, u64) = (2, 1, 214);
 pub const DEFAULT_ACTIVITY_LIMIT: usize = 200;
+
+/// Backoff policy for a captured run the harness refused because a usage
+/// allowance is exhausted (a "5-hour" plan window, a weekly limit, HTTP
+/// 429). The CLI exits non-zero within seconds, so without a wait the
+/// pipeline would record a hard failure for every command in flight —
+/// Improve's parallel scans all failing at once is the crash this guards.
+/// Instead the run sleeps out the allowance: the first retry waits
+/// [`Self::first`], each following wait doubles up to [`Self::max`], and
+/// the accumulated waits stop at [`Self::budget`] so a weekly limit (or a
+/// billing problem) still terminates with the harness's own error.
+#[derive(Debug, Clone, Copy)]
+struct UsageLimitBackoff {
+    first: Duration,
+    max: Duration,
+    budget: Duration,
+}
+
+impl Default for UsageLimitBackoff {
+    fn default() -> Self {
+        Self {
+            first: Duration::from_secs(30),
+            max: Duration::from_secs(30 * 60),
+            // Generous enough to outlast a 5-hour window; a weekly limit
+            // exceeds any sane wait and fails with the real message.
+            budget: Duration::from_secs(6 * 60 * 60),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiRunMode {
@@ -66,6 +96,7 @@ pub struct AiRunner {
     opencode_binary: PathBuf,
     codex_binary: PathBuf,
     claude_binary: PathBuf,
+    usage_limit_backoff: UsageLimitBackoff,
 }
 
 impl Default for AiRunner {
@@ -74,6 +105,7 @@ impl Default for AiRunner {
             opencode_binary: PathBuf::from("opencode"),
             codex_binary: PathBuf::from("codex"),
             claude_binary: PathBuf::from("claude"),
+            usage_limit_backoff: UsageLimitBackoff::default(),
         }
     }
 }
@@ -252,6 +284,45 @@ impl AiRunner {
         activity_tx: Option<mpsc::UnboundedSender<String>>,
         mut cancel: oneshot::Receiver<()>,
     ) -> Result<AiCapturedRun> {
+        let policy = self.usage_limit_backoff;
+        let mut waited = Duration::ZERO;
+        let mut wait = policy.first;
+        loop {
+            let error = match self
+                .run_captured_once(request, activity_tx.as_ref(), &mut cancel)
+                .await
+            {
+                Ok(run) => return Ok(run),
+                Err(error) => error,
+            };
+            // A temporary allowance exhaustion waits out its reset and
+            // re-runs the command, so the surrounding pipeline keeps its
+            // slot occupied instead of recording a failure. Any other
+            // failure — or a spent budget — surfaces the harness's own
+            // message untouched.
+            if !is_usage_limit_error(&user_friendly_message(&error))
+                || waited.saturating_add(wait) > policy.budget
+            {
+                return Err(error);
+            }
+            if let Some(tx) = &activity_tx {
+                let _ = tx.send(format!(
+                    "usage limit reached — waiting {} for the harness allowance to reset",
+                    describe_wait(wait)
+                ));
+            }
+            tokio::time::sleep(wait).await;
+            waited += wait;
+            wait = wait.checked_mul(2).unwrap_or(policy.max).min(policy.max);
+        }
+    }
+
+    async fn run_captured_once(
+        &self,
+        request: &AiRunRequest,
+        activity_tx: Option<&mpsc::UnboundedSender<String>>,
+        cancel: &mut oneshot::Receiver<()>,
+    ) -> Result<AiCapturedRun> {
         let command = self.preflight(request).await?;
         let mut child = Command::new(&command.binary)
             .args(&command.args)
@@ -284,7 +355,7 @@ impl AiRunner {
                     activity.pop_front();
                 }
                 activity.push_back(line.clone());
-                if let Some(tx) = &activity_tx {
+                if let Some(tx) = activity_tx {
                     let _ = tx.send(line.clone());
                 }
                 if is_stdout {
@@ -302,7 +373,7 @@ impl AiRunner {
         };
         let status = tokio::select! {
             status = tokio::time::timeout(request.timeout, completion) => status.map_err(|_| self.error(request, AiErrorCode::TimedOut, "captured run timed out"))??,
-            _ = &mut cancel => { let _ = child.kill().await; return Err(self.error(request, AiErrorCode::Cancelled, "captured run was cancelled")); }
+            _ = &mut *cancel => { let _ = child.kill().await; return Err(self.error(request, AiErrorCode::Cancelled, "captured run was cancelled")); }
         };
         if !status.success() {
             return Err(self.error(
@@ -327,6 +398,12 @@ impl AiRunner {
             activity: activity.into_iter().collect(),
             transcript,
         })
+    }
+
+    #[cfg(test)]
+    fn with_usage_limit_backoff(mut self, backoff: UsageLimitBackoff) -> Self {
+        self.usage_limit_backoff = backoff;
+        self
     }
 
     fn binary(&self, harness: AiHarness) -> &Path {
@@ -549,6 +626,25 @@ where
     }
 }
 
+/// Compact human form for a retry wait: `45s`, `10m`, `2h`, `2h 30m`.
+fn describe_wait(wait: Duration) -> String {
+    if wait.as_secs() == 0 {
+        return format!("{wait:?}");
+    }
+    let seconds = wait.as_secs();
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    match minutes % 60 {
+        0 => format!("{}h", minutes / 60),
+        rem => format!("{}h {rem}m", minutes / 60),
+    }
+}
+
 fn classify_cli_failure(stderr: &str) -> AiErrorCode {
     let stderr = stderr.to_ascii_lowercase();
     if [
@@ -632,6 +728,201 @@ mod tests {
             session_title: None,
             attachments: Vec::new(),
         }
+    }
+
+    /// POSIX shell stub for one harness CLI. It answers `--version` so the
+    /// preflight accepts it, counts its real invocations into `invocations`
+    /// in `dir`, and runs `body` with `n` bound to that 1-based count.
+    fn fake_cli(dir: &Path, body: &str) -> PathBuf {
+        let counter = dir.join("invocations");
+        let path = dir.join("fake-cli.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"--version\" ]; then\n  echo fake 2.1.214\n  exit 0\nfi\n\
+                 n=$(cat {counter} 2>/dev/null || echo 0)\n\
+                 n=$((n+1))\n\
+                 echo $n > {counter}\n\
+                 {body}\n",
+                counter = counter.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    fn invocations(dir: &Path) -> u32 {
+        std::fs::read_to_string(dir.join("invocations"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// A captured request against a real tempdir cwd, with a permissive
+    /// timeout: the fake CLI finishes instantly, the backoff waits happen
+    /// between attempts.
+    fn captured_request(harness: AiHarness, cwd: &Path) -> AiRunRequest {
+        AiRunRequest {
+            slot: "dashboard.ai.review.strong".into(),
+            config: AiModelConfig {
+                model: match harness {
+                    AiHarness::OpenCode => "openai/gpt-5".into(),
+                    AiHarness::Codex => "openai/gpt-5".into(),
+                    AiHarness::ClaudeCode => "anthropic/claude-sonnet".into(),
+                },
+                thinking: "high".into(),
+                harness,
+            },
+            prompt: "review this".into(),
+            cwd: cwd.to_path_buf(),
+            mode: AiRunMode::Captured,
+            permission: AiPermission::Plan,
+            timeout: Duration::from_secs(30),
+            activity_limit: 2,
+            session_title: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Millisecond backoff so retry tests sleep milliseconds, not minutes.
+    fn fast_backoff() -> UsageLimitBackoff {
+        UsageLimitBackoff {
+            first: Duration::from_millis(50),
+            max: Duration::from_millis(100),
+            budget: Duration::from_secs(2),
+        }
+    }
+
+    /// The observed failure: every captured scan hits a usage-limited CLI.
+    /// Each harness must wait out its backoff and resume instead of
+    /// returning a hard failure to the pipeline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn usage_limited_captured_runs_back_off_and_resume_for_every_harness() {
+        for harness in [AiHarness::OpenCode, AiHarness::Codex, AiHarness::ClaudeCode] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cli = fake_cli(
+                tmp.path(),
+                "if [ \"$n\" -lt 3 ]; then\n  echo 'You have hit your usage limit' >&2\n  exit 1\nfi\necho \"recovered on call $n\"\n",
+            );
+            let runner = AiRunner::default()
+                .with_binary(harness, cli)
+                .with_usage_limit_backoff(fast_backoff());
+            let (_cancel_tx, cancel) = oneshot::channel();
+            let run = runner
+                .run_captured(&captured_request(harness, tmp.path()), None, cancel)
+                .await
+                .unwrap_or_else(|error| panic!("{harness:?} must outlast the limit: {error}"));
+            assert!(run.transcript.contains("recovered on call 3"));
+            assert_eq!(invocations(tmp.path()), 3, "{harness:?} retried twice");
+        }
+    }
+
+    /// Once the backoff budget is spent the harness's own error is surfaced
+    /// untouched — a weekly (or revoked-billing) limit is not cured by
+    /// waiting, and the user must see the real message.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn usage_limit_retry_stops_after_the_backoff_budget_and_surfaces_the_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = fake_cli(
+            tmp.path(),
+            "echo 'You have hit your usage limit' >&2\nexit 1\n",
+        );
+        let runner = AiRunner::default()
+            .with_binary(AiHarness::Codex, cli)
+            .with_usage_limit_backoff(UsageLimitBackoff {
+                first: Duration::from_millis(50),
+                max: Duration::from_millis(100),
+                budget: Duration::ZERO,
+            });
+        let (_cancel_tx, cancel) = oneshot::channel();
+        let error = runner
+            .run_captured(
+                &captured_request(AiHarness::Codex, tmp.path()),
+                None,
+                cancel,
+            )
+            .await
+            .expect_err("a spent budget must surface the harness error");
+        assert!(
+            error.to_string().contains("usage limit"),
+            "the harness message must be preserved: {error}"
+        );
+        assert_eq!(invocations(tmp.path()), 1, "no budget means no retry");
+    }
+
+    /// Failures that a wait cannot cure (auth, bad flag, …) fail on the
+    /// first attempt instead of stalling the pipeline in backoff loops.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_limit_captured_failures_are_never_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = fake_cli(tmp.path(), "echo 'not logged in' >&2\nexit 1\n");
+        let runner = AiRunner::default()
+            .with_binary(AiHarness::ClaudeCode, cli)
+            .with_usage_limit_backoff(fast_backoff());
+        let (_cancel_tx, cancel) = oneshot::channel();
+        let error = runner
+            .run_captured(
+                &captured_request(AiHarness::ClaudeCode, tmp.path()),
+                None,
+                cancel,
+            )
+            .await
+            .expect_err("an authentication failure must surface");
+        assert!(error.to_string().contains("not logged in"));
+        assert_eq!(invocations(tmp.path()), 1, "only usage limits may retry");
+    }
+
+    /// The split flow forwards every output line to its AI Activity panel:
+    /// the retry wait must be visible there, and real output must keep
+    /// flowing after a limited attempt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backoff_waits_and_output_reach_the_activity_channel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cli = fake_cli(
+            tmp.path(),
+            "if [ \"$n\" -eq 1 ]; then\n  echo 'You have hit your usage limit' >&2\n  exit 1\nfi\necho \"final answer $n\"\n",
+        );
+        let runner = AiRunner::default()
+            .with_binary(AiHarness::OpenCode, cli)
+            .with_usage_limit_backoff(fast_backoff());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            while let Some(line) = rx.recv().await {
+                lines.push(line);
+            }
+            lines
+        });
+        let (_cancel_tx, cancel) = oneshot::channel();
+        runner
+            .run_captured(
+                &captured_request(AiHarness::OpenCode, tmp.path()),
+                Some(tx),
+                cancel,
+            )
+            .await
+            .expect("the run should resume after the limit");
+        let lines = collector.await.unwrap();
+        assert!(lines.iter().any(|line| line.contains("final answer 2")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("usage limit reached — waiting")),
+            "the wait must be announced on the activity channel: {lines:?}"
+        );
+        assert_eq!(invocations(tmp.path()), 2);
     }
 
     #[test]
