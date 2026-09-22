@@ -711,6 +711,45 @@ fn prompt_contains_frozen_manifest_and_revision_only_when_both_inputs_exist() {
 }
 
 #[test]
+fn prompt_ranks_rejection_feedback_above_the_grouping_defaults() {
+    // A developer who rejects a proposal asking for "tests in one pull request,
+    // the feature in another" was losing to the prompt's own test-grouping rule:
+    // the revision context carried the feedback but never said to act on it, so
+    // the planner kept re-emitting the grouping it had just been told was wrong.
+    let prompt = build_split_plan_prompt(
+        &fixture(),
+        Some(valid_response()),
+        Some("put the tests in their own pull request"),
+    );
+    assert!(
+        prompt.contains("highest-priority instruction in this prompt"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("overrides every default below it, including the test-grouping default"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("Never hand back the grouping the developer just rejected"),
+        "{prompt}"
+    );
+    // The test-grouping rule has to read as an overridable default, not a law.
+    assert!(
+        prompt.contains("a default the rejection feedback overrides"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("keep every `test` unit with the implementation it covers"),
+        "{prompt}"
+    );
+    // Feedback outranks the heuristics, never the JSON contract.
+    assert!(
+        prompt.contains("The only thing the feedback cannot override is the JSON contract"),
+        "{prompt}"
+    );
+}
+
+#[test]
 fn corrective_prompt_only_reasserts_the_unchanged_contract_failure() {
     let original = build_split_plan_prompt(&fixture(), None, None);
     let corrected = build_corrective_plan_prompt(&original, "unknown unit CU9999");

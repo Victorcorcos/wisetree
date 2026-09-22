@@ -29,7 +29,9 @@ Rejection feedback (empty on the first proposal):
 USER_FEEDBACK
 ```
 
-Each manifest row is labelled `test` or `implementation`. Create at least two bottom-to-top responsibilities. Each responsibility must follow the Single Responsibility Principle and keep every `test` unit with the implementation it covers. Assign every change-unit ID exactly once. `paths` must exactly list the paths represented by `units`.
+When the rejection feedback above is non-empty, the developer has already read the previous proposal and stated exactly what is wrong with it. That feedback is the highest-priority instruction in this prompt and it overrides every default below it, including the test-grouping default and the size guideline. Obey it literally: when it dictates a grouping — such as "put these files and the tests in one pull request and the feature in another" — emit exactly that grouping instead of the one you would have chosen on your own. Revise the previous proposal rather than starting over: keep whatever the feedback does not touch, and re-emit the complete revised plan. Never hand back the grouping the developer just rejected. The only thing the feedback cannot override is the JSON contract below: every change-unit ID still has to be assigned exactly once, and `paths` must still match `units`.
+
+Each manifest row is labelled `test` or `implementation`. Create at least two bottom-to-top responsibilities. Each responsibility must follow the Single Responsibility Principle, and by default a `test` unit ships in the same responsibility as the implementation it covers — a default the rejection feedback overrides when it asks for tests to land in a pull request of their own. Assign every change-unit ID exactly once. `paths` must exactly list the paths represented by `units`.
 
 Keep the user-facing fields simple and distinct:
 
