@@ -1332,12 +1332,13 @@ impl ReviewPullRequestScreen {
                 colors::MUTED,
                 None,
             ));
-            persist_scan_telemetry(&self.scan_telemetry);
+            persist_scan_telemetry(&self.request.worktree_path, &self.scan_telemetry);
             self.telemetry_reported = true;
         }
         // The table only ever shows a viewport of rows; the file keeps all of
         // them so a long run stays diagnosable once this screen closes.
         persist_run_report(
+            &self.request.worktree_path,
             self.request.number,
             self.posted.len(),
             &self.summary_rows,
@@ -2675,7 +2676,7 @@ impl ReviewPullRequestScreen {
         let footer = if self.decision_max_scroll.get() > 0 {
             format!(
                 "↑/↓ scroll · any other key continues · full report: {}",
-                review_report_path_label()
+                review_report_path_label(&self.request.worktree_path)
             )
         } else {
             "Press any key to continue".to_string()
@@ -2703,9 +2704,11 @@ fn visible_attachment_references(text: &str, attachments: &[ImageAttachment]) ->
         .collect()
 }
 
-/// Append the finished run's complete row list to `~/.wisetree/`. Skipped
-/// under test so the suite never touches the user's home directory.
+/// Append the finished run's complete row list to the reviewed repository's
+/// `.wisetree/review/`. Skipped under test so the suite never writes into
+/// whatever path a fixture request happens to name.
 fn persist_run_report(
+    worktree_path: &str,
     number: u64,
     posted: usize,
     rows: &[SummaryRow],
@@ -2713,19 +2716,24 @@ fn persist_run_report(
 ) {
     #[cfg(not(test))]
     {
+        let worktree = std::path::PathBuf::from(worktree_path);
         let rows = rows.to_vec();
         let scans = scans.to_vec();
         tokio::task::spawn_blocking(move || {
-            crate::services::review_report::persist_review_report(number, posted, &rows, &scans);
+            crate::services::review_report::persist_review_report(
+                &worktree, number, posted, &rows, &scans,
+            );
         });
     }
     #[cfg(test)]
-    let _ = (number, posted, rows, scans);
+    let _ = (worktree_path, number, posted, rows, scans);
 }
 
-/// `~/.wisetree/review_report.json`, shortened back to `~` for the footer.
-fn review_report_path_label() -> String {
-    let path = crate::constants::review_report_file();
+/// The repository's `.wisetree/review/report.json`, shortened back to `~` for
+/// the footer.
+fn review_report_path_label(worktree_path: &str) -> String {
+    let path =
+        crate::services::review_report::review_report_file(std::path::Path::new(worktree_path));
     let display = path.display().to_string();
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() => display
@@ -2736,16 +2744,17 @@ fn review_report_path_label() -> String {
     }
 }
 
-fn persist_scan_telemetry(scans: &[ReviewScanTelemetry]) {
+fn persist_scan_telemetry(worktree_path: &str, scans: &[ReviewScanTelemetry]) {
     #[cfg(not(test))]
     {
+        let worktree = std::path::PathBuf::from(worktree_path);
         let scans = scans.to_vec();
         tokio::task::spawn_blocking(move || {
-            crate::services::review_telemetry::persist_review_telemetry(&scans);
+            crate::services::review_telemetry::persist_review_telemetry(&worktree, &scans);
         });
     }
     #[cfg(test)]
-    let _ = scans;
+    let _ = (worktree_path, scans);
 }
 
 /// Render a centered row of bordered buttons, each sized to exactly its own

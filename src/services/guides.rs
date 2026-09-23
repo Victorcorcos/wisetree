@@ -236,7 +236,7 @@ fn truncate(value: &str, max_bytes: usize) -> String {
 /// The mother worktree of `worktree_path`, derived from its `.git` entry: a
 /// directory means this *is* the mother, a file points at
 /// `<mother>/.git/worktrees/<name>`.
-fn mother_worktree(worktree_path: &Path) -> Option<PathBuf> {
+pub(crate) fn mother_worktree(worktree_path: &Path) -> Option<PathBuf> {
     let dot_git = worktree_path.join(".git");
     if dot_git.is_dir() {
         return Some(worktree_path.to_path_buf());

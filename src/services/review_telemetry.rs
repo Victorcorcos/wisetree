@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::constants::review_telemetry_file;
+use crate::constants::{review_artifact_file, REVIEW_TELEMETRY_FILE_NAME};
 use crate::services::ai_status::AiStatusPaths;
 
 const REVIEW_TELEMETRY_RUNS_MAX: usize = 8;
@@ -189,8 +189,11 @@ pub(crate) fn review_telemetry_label(scans: &[ReviewScanTelemetry]) -> String {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) fn persist_review_telemetry(scans: &[ReviewScanTelemetry]) {
-    let _ = persist_review_telemetry_at(&review_telemetry_file(), scans);
+pub(crate) fn persist_review_telemetry(worktree_path: &Path, scans: &[ReviewScanTelemetry]) {
+    let _ = persist_review_telemetry_at(
+        &review_artifact_file(worktree_path, REVIEW_TELEMETRY_FILE_NAME),
+        scans,
+    );
 }
 
 fn persist_review_telemetry_at(path: &Path, scans: &[ReviewScanTelemetry]) -> std::io::Result<()> {

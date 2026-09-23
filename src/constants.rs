@@ -1,6 +1,6 @@
 //! Compile-time and runtime constants — config paths, app metadata.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Filename of the project-local config (lives next to the repo root).
 pub const LOCAL_CONFIG_FILE_NAME: &str = ".wisetree.json";
@@ -38,13 +38,18 @@ pub const IMAGE_UPLOAD_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// Filename of the dashboard pull-request cache.
 pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 
+/// Directory holding every repository-local Review artifact, relative to a
+/// repository root. Review history is about one repository's pull requests,
+/// so it is stored with that repository rather than in the global config.
+pub const REVIEW_DIR_NAME: &str = ".wisetree/review";
+
 /// Filename of the bounded Review Pull Request scan-telemetry history.
-pub const REVIEW_TELEMETRY_FILE_NAME: &str = "review_telemetry.json";
+pub const REVIEW_TELEMETRY_FILE_NAME: &str = "telemetry.json";
 
 /// Filename of the bounded Review Pull Request run-report history (every
 /// summary row of the last few runs, so a run too long for the table stays
 /// diagnosable after the screen closes).
-pub const REVIEW_REPORT_FILE_NAME: &str = "review_report.json";
+pub const REVIEW_REPORT_FILE_NAME: &str = "report.json";
 
 /// Commit message title written when the "Update Pull Request" flow
 /// committed the result of an AI-assisted conflict resolution. Kept as a
@@ -102,14 +107,17 @@ pub fn dashboard_pr_cache_file() -> PathBuf {
     global_config_dir().join(DASHBOARD_PR_CACHE_FILE_NAME)
 }
 
-/// Path to the bounded Review Pull Request telemetry history.
-pub fn review_telemetry_file() -> PathBuf {
-    global_config_dir().join(REVIEW_TELEMETRY_FILE_NAME)
-}
-
-/// Path to the bounded Review Pull Request run-report history.
-pub fn review_report_file() -> PathBuf {
-    global_config_dir().join(REVIEW_REPORT_FILE_NAME)
+/// Path to a repository-local Review artifact.
+///
+/// Review history describes one repository's pull requests, so it belongs to
+/// that repository. It is anchored on the *mother* worktree rather than the
+/// worktree the run happened in: Wisetree exists to create and delete
+/// worktrees, and history written into a throwaway checkout dies with it.
+pub fn review_artifact_file(worktree_path: &Path, file_name: &str) -> PathBuf {
+    crate::services::guides::mother_worktree(worktree_path)
+        .unwrap_or_else(|| worktree_path.to_path_buf())
+        .join(REVIEW_DIR_NAME)
+        .join(file_name)
 }
 
 /// Resolve opencode's persisted model-state file

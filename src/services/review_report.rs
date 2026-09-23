@@ -4,7 +4,7 @@
 //! that produces hundreds of them (say, one withheld finding per verification
 //! that never completed) is otherwise unreadable and gone the moment the
 //! screen closes. Every finished run therefore appends its complete row list
-//! to `~/.wisetree/review_report.json`.
+//! to `.wisetree/review/report.json` in the reviewed repository.
 
 use std::fs;
 use std::path::Path;
@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::constants::review_report_file;
+use crate::constants::{review_artifact_file, REVIEW_REPORT_FILE_NAME};
 use crate::services::review_telemetry::ReviewScanTelemetry;
 use crate::tui::widgets::SummaryRow;
 
@@ -74,12 +74,24 @@ impl From<&SummaryRow> for ReviewReportRow {
 /// Append one finished review run to the bounded history. Best-effort: a
 /// report that cannot be written never disturbs the run that produced it.
 pub fn persist_review_report(
+    worktree_path: &Path,
     pull_request: u64,
     posted: usize,
     rows: &[SummaryRow],
     scans: &[ReviewScanTelemetry],
 ) {
-    let _ = persist_review_report_at(&review_report_file(), pull_request, posted, rows, scans);
+    let _ = persist_review_report_at(
+        &review_report_file(worktree_path),
+        pull_request,
+        posted,
+        rows,
+        scans,
+    );
+}
+
+/// Where this repository's run-report history lives.
+pub fn review_report_file(worktree_path: &Path) -> std::path::PathBuf {
+    review_artifact_file(worktree_path, REVIEW_REPORT_FILE_NAME)
 }
 
 fn persist_review_report_at(
@@ -194,6 +206,46 @@ mod tests {
         assert!(json.contains("promptBytes"));
         assert!(json.contains("uncachedInput"));
         assert!(json.contains("cacheRead"));
+    }
+
+    /// Wisetree deletes worktrees for a living, so a history written into the
+    /// worktree a review ran in would disappear with it. It is anchored on the
+    /// mother checkout instead, which outlives every worktree cut from it.
+    #[test]
+    fn the_report_lands_in_the_mother_checkout_not_the_worktree_it_ran_in() {
+        let mother = tempdir().unwrap();
+        fs::create_dir_all(mother.path().join(".git").join("worktrees").join("feature")).unwrap();
+        let worktree = tempdir().unwrap();
+        fs::write(
+            worktree.path().join(".git"),
+            format!(
+                "gitdir: {}",
+                mother
+                    .path()
+                    .join(".git")
+                    .join("worktrees")
+                    .join("feature")
+                    .display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            review_report_file(worktree.path()),
+            mother.path().join(".wisetree/review").join("report.json")
+        );
+    }
+
+    /// Reviewing straight from the main checkout still writes next to it.
+    #[test]
+    fn a_plain_checkout_keeps_its_own_report() {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join(".git")).unwrap();
+
+        assert_eq!(
+            review_report_file(repo.path()),
+            repo.path().join(".wisetree/review").join("report.json")
+        );
     }
 
     #[test]
