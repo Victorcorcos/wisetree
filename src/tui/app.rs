@@ -4358,7 +4358,7 @@ impl App {
                 } => {
                     if let Some(screen) = self.review_pr.as_mut() {
                         screen.set_scan_mode(scan_mode);
-                        screen.set_review_context(context);
+                        screen.set_review_context(*context);
                         screen.set_files(files, owner, repo, head_sha);
                         screen.record_skipped_files(&skipped);
                     }

@@ -1013,7 +1013,9 @@ pub enum ReviewPreparation {
     Ready {
         files: Vec<ReviewFile>,
         scan_mode: ReviewScanMode,
-        context: ReviewContext,
+        /// Boxed so the one big variant does not set the size of every
+        /// `ReviewPreparation` the preparation task returns.
+        context: Box<ReviewContext>,
         /// Changed files nobody reviews by hand (lockfiles, minified
         /// bundles, snapshots, …), filtered out deterministically before
         /// any AI call. Reported on the final table with their reason.
@@ -1133,6 +1135,10 @@ pub struct ReviewContext {
     pub convention_docs: String,
     pub directory_inventory: String,
     pub changed_file_manifest: String,
+    /// The repository's guide index (see [`crate::services::guides`]) — names
+    /// and "Use when" lines only, never bodies. Prepared once per review and
+    /// carried in the shared context so every scan profile sees the same list.
+    pub guides: String,
     pub(crate) coverage_ledger: ReviewCoverageLedger,
 }
 
@@ -1153,8 +1159,13 @@ impl ReviewContext {
         } else {
             &self.changed_file_manifest
         };
+        let guides = if self.guides.trim().is_empty() {
+            crate::services::guides::NO_GUIDES
+        } else {
+            &self.guides
+        };
         format!(
-            "### Root convention documents\n{docs}\n\n### Changed-directory inventory\n{inventory}\n\n### Complete changed-file manifest\n{manifest}"
+            "### Root convention documents\n{docs}\n\n### Repository guides\n{guides}\n\n### Changed-directory inventory\n{inventory}\n\n### Complete changed-file manifest\n{manifest}"
         )
     }
 }
@@ -3706,7 +3717,7 @@ impl DashboardService {
         Ok(ReviewPreparation::Ready {
             scan_mode: review_scan_mode(&files),
             files,
-            context,
+            context: Box::new(context),
             skipped,
             owner,
             repo,
@@ -11097,6 +11108,7 @@ async fn build_review_context(cwd: &Path, files: &[ReviewFile]) -> ReviewContext
     let coverage_ledger = build_coverage_ledger(root.clone(), coverage_inputs).await;
     ReviewContext {
         convention_docs: render_review_documents(&documents, REVIEW_REPO_CONTEXT_MAX_BYTES),
+        guides: truncate_bugkill_field(&guides::index_for(&root), GUIDES_MAX_BYTES),
         directory_inventory: build_review_directory_inventory(
             &root,
             files,
@@ -11532,7 +11544,10 @@ fn review_file_is_binary(file: &ReviewFile) -> bool {
             .starts_with("### CHANGE: deleted binary file")
 }
 
-const PROJECT_TEST_PATTERNS_FILE: &str = ".wisetree-review-tests";
+/// Hand-written globs naming the files this project treats as tests, for the
+/// cases the path heuristics miss. Lives under `.wisetree/review/` so every
+/// repository-local Wisetree artifact shares one gitignored directory.
+const PROJECT_TEST_PATTERNS_FILE: &str = ".wisetree/review/test_patterns.txt";
 const PROJECT_TEST_PATTERNS_MAX_BYTES: usize = 16 * 1024;
 const PROJECT_TEST_CLASSIFICATION: &str = "### CLASSIFICATION: test file (project pattern)\n";
 
@@ -13727,11 +13742,36 @@ error: could not fetch gustavo";
             worked: None,
         };
 
+        // Review and Improve share the scan builders below and reach the
+        // index through the context they both prepare, not a placeholder.
+        let application = ReviewFile {
+            path: "app/policies/admin.rb".to_string(),
+            annotated_diff: "     1 +def allowed?; true; end".to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let test = ReviewFile {
+            path: "spec/policies/admin_spec.rb".to_string(),
+            annotated_diff: "     1 +expect(policy).to be_allowed".to_string(),
+            ..application.clone()
+        };
+        let files = [application.clone(), test.clone()];
+        let context = ReviewContext {
+            guides: index.clone(),
+            ..ReviewContext::default()
+        };
+
         let prompts = [
             build_develop_plan_prompt("task", None, None, None, &index),
             build_develop_implement_prompt("task", "s", "o", "", None, &index),
             build_bug_investigate_prompt("bug", None, &index),
             build_bug_fix_prompt("bug", &row, None, &index),
+            build_review_scan_prompt(&application, &context, "/tmp/tables.md"),
+            build_review_scan_prompt(&test, &context, "/tmp/tables.md"),
+            build_review_coverage_prompt(&files, &context, &[]),
+            build_review_merged_prompt(&files, &context, &[], "/tmp/tables.md"),
         ];
 
         for prompt in prompts {
@@ -13741,6 +13781,56 @@ error: could not fetch gustavo";
             assert!(prompt.contains("CODE WINS"), "{prompt}");
             assert!(!prompt.contains("REPOSITORY_GUIDES"), "{prompt}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_review_context_discovers_guides_from_the_worktree() {
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join(guides::GUIDES_DIR)).unwrap();
+        std::fs::write(
+            worktree.path().join(guides::GUIDES_DIR).join("tenancy.md"),
+            "---\nname: tenancy\nwhen: touching anything scoped to an account\n---\n\nLong body \
+             the prompt must never embed.\n",
+        )
+        .unwrap();
+        let files = vec![ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "     1 +let x = 1;".to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        }];
+
+        let context = build_review_context(worktree.path(), &files).await;
+
+        assert!(context.guides.contains("tenancy"));
+        assert!(context.guides.contains(".wisetree/guides/tenancy.md"));
+        // Only the header travels; the body stays on disk for the harness to
+        // read on demand, which is the whole point of the index.
+        assert!(!context.guides.contains("Long body"));
+        let prompt = build_review_scan_prompt(&files[0], &context, "/tmp/tables.md");
+        assert!(prompt.contains("### Repository guides"), "{prompt}");
+        assert!(prompt.contains(".wisetree/guides/tenancy.md"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn a_worktree_without_guides_tells_the_reviewer_so() {
+        let worktree = tempfile::tempdir().unwrap();
+        let files = vec![ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "     1 +let x = 1;".to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        }];
+
+        let context = build_review_context(worktree.path(), &files).await;
+
+        assert_eq!(context.guides, guides::NO_GUIDES);
+        let prompt = build_review_scan_prompt(&files[0], &context, "/tmp/tables.md");
+        assert!(prompt.contains(guides::NO_GUIDES), "{prompt}");
     }
 
     #[test]
@@ -14789,6 +14879,7 @@ copy to src/copied_again.rs
             convention_docs: "#### AGENTS.md\nUse surgical changes.".to_string(),
             directory_inventory: "#### src\n- lib.rs\n- main.rs".to_string(),
             changed_file_manifest: "- src/lib.rs (application)".to_string(),
+            guides: String::new(),
             coverage_ledger: ReviewCoverageLedger::default(),
         };
         let prompt = build_review_scan_prompt(&file, &context, "/tmp/tables.md");
@@ -14841,6 +14932,7 @@ copy to src/copied_again.rs
             convention_docs: "shared conventions".to_string(),
             directory_inventory: "shared inventory".to_string(),
             changed_file_manifest: "shared manifest".to_string(),
+            guides: String::new(),
             coverage_ledger: ReviewCoverageLedger::default(),
         };
         let first = build_review_group_prompt_with_relationships(
@@ -15617,11 +15709,9 @@ copy to src/copied_again.rs
     #[tokio::test]
     async fn project_test_patterns_take_precedence_over_path_heuristics() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(PROJECT_TEST_PATTERNS_FILE),
-            "checks/**/*.contract.ts\n# ignored\n",
-        )
-        .unwrap();
+        let patterns = dir.path().join(PROJECT_TEST_PATTERNS_FILE);
+        std::fs::create_dir_all(patterns.parent().unwrap()).unwrap();
+        std::fs::write(&patterns, "checks/**/*.contract.ts\n# ignored\n").unwrap();
         let mut files = vec![ReviewFile {
             path: "checks/api/user.contract.ts".to_string(),
             annotated_diff: "     1 +expect(result).toEqual(ok)".to_string(),
@@ -15810,6 +15900,7 @@ copy to src/copied_again.rs
             directory_inventory: "shared inventory".to_string(),
             changed_file_manifest: "- src/source.rs (application)\n- tests/source_test.rs (test)"
                 .to_string(),
+            guides: String::new(),
             coverage_ledger: ReviewCoverageLedger::default(),
         };
         let source_prompt = build_review_scan_prompt(&source, &context, "/tmp/t.md");
@@ -15863,6 +15954,7 @@ copy to src/copied_again.rs
             directory_inventory: "#### src\n- lib.rs\n- lib_test.rs".to_string(),
             changed_file_manifest: "- src/lib.rs (application)\n- tests/lib_test.rs (test)"
                 .to_string(),
+            guides: String::new(),
             coverage_ledger: ReviewCoverageLedger::default(),
         };
         let tester_findings = vec![ReviewFinding {
@@ -16167,6 +16259,7 @@ copy to src/copied_again.rs
             convention_docs: "rules".to_string(),
             directory_inventory: "tests/auth_test.rs".to_string(),
             changed_file_manifest: "all files".to_string(),
+            guides: String::new(),
             coverage_ledger: ReviewCoverageLedger::default(),
         };
         let stats = review_prompt_evidence_stats(&files, ReviewScanMode::Split, &context, &[]);
@@ -16271,6 +16364,7 @@ copy to src/copied_again.rs
             directory_inventory: "merged inventory".to_string(),
             changed_file_manifest: "- src/lib.rs (application)\n- tests/lib_test.rs (test)"
                 .to_string(),
+            guides: String::new(),
             coverage_ledger: ReviewCoverageLedger::default(),
         };
         let tester_findings = vec![ReviewFinding {
@@ -16532,6 +16626,7 @@ copy to src/copied_again.rs
             convention_docs: String::new(),
             directory_inventory: "#### src\n- helper.rs\n- lib.rs\n- lib_test.rs".to_string(),
             changed_file_manifest: String::new(),
+            guides: String::new(),
             coverage_ledger: ReviewCoverageLedger::default(),
         };
         let rendered =

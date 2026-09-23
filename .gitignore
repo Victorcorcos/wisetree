@@ -22,3 +22,8 @@ local/
 # one local run, and the work they produced is already in the git history.
 PLAN.md
 BUG_INVESTIGATION.md
+
+# Repository-local Wisetree state: Split plans and drafts, the hand-written
+# guide index, and the reviewer's project test patterns. All of it is personal
+# to one checkout, so it is never committed for the team.
+.wisetree/
