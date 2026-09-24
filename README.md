@@ -306,7 +306,18 @@ mkdir -p .wisetree/guides
 $EDITOR .wisetree/guides/access_control.md
 ```
 
-Add `.wisetree/` to your `.gitignore`. Guides are personal notes about your own understanding of the repository, and the whole directory also holds per-checkout Wisetree state (Split plans and drafts, Review run history), none of which should be committed for the team.
+Then make git ignore `.wisetree/`. Guides are personal notes about your own understanding of the repository, and the directory also holds per-checkout Wisetree state (Split plans and drafts, Review run history), none of which should be committed for the team.
+
+Do it **once, globally**, rather than adding a line to every repository you work in — most of them are not yours to add Wisetree-specific entries to anyway:
+
+```bash
+git config --global core.excludesFile ~/.gitignore_global
+echo '.wisetree/' >> ~/.gitignore_global
+```
+
+`core.excludesFile` is a personal ignore list git applies to every repository, so `.wisetree/` disappears from `git status` everywhere without touching a single team `.gitignore`. Note that `.wisetree.json` is deliberately *not* in that list: unlike the directory, the project config is meant to be committed so your team shares the same worktree setup.
+
+If you would rather keep it per-repository, `echo '.wisetree/' >> .gitignore` works too.
 
 These capabilities are implemented in `wisetree` and are especially useful once you are managing real projects, pull requests, and multiple agent runs at the same time:
 
