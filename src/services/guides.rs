@@ -4,8 +4,8 @@
 //! alone does not make obvious — an access-control model with N permission
 //! levels, a tenancy scheme, a legacy data-migration path. Guides are
 //! per-repository and personal: they live in `.wisetree/guides/` inside the
-//! working tree, which the user gitignores, so nothing here is ever
-//! committed for the team.
+//! working tree, which the user gitignores, so nothing here ever reaches the
+//! repository's history.
 //!
 //! The AI commands (Develop plan/implement, Bugkill investigate/fix) never
 //! embed a guide's body in their prompt. They embed only the index rendered

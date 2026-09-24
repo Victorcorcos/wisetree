@@ -96,7 +96,7 @@ src/
 ## Important Gotchas
 
 - `.claude/` is in `.gitignore` — never place `CLAUDE.md` there; it will silently not be committed.
-- `.wisetree.json` at the repo root is also gitignored (personal config override); the shared project config lives elsewhere.
+- `.wisetree.json` at the repo root is also gitignored — it is this checkout's personal config override, and no project config is tracked in git.
 - `.wisetree/` (gitignored) is the repository-local state directory: `guides/*.md` (the guide index fed to Develop, Bugkill, Review and Improve — user-facing docs in the README), `split_plan.md` + `split_drafts/` (Split), and `review/` (run history plus the reviewer's project test patterns). `~/.wisetree/` is the unrelated *global* config dir — do not conflate them.
 - Dashboard PR fetching uses `gh pr list`; after a 429 it backs off for 5 minutes.
 - Remotes: `origin` = victorcorcos/wisetree, `upstream` = same upstream project, `anderson` = fork. PRs go to `origin/main`.

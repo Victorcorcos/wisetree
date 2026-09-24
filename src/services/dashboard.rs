@@ -9642,7 +9642,7 @@ fn build_merge_prompt(base_ref: &str, conflicts: &[String], autonomous: bool) ->
 
 /// Fallback PR template used when the repo ships none of the well-known
 /// template files. Mirrors the `filler` skill's reference template so the
-/// native flow produces the same section layout the team is used to.
+/// native flow produces the same section layout as that skill.
 const EXPLAIN_TEMPLATE_FALLBACK: &str = "# Description ✍️
 
 Brief explanation of the PR purpose

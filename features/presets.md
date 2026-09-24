@@ -243,7 +243,7 @@ Re-run the schema generator (`cargo run --bin generate-schema`) so `schema.json`
 - **Don't merge eagerly at load.** `ConfigService` should keep the raw `WorktreeConfig` (with the presets map intact). `resolve` is called at the moment of use. Eager merging hides the original config from `wisetree presets show` and `wisetree settings`.
 - **Validate at load, not at use.** Cycle detection and name validation belong in `validate`, called from `load_from_path`. By the time `resolve` runs, the map is known good.
 - **Stable ordering matters.** `BTreeMap` over `HashMap` — the TUI selector should not reshuffle on each invocation, and `wisetree presets list --json` output should be deterministic for diffing.
-- **Don't introduce a separate file format.** Presets live inside the existing `.wisetree.json`. A `~/.wisetree/presets/` directory is tempting but doubles the discovery rules and breaks team-shared configs.
+- **Don't introduce a separate file format.** Presets live inside the existing `.wisetree.json`. A `~/.wisetree/presets/` directory is tempting but doubles the discovery rules and breaks configs committed with the repository.
 - **`Option<Vec<T>>` is awkward to serialize prettily.** That's fine — `skip_serializing_if = "Option::is_none"` keeps the on-disk shape clean. Don't substitute a custom enum for clever empty/unset distinctions; the option is the simplest correct thing.
 - **Preset names are user-facing identifiers.** Treat them as data, not code. Don't lowercase/uppercase them, don't strip whitespace, don't auto-rename. Round-trip them verbatim.
 

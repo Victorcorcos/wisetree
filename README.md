@@ -167,7 +167,7 @@ You land on the main menu, where the available actions are:
 
 | Menu entry | What it does |
 | --- | --- |
-| **Setup Project Config** | Creates a repo-local `.wisetree.json` when the project does not have one yet, so team defaults can live next to the code. |
+| **Setup Project Config** | Creates a repo-local `.wisetree.json` when the project does not have one yet, so the project's defaults live next to the code. |
 | **Setup Shell Integration** | One-time installer for the shell wrapper + completions (only shown when integration is not yet installed). |
 | **Create** | Guided flow: pick a source branch, name the directory, optionally name a new branch, confirm. Copy patterns, shared-cache links, post-create commands, and terminal launch run automatically afterwards when configured. |
 | **Dashboard** | Live, auto-refreshing table of every worktree. See [Dashboard](#-dashboard) for the full feature breakdown — status, AI status, ahead/behind, last commit, PR state, fuzzy search, row actions, and bulk delete. |
@@ -306,7 +306,7 @@ mkdir -p .wisetree/guides
 $EDITOR .wisetree/guides/access_control.md
 ```
 
-Then make git ignore `.wisetree/`. Guides are personal notes about your own understanding of the repository, and the directory also holds per-checkout Wisetree state (Split plans and drafts, Review run history), none of which should be committed for the team.
+Then make git ignore `.wisetree/`. Guides are personal notes about your own understanding of the repository, and the directory also holds per-checkout Wisetree state (Split plans and drafts, Review run history) — none of it belongs in the repository's history.
 
 Do it **once, globally**, rather than adding a line to every repository you work in — most of them are not yours to add Wisetree-specific entries to anyway:
 
@@ -315,7 +315,7 @@ git config --global core.excludesFile ~/.gitignore_global
 echo '.wisetree/' >> ~/.gitignore_global
 ```
 
-`core.excludesFile` is a personal ignore list git applies to every repository, so `.wisetree/` disappears from `git status` everywhere without touching a single team `.gitignore`. Note that `.wisetree.json` is deliberately *not* in that list: unlike the directory, the project config is meant to be committed so your team shares the same worktree setup.
+`core.excludesFile` is a personal ignore list git applies to every repository, so `.wisetree/` disappears from `git status` everywhere without editing a single repository's `.gitignore`. Note that `.wisetree.json` is deliberately *not* in that list: unlike the directory, the project config is worth committing so the worktree setup travels with the repository instead of being re-created on every clone.
 
 If you would rather keep it per-repository, `echo '.wisetree/' >> .gitignore` works too.
 
@@ -330,7 +330,7 @@ These capabilities are implemented in `wisetree` and are especially useful once 
 | **AI model picker** | Settings → Dashboard → `ai` | Fetches provider/model pairs for `opencode` from the public models catalog and can also surface locally available free `opencode` models. Selecting one writes the exact `provider/model` value (to `ai.model`) and an optional thinking strength (to `ai.thinking`) used for AI conflict resolution. | Developers do not need to memorize model IDs or edit JSON by hand to enable the AI merge workflow. |
 | **AI harness activity detection** | Dashboard `AI Status` column | Detects Claude Code, Opencode, Codex CLI, and Gemini CLI activity from their on-disk session/state files, then aggregates each worktree as `Pending`, `Running`, `Finished`, or `Failed`. Detection is file-based and cross-platform. | When several agents are running, the dashboard can show which worktrees are still active and which are ready for review. |
 | **Safe bulk cleanup** | Dashboard footer buttons | Bulk-delete by status group (`Merged`, `Closed`, `Open`, `Clean`, `Dirty`) with a confirmation dialog, protected main checkout, optional branch deletion through `deleteBranchWithWorktree`, and per-item warnings after the run. | Cleanup becomes a deliberate batch operation instead of a risky sequence of manual `rm`, `git worktree remove`, and `git branch -d` commands. |
-| **Config editor and config sync** | Settings | The TUI edits copy patterns, ignore patterns, link patterns, link strategy, cache directory, post-create commands, terminal command, path template, dashboard settings, and branch-deletion behavior. It can also copy the full config between global settings and the repo-local `.wisetree.json`. | Team defaults and personal defaults can be moved or tuned without manually editing nested JSON. |
+| **Config editor and config sync** | Settings | The TUI edits copy patterns, ignore patterns, link patterns, link strategy, cache directory, post-create commands, terminal command, path template, dashboard settings, and branch-deletion behavior. It can also copy the full config between global settings and the repo-local `.wisetree.json`. | Project defaults and personal defaults can be moved or tuned without manually editing nested JSON. |
 | **Scriptable dashboard snapshots** | `wisetree dashboard --json` / `--watch` | Emits one dashboard snapshot as JSON or streams snapshots as JSON Lines. Rows include worktree, git, PR, and AI-status fields when those enrichments are enabled. | CI scripts, local automation, status bars, and custom dashboards can consume the same state the TUI uses. |
 | **Shell integration and row navigation** | `Setup Shell Integration`, dashboard row actions | Installs a shell wrapper and completions so `wisetree` can change the parent shell into a selected worktree. Dashboard actions can also open the configured editor/terminal command or copy the path. | Moving from "I found the worktree" to "I am inside it and ready to work" becomes one action. |
 | **Deletion safety and recovery** | Dashboard delete, bulk delete, worktree deletion service | Refuses dirty deletions unless forced, protects current/default branches, can delete the matching branch when configured, retries submodule-related worktree removal safely, unlinks shared-cache directories before removal, and falls back to manual cleanup plus `git worktree prune` for corrupted worktrees. | Destructive operations are guarded around the failure modes developers actually hit in long-running worktree-heavy repos. |
@@ -340,7 +340,7 @@ These capabilities are implemented in `wisetree` and are especially useful once 
 `wisetree` loads the **first** of these it finds; the files are never merged.
 When run inside a child worktree, the mother worktree is checked first:
 
-1. `.wisetree.json` in the mother worktree (project-local, commit it to share with the team).
+1. `.wisetree.json` in the mother worktree (project-local; commit it so the setup travels with the repository).
 2. `.wisetree.json` in the current worktree.
 3. `~/.wisetree/settings.json` (global, your personal defaults — auto-created on first run).
 
