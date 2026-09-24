@@ -356,7 +356,11 @@ impl WorktreeService {
         let mut branch_delete_error = None;
         if let Some(name) = &branch_name {
             let branch_git = GitService::new(main_worktree_path.or_else(|| self.git_root.clone()));
-            match branch_git.delete_branch(name, true).await {
+            // `force` carries the user's explicit "delete it anyway" through to
+            // the branch: an ordinary delete uses `git branch -d`, so a branch
+            // holding unmerged commits is kept and reported instead of being
+            // destroyed along with the worktree.
+            match branch_git.delete_branch(name, force).await {
                 Ok(()) => branch_deleted = true,
                 Err(e) => {
                     branch_delete_error = Some(format!("Branch '{name}' was kept.\n{e}"));

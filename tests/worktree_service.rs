@@ -39,27 +39,18 @@ fn build_fixture() -> Fixture {
     }
 }
 
+/// Runs `f` with `$HOME` pointed at a fresh tempdir, restoring the real one
+/// even on panic — and then **re-raising that panic**. Swallowing it instead
+/// makes every assertion inside silently optional, which is how a dozen tests
+/// in this file reported success for months while executing nothing.
 fn with_isolated_home<F: FnOnce()>(f: F) {
     let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().expect("home");
     let prev = std::env::var_os("HOME");
     std::env::set_var("HOME", home.path());
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     if let Some(p) = prev {
         std::env::set_var("HOME", p);
-    } else {
-        std::env::remove_var("HOME");
-    }
-}
-
-fn with_isolated_home_checked<F: FnOnce()>(f: F) {
-    let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let home = tempfile::tempdir().expect("home");
-    let prev = std::env::var_os("HOME");
-    std::env::set_var("HOME", home.path());
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    if let Some(path) = prev {
-        std::env::set_var("HOME", path);
     } else {
         std::env::remove_var("HOME");
     }
@@ -68,8 +59,8 @@ fn with_isolated_home_checked<F: FnOnce()>(f: F) {
     }
 }
 
-#[tokio::test]
-async fn initialize_rejects_non_git_directory() {
+#[test]
+fn initialize_rejects_non_git_directory() {
     with_isolated_home(|| {
         let body = async {
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -81,8 +72,8 @@ async fn initialize_rejects_non_git_directory() {
     });
 }
 
-#[tokio::test]
-async fn create_worktree_full_flow_copies_env_files() {
+#[test]
+fn create_worktree_full_flow_copies_env_files() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -120,8 +111,8 @@ async fn create_worktree_full_flow_copies_env_files() {
     });
 }
 
-#[tokio::test]
-async fn create_worktree_from_child_uses_mother_path_as_anchor() {
+#[test]
+fn create_worktree_from_child_uses_mother_path_as_anchor() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -164,8 +155,13 @@ async fn create_worktree_from_child_uses_mother_path_as_anchor() {
                 .expect("repo parent")
                 .join("repo.worktree")
                 .join("feat-b");
-            assert_eq!(second.worktree_path, expected);
             assert!(second.worktree_path.exists());
+            // macOS reaches tempdirs through /private, and the service reports
+            // the canonical path — compare both sides canonically.
+            assert_eq!(
+                second.worktree_path.canonicalize().unwrap(),
+                expected.canonicalize().unwrap()
+            );
         };
         tokio::runtime::Runtime::new().unwrap().block_on(body);
     });
@@ -176,7 +172,7 @@ async fn create_worktree_from_child_uses_mother_path_as_anchor() {
 // with "Cannot start a runtime from within a runtime".
 #[test]
 fn create_worktree_from_child_uses_mother_config_over_child_config() {
-    with_isolated_home_checked(|| {
+    with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
             let mother_config = WorktreeConfig {
@@ -258,8 +254,8 @@ fn create_worktree_from_child_uses_mother_config_over_child_config() {
     });
 }
 
-#[tokio::test]
-async fn create_worktree_runs_post_create_commands_with_progress() {
+#[test]
+fn create_worktree_runs_post_create_commands_with_progress() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -306,8 +302,8 @@ async fn create_worktree_runs_post_create_commands_with_progress() {
     });
 }
 
-#[tokio::test]
-async fn create_worktree_populates_link_report_when_link_patterns_enabled() {
+#[test]
+fn create_worktree_populates_link_report_when_link_patterns_enabled() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -349,7 +345,7 @@ async fn create_worktree_populates_link_report_when_link_patterns_enabled() {
 
 #[test]
 fn create_split_worktree_keeps_copy_and_link_setup_without_user_actions() {
-    with_isolated_home_checked(|| {
+    with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
             fs::write(fx.repo.join(".env"), "TOKEN=local\n").unwrap();
@@ -384,8 +380,8 @@ fn create_split_worktree_keeps_copy_and_link_setup_without_user_actions() {
     });
 }
 
-#[tokio::test]
-async fn create_worktree_rejects_existing_branch_when_creating_new() {
+#[test]
+fn create_worktree_rejects_existing_branch_when_creating_new() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -410,8 +406,8 @@ async fn create_worktree_rejects_existing_branch_when_creating_new() {
     });
 }
 
-#[tokio::test]
-async fn create_worktree_allows_checkout_when_branch_matches_source() {
+#[test]
+fn create_worktree_allows_checkout_when_branch_matches_source() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -439,8 +435,8 @@ async fn create_worktree_allows_checkout_when_branch_matches_source() {
     });
 }
 
-#[tokio::test]
-async fn delete_worktree_removes_path_and_skips_branch_when_disabled() {
+#[test]
+fn delete_worktree_removes_path_and_skips_branch_when_disabled() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -476,8 +472,8 @@ async fn delete_worktree_removes_path_and_skips_branch_when_disabled() {
     });
 }
 
-#[tokio::test]
-async fn delete_worktree_with_branch_deletion_when_enabled() {
+#[test]
+fn delete_worktree_with_branch_deletion_when_enabled() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -517,8 +513,8 @@ async fn delete_worktree_with_branch_deletion_when_enabled() {
     });
 }
 
-#[tokio::test]
-async fn delete_worktree_keeps_unmerged_branch_and_returns_warning() {
+#[test]
+fn delete_worktree_keeps_unmerged_branch_and_returns_warning() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -568,8 +564,8 @@ async fn delete_worktree_keeps_unmerged_branch_and_returns_warning() {
     });
 }
 
-#[tokio::test]
-async fn delete_worktree_dirty_without_force_errors() {
+#[test]
+fn delete_worktree_dirty_without_force_errors() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -607,8 +603,8 @@ async fn delete_worktree_dirty_without_force_errors() {
     });
 }
 
-#[tokio::test]
-async fn manual_worktree_cleanup_runs_prune() {
+#[test]
+fn manual_worktree_cleanup_runs_prune() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
