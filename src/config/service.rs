@@ -1,14 +1,15 @@
 //! `ConfigService` — discovery, load, save, reset.
 //!
-//! Resolution order is project-local `.wisetree.json` first, then
-//! `~/.wisetree/settings.json`, falling back to `WorktreeConfig::default()`.
+//! Resolution order is the project-local `.wisetree/.wisetree.json` first
+//! (falling back to a legacy `.wisetree.json` at the repository root), then
+//! `~/.wisetree/settings.json`, then `WorktreeConfig::default()`.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::schema::WorktreeConfig;
-use crate::constants::{global_config_dir, global_config_file, LOCAL_CONFIG_FILE_NAME};
+use crate::constants::{existing_local_config_file, global_config_dir, global_config_file};
 use crate::errors::{Result, WisetreeError};
 
 /// Where the active config came from.
@@ -91,12 +92,10 @@ impl ConfigService {
     ) -> Result<WorktreeConfig> {
         self.ensure_global_config()?;
 
-        let candidates = [
-            mother_path.join(LOCAL_CONFIG_FILE_NAME),
-            child_path.join(LOCAL_CONFIG_FILE_NAME),
-            global_config_file(),
-        ];
-        if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
+        let candidate = existing_local_config_file(mother_path)
+            .or_else(|| existing_local_config_file(child_path))
+            .or_else(|| global_config_file().exists().then(global_config_file));
+        if let Some(path) = candidate {
             return self.load_from_path(path);
         }
 
@@ -176,13 +175,8 @@ impl ConfigService {
             .or_else(|| env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let candidates = [cwd.join(LOCAL_CONFIG_FILE_NAME), global_config_file()];
-        for c in candidates {
-            if c.exists() {
-                return Ok(Some(c));
-            }
-        }
-        Ok(None)
+        Ok(existing_local_config_file(&cwd)
+            .or_else(|| global_config_file().exists().then(global_config_file)))
     }
 
     fn load_from_path(&mut self, path: PathBuf) -> Result<WorktreeConfig> {

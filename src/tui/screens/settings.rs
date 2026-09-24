@@ -5659,7 +5659,7 @@ impl SettingsScreen {
         let local_path = self
             .local_config_path
             .clone()
-            .unwrap_or_else(|| ".wisetree.json (project local)".to_string());
+            .unwrap_or_else(|| ".wisetree/.wisetree.json (project local)".to_string());
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -5840,7 +5840,7 @@ impl SettingsScreen {
         let target = self
             .local_config_path
             .clone()
-            .unwrap_or_else(|| ".wisetree.json (project local)".to_string());
+            .unwrap_or_else(|| ".wisetree/.wisetree.json (project local)".to_string());
         let saving_line = Line::from(vec![
             Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
             Span::styled(target, Style::default().fg(colors::EMPHASIS)),

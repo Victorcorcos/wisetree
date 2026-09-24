@@ -96,8 +96,8 @@ src/
 ## Important Gotchas
 
 - `.claude/` is in `.gitignore` — never place `CLAUDE.md` there; it will silently not be committed.
-- `.wisetree.json` at the repo root is also gitignored — it is this checkout's personal config override, and no project config is tracked in git.
-- `.wisetree/` (gitignored) is the repository-local state directory: `guides/*.md` (the guide index fed to Develop, Bugkill, Review and Improve — user-facing docs in the README), `split_plan.md` + `split_drafts/` (Split), and `review/` (run history plus the reviewer's project test patterns). `~/.wisetree/` is the unrelated *global* config dir — do not conflate them.
+- The project config is `.wisetree/.wisetree.json` (a legacy `.wisetree.json` at the root is still read, never written). Here it is gitignored with the rest of `.wisetree/` — it is this checkout's personal override, and no project config is tracked in git.
+- `.wisetree/` (gitignored) is the repository-local state directory: `.wisetree.json` (project config), `guides/*.md` (the guide index fed to Develop, Bugkill, Review and Improve — user-facing docs in the README), `split_plan.md` + `split_drafts/` (Split), and `review/` (run history plus the reviewer's project test patterns). `~/.wisetree/` is the unrelated *global* config dir — do not conflate them.
 - Dashboard PR fetching uses `gh pr list`; after a 429 it backs off for 5 minutes.
 - Remotes: `origin` = victorcorcos/wisetree, `upstream` = same upstream project, `anderson` = fork. PRs go to `origin/main`.
 - CI runs on Ubuntu and macOS; format + clippy + build + tests must all pass before merge.

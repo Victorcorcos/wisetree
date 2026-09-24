@@ -2,7 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// Filename of the project-local config (lives next to the repo root).
+/// Directory under a repository root holding every repository-local Wisetree
+/// artifact: the project config, guides, Split state and Review history.
+pub const LOCAL_DIR_NAME: &str = ".wisetree";
+
+/// Filename of the project-local config, inside [`LOCAL_DIR_NAME`].
 pub const LOCAL_CONFIG_FILE_NAME: &str = ".wisetree.json";
 
 /// Subdirectory of `$HOME` where the global config and state live.
@@ -104,6 +108,44 @@ pub fn dashboard_pr_cache_file() -> PathBuf {
     global_config_dir().join(DASHBOARD_PR_CACHE_FILE_NAME)
 }
 
+/// Path to a repository's project config: `<root>/.wisetree/.wisetree.json`.
+/// This is where Wisetree writes, and the first place it reads.
+pub fn local_config_file(repo_root: &Path) -> PathBuf {
+    repo_root.join(LOCAL_DIR_NAME).join(LOCAL_CONFIG_FILE_NAME)
+}
+
+/// The pre-move location: `.wisetree.json` loose at the repository root.
+/// Still read when the current location is absent, so a repository that was
+/// never migrated keeps working instead of silently falling back to global
+/// defaults. Nothing writes here.
+pub fn legacy_local_config_file(repo_root: &Path) -> PathBuf {
+    repo_root.join(LOCAL_CONFIG_FILE_NAME)
+}
+
+/// The repository root owning a project-config path, which is what config
+/// discovery takes. Handles both `<root>/.wisetree/.wisetree.json` and the
+/// legacy `<root>/.wisetree.json`, so callers never have to know which one
+/// they are holding — `config_path.parent()` would be wrong for the former.
+pub fn local_config_root(config_path: &Path) -> Option<&Path> {
+    let parent = config_path.parent()?;
+    if parent.file_name() == Some(std::ffi::OsStr::new(LOCAL_DIR_NAME)) {
+        parent.parent()
+    } else {
+        Some(parent)
+    }
+}
+
+/// The project config Wisetree should read for `repo_root`, if any: the
+/// current location when it exists, otherwise the legacy root file.
+pub fn existing_local_config_file(repo_root: &Path) -> Option<PathBuf> {
+    [
+        local_config_file(repo_root),
+        legacy_local_config_file(repo_root),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+}
+
 /// Path to a repository-local Review artifact.
 ///
 /// Review history describes one repository's pull requests, so it belongs to
@@ -144,4 +186,70 @@ pub fn opencode_model_state_file() -> PathBuf {
         .join("state")
         .join(OPENCODE_STATE_DIR_NAME)
         .join(OPENCODE_MODEL_STATE_FILE_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_project_config_lives_inside_the_wisetree_directory() {
+        let root = Path::new("/repo");
+
+        assert_eq!(
+            local_config_file(root),
+            Path::new("/repo/.wisetree/.wisetree.json")
+        );
+        assert_eq!(
+            legacy_local_config_file(root),
+            Path::new("/repo/.wisetree.json")
+        );
+    }
+
+    /// A repository that was never migrated keeps working: without the
+    /// fallback its config would be ignored in silence and Wisetree would
+    /// quietly run on global defaults.
+    #[test]
+    fn a_legacy_root_config_is_read_when_the_current_one_is_absent() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(legacy_local_config_file(repo.path()), "{}").unwrap();
+
+        assert_eq!(
+            existing_local_config_file(repo.path()),
+            Some(legacy_local_config_file(repo.path()))
+        );
+    }
+
+    #[test]
+    fn the_current_location_wins_when_both_exist() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(legacy_local_config_file(repo.path()), "{}").unwrap();
+        let current = local_config_file(repo.path());
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, "{}").unwrap();
+
+        assert_eq!(existing_local_config_file(repo.path()), Some(current));
+    }
+
+    #[test]
+    fn a_repository_without_any_project_config_resolves_to_nothing() {
+        let repo = tempfile::tempdir().unwrap();
+
+        assert_eq!(existing_local_config_file(repo.path()), None);
+    }
+
+    /// Config discovery takes the repository root, not the directory holding
+    /// the file — which stopped being the same thing once the config moved
+    /// one level down.
+    #[test]
+    fn the_owning_root_is_recovered_from_either_layout() {
+        assert_eq!(
+            local_config_root(Path::new("/repo/.wisetree/.wisetree.json")),
+            Some(Path::new("/repo"))
+        );
+        assert_eq!(
+            local_config_root(Path::new("/repo/.wisetree.json")),
+            Some(Path::new("/repo"))
+        );
+    }
 }

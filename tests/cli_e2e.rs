@@ -155,8 +155,10 @@ fn cache_list_json_outputs_object() {
     let fx = repo_with_commit();
     let home = isolated_home();
 
+    let config_path = fx.repo.join(".wisetree").join(".wisetree.json");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
     std::fs::write(
-        fx.repo.join(".wisetree.json"),
+        config_path,
         serde_json::to_string_pretty(&WorktreeConfig {
             worktree_copy_patterns: Vec::new(),
             worktree_link_patterns: vec!["node_modules".into()],

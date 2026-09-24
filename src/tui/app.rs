@@ -26,7 +26,9 @@ use crate::config::schema::{
     AiHarness, DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig,
 };
 use crate::config::service::ConfigService;
-use crate::constants::{global_config_file, LOCAL_CONFIG_FILE_NAME};
+use crate::constants::{
+    existing_local_config_file, global_config_file, local_config_file, local_config_root,
+};
 use crate::errors::{user_friendly_message, WisetreeError};
 use crate::files::service::{open_terminal, open_url};
 use crate::git::exec::get_git_root;
@@ -8153,7 +8155,7 @@ impl App {
             None => {
                 self.show_toast(
                     ToastVariant::Error,
-                    "No git repository in scope — cannot write .wisetree.json.",
+                    "No git repository in scope — cannot write .wisetree/.wisetree.json.",
                 );
                 return;
             }
@@ -8174,18 +8176,20 @@ impl App {
         if let Err(err) = writer.save(&config, Some(&local_path)) {
             self.show_toast(
                 ToastVariant::Error,
-                format!("Failed to write .wisetree.json: {err}"),
+                format!("Failed to write .wisetree/.wisetree.json: {err}"),
             );
             return;
         }
 
         if let Some(service) = self.worktree_service.as_mut() {
-            let _ = service.config_service_mut().load(local_path.parent());
+            let _ = service
+                .config_service_mut()
+                .load(local_config_root(&local_path));
         }
 
         self.show_toast(
             ToastVariant::Success,
-            format!("Applied {applied_label} to .wisetree.json"),
+            format!("Applied {applied_label} to .wisetree/.wisetree.json"),
         );
         self.back_to_menu();
     }
@@ -9782,7 +9786,7 @@ impl App {
                 reader.load_global().map_err(|e| e.to_string())?
             } else {
                 reader
-                    .load(target_path.parent())
+                    .load(local_config_root(&target_path))
                     .map_err(|e| e.to_string())?
             }
         } else {
@@ -9796,7 +9800,7 @@ impl App {
             .map_err(|e| e.to_string())?;
 
         if let Some(service) = self.worktree_service.as_mut() {
-            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            let project_path = local_path.as_deref().and_then(local_config_root);
             service
                 .config_service_mut()
                 .load(project_path)
@@ -9814,22 +9818,24 @@ impl App {
     fn local_config_path(&self) -> Option<PathBuf> {
         if let Some(service) = self.worktree_service.as_ref() {
             if let Some(mother_path) = service.mother_worktree_path() {
-                let mother_config = mother_path.join(LOCAL_CONFIG_FILE_NAME);
-                if mother_config.exists() {
-                    return Some(mother_config);
+                // An existing file wins wherever it sits, including a legacy
+                // `.wisetree.json` at the root, so editing a repository that
+                // was never migrated updates it in place instead of writing a
+                // second config beside it.
+                if let Some(existing) = existing_local_config_file(mother_path) {
+                    return Some(existing);
                 }
 
                 if let Some(child_path) = self.git_root.as_deref() {
-                    let child_config = Path::new(child_path).join(LOCAL_CONFIG_FILE_NAME);
-                    if child_config.exists() {
-                        return Some(child_config);
+                    if let Some(existing) = existing_local_config_file(Path::new(child_path)) {
+                        return Some(existing);
                     }
                 }
 
                 // When neither local file exists, the mother path is the
                 // preferred local destination for an explicit local-config
                 // action (such as Setup Project Config).
-                return Some(mother_config);
+                return Some(local_config_file(mother_path));
             }
 
             if let Some(path) = service.config_service().config_path() {
@@ -9839,9 +9845,10 @@ impl App {
             }
         }
 
-        self.git_root
-            .as_ref()
-            .map(|root| PathBuf::from(root).join(LOCAL_CONFIG_FILE_NAME))
+        self.git_root.as_ref().map(|root| {
+            let root = Path::new(root);
+            existing_local_config_file(root).unwrap_or_else(|| local_config_file(root))
+        })
     }
 
     fn local_config_path_str(&self) -> Option<String> {
@@ -9861,7 +9868,8 @@ impl App {
 
         let mut config = if local_path.exists() {
             let mut svc = ConfigService::new();
-            svc.load(local_path.parent()).map_err(|e| e.to_string())?
+            svc.load(local_config_root(&local_path))
+                .map_err(|e| e.to_string())?
         } else {
             self.current_config().cloned().unwrap_or_default()
         };
@@ -9875,7 +9883,7 @@ impl App {
         if let Some(service) = self.worktree_service.as_mut() {
             service
                 .config_service_mut()
-                .load(local_path.parent())
+                .load(local_config_root(&local_path))
                 .map_err(|e| e.to_string())?;
         }
 
@@ -9924,7 +9932,7 @@ impl App {
         let mut reader = ConfigService::new();
         let mut config = if target_path.exists() {
             reader
-                .load(target_path.parent())
+                .load(local_config_root(&target_path))
                 .map_err(|e| e.to_string())?
         } else {
             WorktreeConfig::default()
@@ -9937,7 +9945,7 @@ impl App {
             .map_err(|e| e.to_string())?;
 
         if let Some(service) = self.worktree_service.as_mut() {
-            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            let project_path = local_path.as_deref().and_then(local_config_root);
             service
                 .config_service_mut()
                 .load(project_path)
@@ -9960,7 +9968,7 @@ impl App {
         let mut reader = ConfigService::new();
         let mut config = if target_path.exists() {
             reader
-                .load(target_path.parent())
+                .load(local_config_root(&target_path))
                 .map_err(|e| e.to_string())?
         } else {
             WorktreeConfig::default()
@@ -9973,7 +9981,7 @@ impl App {
             .map_err(|e| e.to_string())?;
 
         if let Some(service) = self.worktree_service.as_mut() {
-            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            let project_path = local_path.as_deref().and_then(local_config_root);
             service
                 .config_service_mut()
                 .load(project_path)
@@ -9996,7 +10004,7 @@ impl App {
         let mut reader = ConfigService::new();
         let mut config = if target_path.exists() {
             reader
-                .load(target_path.parent())
+                .load(local_config_root(&target_path))
                 .map_err(|e| e.to_string())?
         } else {
             WorktreeConfig::default()
@@ -10009,7 +10017,7 @@ impl App {
             .map_err(|e| e.to_string())?;
 
         if let Some(service) = self.worktree_service.as_mut() {
-            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            let project_path = local_path.as_deref().and_then(local_config_root);
             service
                 .config_service_mut()
                 .load(project_path)
@@ -10032,7 +10040,7 @@ impl App {
         let mut reader = ConfigService::new();
         let mut config = if target_path.exists() {
             reader
-                .load(target_path.parent())
+                .load(local_config_root(&target_path))
                 .map_err(|e| e.to_string())?
         } else {
             WorktreeConfig::default()
@@ -10045,7 +10053,7 @@ impl App {
             .map_err(|e| e.to_string())?;
 
         if let Some(service) = self.worktree_service.as_mut() {
-            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            let project_path = local_path.as_deref().and_then(local_config_root);
             service
                 .config_service_mut()
                 .load(project_path)
@@ -10068,7 +10076,7 @@ impl App {
         let mut reader = ConfigService::new();
         let mut config = if target_path.exists() {
             reader
-                .load(target_path.parent())
+                .load(local_config_root(&target_path))
                 .map_err(|e| e.to_string())?
         } else {
             WorktreeConfig::default()
@@ -10086,7 +10094,7 @@ impl App {
             .map_err(|e| e.to_string())?;
 
         if let Some(service) = self.worktree_service.as_mut() {
-            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            let project_path = local_path.as_deref().and_then(local_config_root);
             service
                 .config_service_mut()
                 .load(project_path)
@@ -10116,7 +10124,7 @@ impl App {
         let mut reader = ConfigService::new();
         let mut config = if target_path.exists() {
             reader
-                .load(target_path.parent())
+                .load(local_config_root(&target_path))
                 .map_err(|e| e.to_string())?
         } else if wise_merge_changed {
             self.current_config().cloned().unwrap_or_default()
@@ -10131,7 +10139,7 @@ impl App {
             .map_err(|e| e.to_string())?;
 
         if let Some(service) = self.worktree_service.as_mut() {
-            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            let project_path = local_path.as_deref().and_then(local_config_root);
             service
                 .config_service_mut()
                 .load(project_path)
@@ -10154,7 +10162,7 @@ impl App {
         let mut reader = ConfigService::new();
         let mut config = if target_path.exists() {
             reader
-                .load(target_path.parent())
+                .load(local_config_root(&target_path))
                 .map_err(|e| e.to_string())?
         } else {
             WorktreeConfig::default()
@@ -10167,7 +10175,7 @@ impl App {
             .map_err(|e| e.to_string())?;
 
         if let Some(service) = self.worktree_service.as_mut() {
-            let project_path = local_path.as_ref().and_then(|p| p.parent());
+            let project_path = local_path.as_deref().and_then(local_config_root);
             service
                 .config_service_mut()
                 .load(project_path)
@@ -10200,7 +10208,7 @@ impl App {
                 }
                 let mut reader = ConfigService::new();
                 reader
-                    .load(local_path.parent())
+                    .load(local_config_root(&local_path))
                     .map_err(|e| e.to_string())?
             }
         };
@@ -10218,7 +10226,7 @@ impl App {
         if let Some(service) = self.worktree_service.as_mut() {
             service
                 .config_service_mut()
-                .load(local_path.parent())
+                .load(local_config_root(&local_path))
                 .map_err(|e| e.to_string())?;
         }
 
@@ -14557,12 +14565,15 @@ mod tests {
     }
 
     fn initialized_menu_app() -> App {
-        // A persistent tempdir with a stub `.wisetree.json` so
+        // A persistent tempdir with a stub `.wisetree/.wisetree.json` so
         // `has_local_config()` is true and the "Setup Project Config"
         // entry is hidden — keeping menu ordering stable for these tests.
         let dir = tempfile::tempdir().expect("tempdir");
         let repo_root = dir.keep();
-        fs::write(repo_root.join(LOCAL_CONFIG_FILE_NAME), "{}").expect("write local config");
+        let local_path = local_config_file(&repo_root);
+        fs::create_dir_all(local_path.parent().expect("config parent"))
+            .expect("create local config dir");
+        fs::write(local_path, "{}").expect("write local config");
 
         let service = WorktreeService::new(None);
 
@@ -14850,7 +14861,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 terminal_command: "global $WORKTREE_PATH".into(),
@@ -14933,7 +14944,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 delete_branch_with_worktree: false,
@@ -15011,7 +15022,8 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
+            fs::create_dir_all(local_path.parent().unwrap()).unwrap();
             fs::write(&local_path, "{}\n").unwrap();
 
             let mut app = App::new(AppMode::Settings, false);
@@ -15057,7 +15069,7 @@ mod tests {
             app.handle_key(key(KeyCode::Enter), &tx);
             app.handle_key(key(KeyCode::Enter), &tx);
 
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
             let saved: WorktreeConfig =
                 serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
 
@@ -15080,7 +15092,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 terminal_command: "global".into(),
@@ -15144,7 +15156,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 terminal_command: "global-cmd".into(),
@@ -15189,7 +15201,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 terminal_command: "old-global".into(),
@@ -15225,7 +15237,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 worktree_path_template: "$BASE_PATH-global".into(),
@@ -15271,7 +15283,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 worktree_path_template: "$BASE_PATH-old".into(),
@@ -15310,7 +15322,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 worktree_link_strategy: LinkStrategy::CreateEmpty,
@@ -15363,7 +15375,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 worktree_link_strategy: LinkStrategy::CreateEmpty,
@@ -15404,7 +15416,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 worktree_link_cache_dir: Some("/global/cache".into()),
@@ -15456,7 +15468,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 worktree_link_cache_dir: Some("/global/old-cache".into()),
@@ -15491,7 +15503,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 dashboard: DashboardConfig {
@@ -15567,7 +15579,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 dashboard: DashboardConfig {
@@ -15622,7 +15634,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let global_path = home.path().join(".wisetree").join("settings.json");
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
                 dashboard: DashboardConfig {
@@ -16547,7 +16559,7 @@ mod tests {
             app.apply_wise_preset_discovery(Ok(discovery));
             app.handle_setup_project_key(key(KeyCode::Enter), &app_event_tx());
 
-            let local_path = repo_root.join(LOCAL_CONFIG_FILE_NAME);
+            let local_path = local_config_file(&repo_root);
             let saved: WorktreeConfig =
                 serde_json::from_str(&fs::read_to_string(&local_path).unwrap()).unwrap();
 
@@ -16590,7 +16602,10 @@ mod tests {
 
             let toast = app.toast.current().expect("toast should be shown");
             assert_eq!(toast.variant, ToastVariant::Success);
-            assert_eq!(toast.message, "Applied Wise Preset to .wisetree.json");
+            assert_eq!(
+                toast.message,
+                "Applied Wise Preset to .wisetree/.wisetree.json"
+            );
         });
     }
 

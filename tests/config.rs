@@ -26,6 +26,14 @@ fn with_home<F: FnOnce(&TempDir)>(f: F) {
     }
 }
 
+/// Path to a project's config in its current home, creating `.wisetree/` so a
+/// plain `fs::write` succeeds.
+fn project_config(root: &std::path::Path) -> std::path::PathBuf {
+    let path = root.join(".wisetree").join(".wisetree.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    path
+}
+
 #[test]
 fn defaults_match_upstream() {
     let cfg = WorktreeConfig::default();
@@ -129,7 +137,7 @@ fn local_config_takes_precedence_over_global() {
             ..WorktreeConfig::default()
         };
         let local_json = serde_json::to_string_pretty(&local).unwrap();
-        fs::write(project.path().join(".wisetree.json"), local_json).unwrap();
+        fs::write(project_config(project.path()), local_json).unwrap();
 
         let global_dir = home.path().join(".wisetree");
         fs::create_dir_all(&global_dir).unwrap();
@@ -149,13 +157,47 @@ fn local_config_takes_precedence_over_global() {
     });
 }
 
+/// The project config used to sit loose at the repository root. A checkout
+/// that was never migrated must keep loading it, or Wisetree would silently
+/// run on global defaults in a repository that clearly configured itself.
+#[test]
+fn a_legacy_root_config_still_loads_and_loses_to_the_current_location() {
+    with_home(|_home| {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let legacy_path = project.path().join(".wisetree.json");
+        let write = |path: &std::path::Path, terminal_command: &str| {
+            let config = WorktreeConfig {
+                terminal_command: terminal_command.into(),
+                ..WorktreeConfig::default()
+            };
+            fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        };
+        write(&legacy_path, "from-legacy-root");
+
+        let mut svc = ConfigService::new();
+        let loaded = svc.load(Some(project.path())).expect("load legacy config");
+        assert_eq!(loaded.terminal_command, "from-legacy-root");
+        assert_eq!(svc.config_path(), Some(legacy_path.as_path()));
+
+        // Once migrated, the file inside `.wisetree/` wins even while the old
+        // one is still lying around.
+        let current_path = project_config(project.path());
+        write(&current_path, "from-wisetree-dir");
+
+        let mut svc = ConfigService::new();
+        let loaded = svc.load(Some(project.path())).expect("load current config");
+        assert_eq!(loaded.terminal_command, "from-wisetree-dir");
+        assert_eq!(svc.config_path(), Some(current_path.as_path()));
+    });
+}
+
 #[test]
 fn mother_config_takes_precedence_over_child_then_global() {
     with_home(|home| {
         let mother = tempfile::tempdir().expect("mother tempdir");
         let child = tempfile::tempdir().expect("child tempdir");
-        let mother_path = mother.path().join(".wisetree.json");
-        let child_path = child.path().join(".wisetree.json");
+        let mother_path = project_config(mother.path());
+        let child_path = project_config(child.path());
         let global_path = home.path().join(".wisetree").join("settings.json");
         fs::create_dir_all(global_path.parent().unwrap()).unwrap();
 
@@ -227,7 +269,7 @@ fn load_global_ignores_local_config() {
             ..WorktreeConfig::default()
         };
         fs::write(
-            project.path().join(".wisetree.json"),
+            project_config(project.path()),
             serde_json::to_string_pretty(&local).unwrap(),
         )
         .unwrap();
@@ -281,7 +323,7 @@ fn save_writes_two_space_indent() {
             terminal_command: "code $WORKTREE_PATH".into(),
             ..WorktreeConfig::default()
         };
-        let target = project.path().join(".wisetree.json");
+        let target = project_config(project.path());
         svc.save(&cfg, Some(&target)).expect("save");
 
         let raw = fs::read_to_string(&target).unwrap();
@@ -298,7 +340,7 @@ fn save_writes_two_space_indent() {
 fn malformed_local_config_returns_error_with_path() {
     with_home(|home| {
         let project = tempfile::tempdir().expect("project tempdir");
-        let path = project.path().join(".wisetree.json");
+        let path = project_config(project.path());
         fs::write(&path, "{ not valid json").unwrap();
 
         let mut svc = ConfigService::new();
@@ -389,7 +431,7 @@ fn compatible_ai_harnesses_load() {
     with_home(|_home| {
         let project = tempfile::tempdir().unwrap();
         fs::write(
-            project.path().join(".wisetree.json"),
+            project_config(project.path()),
             r#"{ "dashboard": { "ai": {
               "explain": { "model": "openai/gpt-5.6", "harness": "codex" },
               "update": { "model": "anthropic/claude", "harness": "claudeCode" },
@@ -407,7 +449,7 @@ fn incompatible_ai_harness_fails_loading_with_slot_and_choices() {
     with_home(|_home| {
         let project = tempfile::tempdir().unwrap();
         fs::write(
-            project.path().join(".wisetree.json"),
+            project_config(project.path()),
             r#"{ "dashboard": { "ai": { "fix": { "apply": {
               "model": "anthropic/claude", "harness": "codex"
             } } } } }"#,
@@ -429,7 +471,7 @@ fn incompatible_split_harness_fails_loading_before_workflow() {
     with_home(|_home| {
         let project = tempfile::tempdir().unwrap();
         fs::write(
-            project.path().join(".wisetree.json"),
+            project_config(project.path()),
             r#"{ "dashboard": { "ai": { "split": { "open": {
               "model": "anthropic/claude", "harness": "codex"
             } } } } }"#,
@@ -449,7 +491,7 @@ fn blank_model_cannot_select_a_non_opencode_harness() {
     with_home(|_home| {
         let project = tempfile::tempdir().unwrap();
         fs::write(
-            project.path().join(".wisetree.json"),
+            project_config(project.path()),
             r#"{ "dashboard": { "ai": { "explain": {
               "model": "  ", "harness": "codex"
             } } } }"#,
@@ -563,7 +605,7 @@ fn notifications_unknown_field_is_rejected() {
 fn legacy_dashboard_notifications_migrate_to_top_level_on_load() {
     with_home(|tmp| {
         // A config written before notifications moved out of `dashboard`.
-        let path = tmp.path().join(".wisetree.json");
+        let path = project_config(tmp.path());
         let raw = r#"{
   "dashboard": {
     "notifications": {
@@ -604,7 +646,7 @@ fn dashboard_refresh_interval_is_clamped_on_load() {
     "refreshIntervalMs": 10
   }
 }"#;
-        fs::write(project.path().join(".wisetree.json"), raw).unwrap();
+        fs::write(project_config(project.path()), raw).unwrap();
 
         let mut svc = ConfigService::new();
         let loaded = svc.load(Some(project.path())).expect("load");
@@ -674,7 +716,7 @@ fn invalid_dashboard_columns_are_dropped_at_load_with_warning() {
     "columns": ["branch", "bogus", "status"]
   }
 }"#;
-        fs::write(project.path().join(".wisetree.json"), raw).unwrap();
+        fs::write(project_config(project.path()), raw).unwrap();
 
         let mut svc = ConfigService::new();
         let loaded = svc.load(Some(project.path())).expect("load");
@@ -698,7 +740,7 @@ fn ai_status_column_auto_add_does_not_warn() {
     "columns": ["branch", "status"]
   }
 }"#;
-        fs::write(project.path().join(".wisetree.json"), raw).unwrap();
+        fs::write(project_config(project.path()), raw).unwrap();
 
         let mut svc = ConfigService::new();
         let loaded = svc.load(Some(project.path())).expect("load");

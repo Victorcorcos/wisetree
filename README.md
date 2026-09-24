@@ -104,7 +104,7 @@ cargo build --all-targets
 cargo test --all-features
 ```
 
-CI runs these on Ubuntu and macOS with `RUSTFLAGS=-D warnings`, plus the deterministic reviewer benchmark gates. Any warning is a failure. See `AGENTS.md` for the full gate list and the rules AI agents must follow when changing code.
+CI runs these on Ubuntu and macOS with `RUSTFLAGS=-D warnings`. Any warning is a failure. See `AGENTS.md` for the full gate list and the rules AI agents must follow when changing code.
 
 ### Local development workflow
 
@@ -167,7 +167,7 @@ You land on the main menu, where the available actions are:
 
 | Menu entry | What it does |
 | --- | --- |
-| **Setup Project Config** | Creates a repo-local `.wisetree.json` when the project does not have one yet, so the project's defaults live next to the code. |
+| **Setup Project Config** | Creates a repo-local `.wisetree/.wisetree.json` when the project does not have one yet, so the project's defaults live next to the code. |
 | **Setup Shell Integration** | One-time installer for the shell wrapper + completions (only shown when integration is not yet installed). |
 | **Create** | Guided flow: pick a source branch, name the directory, optionally name a new branch, confirm. Copy patterns, shared-cache links, post-create commands, and terminal launch run automatically afterwards when configured. |
 | **Dashboard** | Live, auto-refreshing table of every worktree. See [Dashboard](#-dashboard) for the full feature breakdown — status, AI status, ahead/behind, last commit, PR state, fuzzy search, row actions, and bulk delete. |
@@ -232,7 +232,7 @@ Without the dashboard, the only way to answer "which of my five agents has somet
 
 Dashboard → Pull Request Commands → **Split** turns one large committed branch into an ordered stack of reviewable pull requests. The planner organizes layers by semantic responsibility and the Single Responsibility Principle first; `MAX` is a soft ceiling on additions plus deletions (tests included) in each parent-to-child PR diff — a guideline, not a target size, and never a reason to cut across a responsibility. A layer that has to run past `MAX` to stay coherent is kept whole and flagged on the review page with its exact overflow and the planner's reason for keeping it together, so Approve/Reject is an informed decision rather than a silent compromise. Lower PRs target the preceding dependency, and the selected source branch is rewritten as a deterministic, single-parent top commit with exactly the original source tree. The source files stay unchanged while the resulting top PR exposes only its assigned responsibility and the branch chain remains linear as GitHub stacks require—these are stacked PRs, not sibling PRs that all target `main`.
 
-The confirmation page describes the full operation. The planner then runs in an embedded terminal, like Explain, Develop and the conflict-resolution flow: Tab focuses it so you can read its reasoning and steer it mid-run, PgUp/PgDn scroll its scrollback, and Esc cancels. Its session is read-only — a planner that edits anything is rejected — and the harness, not the AI, writes the proposal to `.wisetree/split_plan.md`; Approve continues, while Reject collects feedback and regenerates the proposal with the same planner until it is approved. Configure both `dashboard.ai.split.plan` (strong semantic planner) and `dashboard.ai.split.open` (focused title/description writer). They follow the normal configuration resolution: mother-worktree `.wisetree.json`, current-worktree `.wisetree.json`, then global `~/.wisetree/settings.json`; sources are selected, never merged.
+The confirmation page describes the full operation. The planner then runs in an embedded terminal, like Explain, Develop and the conflict-resolution flow: Tab focuses it so you can read its reasoning and steer it mid-run, PgUp/PgDn scroll its scrollback, and Esc cancels. Its session is read-only — a planner that edits anything is rejected — and the harness, not the AI, writes the proposal to `.wisetree/split_plan.md`; Approve continues, while Reject collects feedback and regenerates the proposal with the same planner until it is approved. Configure both `dashboard.ai.split.plan` (strong semantic planner) and `dashboard.ai.split.open` (focused title/description writer). They follow the normal configuration resolution: mother-worktree `.wisetree/.wisetree.json`, current-worktree `.wisetree/.wisetree.json`, then global `~/.wisetree/settings.json`; sources are selected, never merged.
 
 ```json
 {
@@ -315,7 +315,14 @@ git config --global core.excludesFile ~/.gitignore_global
 echo '.wisetree/' >> ~/.gitignore_global
 ```
 
-`core.excludesFile` is a personal ignore list git applies to every repository, so `.wisetree/` disappears from `git status` everywhere without editing a single repository's `.gitignore`. Note that `.wisetree.json` is deliberately *not* in that list: unlike the directory, the project config is worth committing so the worktree setup travels with the repository instead of being re-created on every clone.
+`core.excludesFile` is a personal ignore list git applies to every repository, so `.wisetree/` disappears from `git status` everywhere without editing a single repository's `.gitignore`.
+
+That covers the project config too, since it lives at `.wisetree/.wisetree.json`. If you want the config committed while the rest of the directory stays ignored, ignore the *contents* instead so a negation can reach back in — git cannot un-ignore a file inside an ignored directory:
+
+```gitignore
+.wisetree/*
+!.wisetree/.wisetree.json
+```
 
 If you would rather keep it per-repository, `echo '.wisetree/' >> .gitignore` works too.
 
@@ -323,14 +330,14 @@ These capabilities are implemented in `wisetree` and are especially useful once 
 
 | Advanced feature | Where to use it | What it does | Why developers care |
 | --- | --- | --- | --- |
-| **Wise project setup presets** | Main menu → `Setup Project Config` | Scans the repository, detects known stacks, and writes a project-local `.wisetree.json` with copy patterns, ignore patterns, shared-cache links, and post-create commands. The preset catalog includes Rails, Django, FastAPI, Flask, Next.js, React, Vue/Nuxt, Angular, Svelte, Astro, Remix, Express, NestJS, Flutter, Spring Boot, .NET, Go, Rust, Laravel, Phoenix, Android, iOS, and Generic. | New projects get sensible `wisetree` defaults without hand-authoring every glob and setup command. Monorepos benefit because Wise discovery merges nested app presets into one de-duplicated config. |
+| **Wise project setup presets** | Main menu → `Setup Project Config` | Scans the repository, detects known stacks, and writes a project-local `.wisetree/.wisetree.json` with copy patterns, ignore patterns, shared-cache links, and post-create commands. The preset catalog includes Rails, Django, FastAPI, Flask, Next.js, React, Vue/Nuxt, Angular, Svelte, Astro, Remix, Express, NestJS, Flutter, Spring Boot, .NET, Go, Rust, Laravel, Phoenix, Android, iOS, and Generic. | New projects get sensible `wisetree` defaults without hand-authoring every glob and setup command. Monorepos benefit because Wise discovery merges nested app presets into one de-duplicated config. |
 | **Shared dependency cache** | `worktreeLinkPatterns`, `worktreeLinkStrategy`, `wisetree cache` | Links heavy directories such as `node_modules`, `target`, `.venv`, `vendor/bundle`, `Pods`, or `.gradle` from a per-repository cache instead of duplicating them in every worktree. Cache entries can be created empty, seeded from the source checkout, inspected, pruned, cleared, or printed as a path. | Creating worktrees stops meaning "download every dependency again"; repeated agent branches can share expensive install/build output safely. |
 | **Dashboard PR control plane** | `wisetree dashboard` row actions | With `gh` available and `dashboard.showPullRequests` enabled, dashboard rows expose PR actions: open in browser, squash-merge with fetched title/body, update a PR branch from the first reachable base ref, or close the PR. Rows also show CI, review, and merge-readiness signals. | Common PR maintenance happens from the same table where you decide which worktree needs attention. |
 | **AI-assisted PR conflict resolution** | Dashboard → `Update Pull Request`; configure `dashboard.ai.model` | When updating a PR hits merge conflicts, `wisetree` can hand the conflicted worktree to `opencode` with a generated merge-resolution prompt, stream the embedded AI activity in the TUI, then let you complete and push or cancel and abort the merge. | PR branches can be brought up to date without leaving the dashboard, while the final commit/push decision stays under human control. |
 | **AI model picker** | Settings → Dashboard → `ai` | Fetches provider/model pairs for `opencode` from the public models catalog and can also surface locally available free `opencode` models. Selecting one writes the exact `provider/model` value (to `ai.model`) and an optional thinking strength (to `ai.thinking`) used for AI conflict resolution. | Developers do not need to memorize model IDs or edit JSON by hand to enable the AI merge workflow. |
 | **AI harness activity detection** | Dashboard `AI Status` column | Detects Claude Code, Opencode, Codex CLI, and Gemini CLI activity from their on-disk session/state files, then aggregates each worktree as `Pending`, `Running`, `Finished`, or `Failed`. Detection is file-based and cross-platform. | When several agents are running, the dashboard can show which worktrees are still active and which are ready for review. |
 | **Safe bulk cleanup** | Dashboard footer buttons | Bulk-delete by status group (`Merged`, `Closed`, `Open`, `Clean`, `Dirty`) with a confirmation dialog, protected main checkout, optional branch deletion through `deleteBranchWithWorktree`, and per-item warnings after the run. | Cleanup becomes a deliberate batch operation instead of a risky sequence of manual `rm`, `git worktree remove`, and `git branch -d` commands. |
-| **Config editor and config sync** | Settings | The TUI edits copy patterns, ignore patterns, link patterns, link strategy, cache directory, post-create commands, terminal command, path template, dashboard settings, and branch-deletion behavior. It can also copy the full config between global settings and the repo-local `.wisetree.json`. | Project defaults and personal defaults can be moved or tuned without manually editing nested JSON. |
+| **Config editor and config sync** | Settings | The TUI edits copy patterns, ignore patterns, link patterns, link strategy, cache directory, post-create commands, terminal command, path template, dashboard settings, and branch-deletion behavior. It can also copy the full config between global settings and the repo-local `.wisetree/.wisetree.json`. | Project defaults and personal defaults can be moved or tuned without manually editing nested JSON. |
 | **Scriptable dashboard snapshots** | `wisetree dashboard --json` / `--watch` | Emits one dashboard snapshot as JSON or streams snapshots as JSON Lines. Rows include worktree, git, PR, and AI-status fields when those enrichments are enabled. | CI scripts, local automation, status bars, and custom dashboards can consume the same state the TUI uses. |
 | **Shell integration and row navigation** | `Setup Shell Integration`, dashboard row actions | Installs a shell wrapper and completions so `wisetree` can change the parent shell into a selected worktree. Dashboard actions can also open the configured editor/terminal command or copy the path. | Moving from "I found the worktree" to "I am inside it and ready to work" becomes one action. |
 | **Deletion safety and recovery** | Dashboard delete, bulk delete, worktree deletion service | Refuses dirty deletions unless forced, protects current/default branches, can delete the matching branch when configured, retries submodule-related worktree removal safely, unlinks shared-cache directories before removal, and falls back to manual cleanup plus `git worktree prune` for corrupted worktrees. | Destructive operations are guarded around the failure modes developers actually hit in long-running worktree-heavy repos. |
@@ -340,8 +347,8 @@ These capabilities are implemented in `wisetree` and are especially useful once 
 `wisetree` loads the **first** of these it finds; the files are never merged.
 When run inside a child worktree, the mother worktree is checked first:
 
-1. `.wisetree.json` in the mother worktree (project-local; commit it so the setup travels with the repository).
-2. `.wisetree.json` in the current worktree.
+1. `.wisetree/.wisetree.json` in the mother worktree (project-local; commit it if you want the setup to travel with the repository — see the ignore note above).
+2. `.wisetree/.wisetree.json` in the current worktree.
 3. `~/.wisetree/settings.json` (global, your personal defaults — auto-created on first run).
 
 Any field you omit falls back to the built-in default below, not to the global file.
@@ -424,7 +431,7 @@ Every AI slot under `dashboard.ai` stores `model`, `thinking`, and `harness`. Th
 
 Install and authenticate the selected binary before starting a workflow. Wisetree uses each CLI's existing authentication; it never stores provider credentials. Claude Code captured workflows require version `2.1.214` or newer. Codex and Claude Code run without approval prompts or CLI sandbox enforcement, so use Wisetree only with repositories and instructions you trust. The confirmation screen shows the resolved role, model, thinking level, harness, and effective permission policy before any AI command launches.
 
-Settings saves to the active configuration source: the mother `.wisetree.json`, then the current worktree’s `.wisetree.json`, otherwise `~/.wisetree/settings.json`. These sources are selected, not merged. AI metering is reported by the selected harness when it exposes usage; OpenCode session telemetry is correlated by session title. Dashboard AI Status is independent of workflow execution and metering: it only reads local Claude Code, OpenCode, Codex CLI, and Gemini CLI state/session files to report activity.
+Settings saves to the active configuration source: the mother `.wisetree/.wisetree.json`, then the current worktree’s `.wisetree/.wisetree.json`, otherwise `~/.wisetree/settings.json`. These sources are selected, not merged. AI metering is reported by the selected harness when it exposes usage; OpenCode session telemetry is correlated by session title. Dashboard AI Status is independent of workflow execution and metering: it only reads local Claude Code, OpenCode, Codex CLI, and Gemini CLI state/session files to report activity.
 
 # 📟 Wisetree CLI
 

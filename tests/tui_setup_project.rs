@@ -177,7 +177,7 @@ fn wise_discovery_completion_renders_four_blocks_and_yes_no() {
     screen.complete_wise_discovery(discover_wise(tmp.path()).expect("wise preset"));
 
     let dumped = dump(120, 60, |frame| screen.render(frame, frame.area()));
-    assert!(dumped.contains("Apply Wise Preset to .wisetree.json?"));
+    assert!(dumped.contains("Apply Wise Preset to .wisetree/.wisetree.json?"));
     assert!(dumped.contains("worktreeCopyPatterns"));
     assert!(dumped.contains("worktreeCopyIgnores"));
     assert!(dumped.contains("worktreeLinkPatterns"));
