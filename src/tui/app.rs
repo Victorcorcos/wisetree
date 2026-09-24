@@ -26,9 +26,7 @@ use crate::config::schema::{
     AiHarness, DashboardConfig, LinkStrategy, NotificationsConfig, WorktreeConfig,
 };
 use crate::config::service::ConfigService;
-use crate::constants::{
-    existing_local_config_file, global_config_file, local_config_file, local_config_root,
-};
+use crate::constants::{global_config_file, local_config_file, local_config_root};
 use crate::errors::{user_friendly_message, WisetreeError};
 use crate::files::service::{open_terminal, open_url};
 use crate::git::exec::get_git_root;
@@ -9818,24 +9816,22 @@ impl App {
     fn local_config_path(&self) -> Option<PathBuf> {
         if let Some(service) = self.worktree_service.as_ref() {
             if let Some(mother_path) = service.mother_worktree_path() {
-                // An existing file wins wherever it sits, including a legacy
-                // `.wisetree.json` at the root, so editing a repository that
-                // was never migrated updates it in place instead of writing a
-                // second config beside it.
-                if let Some(existing) = existing_local_config_file(mother_path) {
-                    return Some(existing);
+                let mother_config = local_config_file(mother_path);
+                if mother_config.exists() {
+                    return Some(mother_config);
                 }
 
                 if let Some(child_path) = self.git_root.as_deref() {
-                    if let Some(existing) = existing_local_config_file(Path::new(child_path)) {
-                        return Some(existing);
+                    let child_config = local_config_file(Path::new(child_path));
+                    if child_config.exists() {
+                        return Some(child_config);
                     }
                 }
 
                 // When neither local file exists, the mother path is the
                 // preferred local destination for an explicit local-config
                 // action (such as Setup Project Config).
-                return Some(local_config_file(mother_path));
+                return Some(mother_config);
             }
 
             if let Some(path) = service.config_service().config_path() {
@@ -9845,10 +9841,9 @@ impl App {
             }
         }
 
-        self.git_root.as_ref().map(|root| {
-            let root = Path::new(root);
-            existing_local_config_file(root).unwrap_or_else(|| local_config_file(root))
-        })
+        self.git_root
+            .as_ref()
+            .map(|root| local_config_file(Path::new(root)))
     }
 
     fn local_config_path_str(&self) -> Option<String> {

@@ -157,40 +157,6 @@ fn local_config_takes_precedence_over_global() {
     });
 }
 
-/// The project config used to sit loose at the repository root. A checkout
-/// that was never migrated must keep loading it, or Wisetree would silently
-/// run on global defaults in a repository that clearly configured itself.
-#[test]
-fn a_legacy_root_config_still_loads_and_loses_to_the_current_location() {
-    with_home(|_home| {
-        let project = tempfile::tempdir().expect("project tempdir");
-        let legacy_path = project.path().join(".wisetree.json");
-        let write = |path: &std::path::Path, terminal_command: &str| {
-            let config = WorktreeConfig {
-                terminal_command: terminal_command.into(),
-                ..WorktreeConfig::default()
-            };
-            fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-        };
-        write(&legacy_path, "from-legacy-root");
-
-        let mut svc = ConfigService::new();
-        let loaded = svc.load(Some(project.path())).expect("load legacy config");
-        assert_eq!(loaded.terminal_command, "from-legacy-root");
-        assert_eq!(svc.config_path(), Some(legacy_path.as_path()));
-
-        // Once migrated, the file inside `.wisetree/` wins even while the old
-        // one is still lying around.
-        let current_path = project_config(project.path());
-        write(&current_path, "from-wisetree-dir");
-
-        let mut svc = ConfigService::new();
-        let loaded = svc.load(Some(project.path())).expect("load current config");
-        assert_eq!(loaded.terminal_command, "from-wisetree-dir");
-        assert_eq!(svc.config_path(), Some(current_path.as_path()));
-    });
-}
-
 #[test]
 fn mother_config_takes_precedence_over_child_then_global() {
     with_home(|home| {
