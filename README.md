@@ -257,6 +257,57 @@ The durable `.wisetree/split_plan.md` records the frozen repository/remote/base/
 
 Only two judgments consume AI calls: choosing SRP boundaries and drafting focused prose. Inventory, line counting, test classification, plan rendering, branch/worktree creation, commits, GitHub publication, ordered URL lists, ticket normalization, `(N/M)` title suffixes, PR-body assembly, and metadata application are deterministic and consume no AI calls. Test classification covers the usual layouts — `spec/`, `test/`, `tests/`, `__tests__/`, `e2e/`, `cypress/`, `*_spec.rb`, `*_test.go`, `test_*.py`, `*.test.tsx`, `PaymentTest.java`, `*.feature`, and friends — and the manifest labels each change unit `test` or `implementation` so the planner keeps tests with the implementation they cover instead of guessing what counts as a test.
 
+#### Repository guides
+
+A guide is a hand-written note about internal logic your code does not make obvious — an access-control model with N permission levels, a tenancy scheme, a legacy data-migration path that explains why two tables disagree. Guides live in `.wisetree/guides/*.md` inside the repository and are read by four Pull Request Commands: **Develop** (plan and implement), **Bugkill** (investigate and fix), **Review**, and **Improve**.
+
+The commands never put a guide's body in their prompt. They embed only an *index* — one entry per guide with its name, a "Use when" line, and its path — and the AI opens the file with its own file-reading tool when, and only when, the work at hand matches. Prompt cost therefore stays flat at a few dozen tokens per guide no matter how long the guide is, and a bug that has nothing to do with authentication skips the authentication guide entirely.
+
+The minimum viable guide is a `when:` line:
+
+```markdown
+---
+when: touching permission checks, roles, or anything gated by a user's level
+---
+
+Everything below the frontmatter is yours: prose, diagrams, code blocks, any
+length. None of it reaches the prompt — the AI reads this file itself when the
+"Use when" line above matches what it is about to do.
+```
+
+Three fields are recognised, and only `when` is required:
+
+| Field | Required | Alias | Default | Cap |
+| --- | --- | --- | --- | --- |
+| `when` | **yes** | `description` | — | 240 bytes |
+| `name` | no | — | the filename without `.md` | — |
+| `applies_to` | no | `paths` | empty | 200 bytes |
+
+A guide declaring all three renders into the prompt like this:
+
+```
+- access-control — `.wisetree/guides/access_control.md` (updated today)
+  Use when: touching permission checks, roles, or anything gated by a user's level
+  Applies to: src/services/**, src/tui/screens/**
+```
+
+**A file missing `when:` (or `description:`) is silently skipped** — without that line the AI has no basis for deciding whether the guide is worth opening, so offering it blindly would be worse than omitting it. The same silent skip applies to anything that is not a readable `*.md` file with a leading `---` fenced block. Nothing warns you; the guide simply never appears. If one seems to be ignored, that missing line is almost always why.
+
+The frontmatter is not YAML — it is a flat `key: value` reader, because three string fields do not justify a parser dependency. Keys are case-insensitive, a line without a `:` is skipped rather than fatal, an empty value counts as absent, and the split happens at the first `:` so a colon inside the value is safe. `applies_to` is a single comma-separated line (`applies_to: app/policies/**, app/models/**`), not a YAML list.
+
+Guides resolve the same way configuration does — the mother worktree first, then the current worktree — so notes written in the main checkout are visible from every worktree cut from it, and a guide in a worktree shadows the mother's guide of the same `name`. Paths render relative from the worktree that owns them and absolute when they come from the mother. At most 24 guides enter the index, sorted by `name`, and the whole index is capped at 4 KB.
+
+Each entry carries how long ago the file was written (`updated today`, `updated 9 days ago`, `updated 4 months ago`), taken from the file's modification time: guides are gitignored, so there is no history to age them by. The index also closes with a standing instruction that when a guide contradicts the code, **the code wins** — and that the run should say so explicitly in its output, so you know which guide has gone stale.
+
+There is no command or screen that creates guides. Make the directory and write the file:
+
+```bash
+mkdir -p .wisetree/guides
+$EDITOR .wisetree/guides/access_control.md
+```
+
+Add `.wisetree/` to your `.gitignore`. Guides are personal notes about your own understanding of the repository, and the whole directory also holds per-checkout Wisetree state (Split plans and drafts, Review run history), none of which should be committed for the team.
+
 These capabilities are implemented in `wisetree` and are especially useful once you are managing real projects, pull requests, and multiple agent runs at the same time:
 
 | Advanced feature | Where to use it | What it does | Why developers care |
