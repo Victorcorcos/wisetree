@@ -13,10 +13,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::constants::{review_artifact_file, REVIEW_REPORT_FILE_NAME};
-use crate::services::review_telemetry::ReviewScanTelemetry;
+use crate::services::review_telemetry::{review_run_totals, ReviewRunTotals, ReviewScanTelemetry};
 use crate::tui::widgets::SummaryRow;
 
-const REVIEW_REPORT_RUNS_MAX: usize = 5;
+const REVIEW_REPORT_RUNS_MAX: usize = 8;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -33,10 +33,14 @@ struct ReviewReportRun {
     failed: usize,
     warned: usize,
     rows: Vec<ReviewReportRow>,
-    /// Per-call data is retained alongside the human-readable rows so runs
-    /// can be compared without correlating two separate history files.
+    /// Per-call token and latency data, kept next to the human-readable rows
+    /// so one run is one record.
     #[serde(default)]
     scans: Vec<ReviewScanTelemetry>,
+    /// `scans` already summed, so comparing two runs never means re-adding
+    /// every call by hand.
+    #[serde(default)]
+    totals: ReviewRunTotals,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +117,7 @@ fn persist_review_report_at(
         failed,
         warned,
         rows: rows.iter().map(ReviewReportRow::from).collect(),
+        totals: review_run_totals(scans),
         scans: scans.to_vec(),
     });
     if history.runs.len() > REVIEW_REPORT_RUNS_MAX {
@@ -206,6 +211,14 @@ mod tests {
         assert!(json.contains("promptBytes"));
         assert!(json.contains("uncachedInput"));
         assert!(json.contains("cacheRead"));
+        assert!(json.contains("openai/gpt-5.6-sol"));
+        assert!(json.contains("harness"));
+        // One run is one record: the rows and the summed usage that used to
+        // live in a second history file now arrive together.
+        assert_eq!(run.totals.calls, 1);
+        assert_eq!(run.totals.uncached_input, Some(100));
+        assert_eq!(run.totals.logical_total, Some(315));
+        assert!(json.contains("logicalTotal"));
     }
 
     /// Wisetree deletes worktrees for a living, so a history written into the

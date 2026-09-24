@@ -1,6 +1,5 @@
 //! Best-effort token and latency telemetry for Review Pull Request scans.
 
-use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,10 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::constants::{review_artifact_file, REVIEW_TELEMETRY_FILE_NAME};
 use crate::services::ai_status::AiStatusPaths;
 
-const REVIEW_TELEMETRY_RUNS_MAX: usize = 8;
 static REVIEW_SCAN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -57,34 +54,21 @@ pub struct ReviewScanTelemetry {
     pub findings: usize,
 }
 
+/// Per-run aggregate of every scan's usage, stored alongside the run's rows
+/// so comparing two runs never means re-summing them by hand.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ReviewTelemetryHistory {
-    runs: Vec<ReviewTelemetryRun>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReviewTelemetryRun {
-    completed_at_ms: u64,
-    scans: Vec<ReviewScanTelemetry>,
-    #[serde(default)]
-    totals: ReviewRunTotals,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReviewRunTotals {
-    calls: usize,
-    prompt_bytes: usize,
-    duration_ms: u64,
-    uncached_input: Option<u64>,
-    cache_read: Option<u64>,
-    cache_write: Option<u64>,
-    output: Option<u64>,
-    reasoning: Option<u64>,
-    logical_total: Option<u64>,
-    cost_usd: Option<f64>,
+pub(crate) struct ReviewRunTotals {
+    pub(crate) calls: usize,
+    pub(crate) prompt_bytes: usize,
+    pub(crate) duration_ms: u64,
+    pub(crate) uncached_input: Option<u64>,
+    pub(crate) cache_read: Option<u64>,
+    pub(crate) cache_write: Option<u64>,
+    pub(crate) output: Option<u64>,
+    pub(crate) reasoning: Option<u64>,
+    pub(crate) logical_total: Option<u64>,
+    pub(crate) cost_usd: Option<f64>,
 }
 
 /// Return a unique title that can be correlated with opencode session telemetry.
@@ -188,36 +172,6 @@ pub(crate) fn review_telemetry_label(scans: &[ReviewScanTelemetry]) -> String {
     )
 }
 
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn persist_review_telemetry(worktree_path: &Path, scans: &[ReviewScanTelemetry]) {
-    let _ = persist_review_telemetry_at(
-        &review_artifact_file(worktree_path, REVIEW_TELEMETRY_FILE_NAME),
-        scans,
-    );
-}
-
-fn persist_review_telemetry_at(path: &Path, scans: &[ReviewScanTelemetry]) -> std::io::Result<()> {
-    let mut history = fs::read_to_string(path)
-        .ok()
-        .and_then(|json| serde_json::from_str::<ReviewTelemetryHistory>(&json).ok())
-        .unwrap_or_default();
-    history.runs.push(ReviewTelemetryRun {
-        completed_at_ms: unix_millis(),
-        scans: scans.to_vec(),
-        totals: review_run_totals(scans),
-    });
-    if history.runs.len() > REVIEW_TELEMETRY_RUNS_MAX {
-        let remove = history.runs.len() - REVIEW_TELEMETRY_RUNS_MAX;
-        history.runs.drain(..remove);
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(&history)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    fs::write(path, json)
-}
-
 fn complete_sum(
     scans: &[ReviewScanTelemetry],
     dimension: impl Fn(&ReviewTokenUsage) -> Option<u64>,
@@ -227,7 +181,7 @@ fn complete_sum(
     })
 }
 
-fn review_run_totals(scans: &[ReviewScanTelemetry]) -> ReviewRunTotals {
+pub(crate) fn review_run_totals(scans: &[ReviewScanTelemetry]) -> ReviewRunTotals {
     let uncached_input = complete_sum(scans, |usage| usage.uncached_input);
     let cache_read = complete_sum(scans, |usage| usage.cache_read);
     let cache_write = complete_sum(scans, |usage| usage.cache_write);
@@ -347,24 +301,18 @@ mod tests {
     }
 
     #[test]
-    fn persistence_keeps_only_the_latest_runs_in_camel_case() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("telemetry.json");
-        for _ in 0..REVIEW_TELEMETRY_RUNS_MAX + 3 {
-            persist_review_telemetry_at(&path, &[scan(Some((1, 2)))]).unwrap();
-        }
-        let json = fs::read_to_string(path).unwrap();
-        let history: ReviewTelemetryHistory = serde_json::from_str(&json).unwrap();
-        assert_eq!(history.runs.len(), REVIEW_TELEMETRY_RUNS_MAX);
-        assert!(json.contains("completedAtMs"));
-        assert!(json.contains("promptBytes"));
-        assert!(json.contains("uncachedInput"));
-        assert!(json.contains("scanRole"));
-        assert!(json.contains("modelProfile"));
-        assert!(json.contains("openai/gpt-5.6-terra"));
-        assert!(json.contains("thinking"));
-        assert!(json.contains("harness"));
-        assert!(json.contains("logicalTotal"));
+    fn totals_sum_every_call_and_go_unavailable_when_one_is() {
+        let complete = review_run_totals(&[scan(Some((1_000, 200))), scan(Some((500, 100)))]);
+        assert_eq!(complete.calls, 2);
+        assert_eq!(complete.uncached_input, Some(1_500));
+        assert_eq!(complete.output, Some(300));
+        assert!(complete.logical_total.is_some());
+
+        // One call without usage makes the run's total unknowable rather than
+        // quietly understated.
+        let partial = review_run_totals(&[scan(Some((1_000, 200))), scan(None)]);
+        assert_eq!(partial.calls, 2);
+        assert_eq!(partial.logical_total, None);
     }
 
     #[test]

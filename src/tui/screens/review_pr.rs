@@ -1332,7 +1332,6 @@ impl ReviewPullRequestScreen {
                 colors::MUTED,
                 None,
             ));
-            persist_scan_telemetry(&self.request.worktree_path, &self.scan_telemetry);
             self.telemetry_reported = true;
         }
         // The table only ever shows a viewport of rows; the file keeps all of
@@ -2742,19 +2741,6 @@ fn review_report_path_label(worktree_path: &str) -> String {
             .unwrap_or(display),
         _ => display,
     }
-}
-
-fn persist_scan_telemetry(worktree_path: &str, scans: &[ReviewScanTelemetry]) {
-    #[cfg(not(test))]
-    {
-        let worktree = std::path::PathBuf::from(worktree_path);
-        let scans = scans.to_vec();
-        tokio::task::spawn_blocking(move || {
-            crate::services::review_telemetry::persist_review_telemetry(&worktree, &scans);
-        });
-    }
-    #[cfg(test)]
-    let _ = (worktree_path, scans);
 }
 
 /// Render a centered row of bordered buttons, each sized to exactly its own

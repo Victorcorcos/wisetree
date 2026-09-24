@@ -43,12 +43,9 @@ pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 /// so it is stored with that repository rather than in the global config.
 pub const REVIEW_DIR_NAME: &str = ".wisetree/review";
 
-/// Filename of the bounded Review Pull Request scan-telemetry history.
-pub const REVIEW_TELEMETRY_FILE_NAME: &str = "telemetry.json";
-
-/// Filename of the bounded Review Pull Request run-report history (every
-/// summary row of the last few runs, so a run too long for the table stays
-/// diagnosable after the screen closes).
+/// Filename of the bounded Review Pull Request run history: every summary row
+/// of the last few runs plus their per-call token telemetry, so a run too long
+/// for the table stays diagnosable after the screen closes.
 pub const REVIEW_REPORT_FILE_NAME: &str = "report.json";
 
 /// Commit message title written when the "Update Pull Request" flow
