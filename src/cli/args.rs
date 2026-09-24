@@ -327,7 +327,7 @@ Configuration:\n  \
 The tool looks for configuration files in the following order:\n  \
 1. .wisetree/config.json in the mother worktree\n  \
 2. .wisetree/config.json in the current worktree\n  \
-3. ~/.wisetree/settings.json (global config)\n\n\
+3. ~/.wisetree/config.json (global config)\n\n\
 For more information, visit: https://github.com/victorcorcos/wisetree\n"
     )
 }

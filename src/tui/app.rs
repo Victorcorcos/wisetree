@@ -14797,7 +14797,7 @@ mod tests {
             fs::create_dir_all(&repo_root).unwrap();
 
             let mut config_service = ConfigService::new();
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let initial = WorktreeConfig {
                 terminal_command: "code $WORKTREE_PATH".into(),
                 delete_branch_with_worktree: false,
@@ -14855,7 +14855,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -14938,7 +14938,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15002,7 +15002,7 @@ mod tests {
 
             assert_eq!(
                 app.settings_edit_file_path(),
-                home.path().join(".wisetree").join("settings.json")
+                home.path().join(".wisetree").join("config.json")
             );
             assert_eq!(
                 SETTINGS_PATH_COPIED_MESSAGE,
@@ -15035,7 +15035,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let global = WorktreeConfig {
                 terminal_command: "global $WORKTREE_PATH".into(),
                 delete_branch_with_worktree: true,
@@ -15086,7 +15086,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15150,7 +15150,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15195,7 +15195,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15231,7 +15231,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15277,7 +15277,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15316,7 +15316,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15369,7 +15369,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15410,7 +15410,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15462,7 +15462,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15497,7 +15497,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15573,7 +15573,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {
@@ -15628,7 +15628,7 @@ mod tests {
             let repo_root = home.path().join("repo");
             fs::create_dir_all(&repo_root).unwrap();
 
-            let global_path = home.path().join(".wisetree").join("settings.json");
+            let global_path = home.path().join(".wisetree").join("config.json");
             let local_path = local_config_file(&repo_root);
 
             let global = WorktreeConfig {

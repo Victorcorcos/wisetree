@@ -1,7 +1,7 @@
 //! `ConfigService` — discovery, load, save, reset.
 //!
 //! Resolution order is the project-local `.wisetree/config.json` first,
-//! then `~/.wisetree/settings.json`, falling back to
+//! then `~/.wisetree/config.json`, falling back to
 //! `WorktreeConfig::default()`.
 
 use std::env;
@@ -153,7 +153,7 @@ impl ConfigService {
         Ok(path)
     }
 
-    /// True when `~/.wisetree/settings.json` exists on disk.
+    /// True when `~/.wisetree/config.json` exists on disk.
     pub fn has_global_config(&self) -> bool {
         global_config_file().exists()
     }

@@ -300,7 +300,7 @@ fn missing_model_is_readable_and_confirmation_fails_safely() {
     );
     let (text, _) = render(&mut screen, 100, 48);
     assert!(text.contains("dashboard.ai.split.plan"), "{text}");
-    assert!(text.contains(".wisetree.json"), "{text}");
+    assert!(text.contains(".wisetree/config.json"), "{text}");
 }
 
 #[test]

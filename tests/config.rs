@@ -146,7 +146,7 @@ fn local_config_takes_precedence_over_global() {
             ..WorktreeConfig::default()
         };
         fs::write(
-            global_dir.join("settings.json"),
+            global_dir.join("config.json"),
             serde_json::to_string_pretty(&global).unwrap(),
         )
         .unwrap();
@@ -164,7 +164,7 @@ fn mother_config_takes_precedence_over_child_then_global() {
         let child = tempfile::tempdir().expect("child tempdir");
         let mother_path = project_config(mother.path());
         let child_path = project_config(child.path());
-        let global_path = home.path().join(".wisetree").join("settings.json");
+        let global_path = home.path().join(".wisetree").join("config.json");
         fs::create_dir_all(global_path.parent().unwrap()).unwrap();
 
         for (path, terminal_command) in [
@@ -214,7 +214,7 @@ fn falls_back_to_global_when_no_local() {
             ..WorktreeConfig::default()
         };
         fs::write(
-            global_dir.join("settings.json"),
+            global_dir.join("config.json"),
             serde_json::to_string_pretty(&global).unwrap(),
         )
         .unwrap();
@@ -248,7 +248,7 @@ fn load_global_ignores_local_config() {
             ..WorktreeConfig::default()
         };
         fs::write(
-            global_dir.join("settings.json"),
+            global_dir.join("config.json"),
             serde_json::to_string_pretty(&global).unwrap(),
         )
         .unwrap();
@@ -265,7 +265,7 @@ fn ensure_global_config_creates_dir_and_file() {
     with_home(|home| {
         let svc = ConfigService::new();
         svc.ensure_global_config().expect("ensure");
-        let path = home.path().join(".wisetree").join("settings.json");
+        let path = home.path().join(".wisetree").join("config.json");
         assert!(
             path.exists(),
             "global config not created at {}",

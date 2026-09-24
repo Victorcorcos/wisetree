@@ -12,8 +12,10 @@ pub const LOCAL_CONFIG_FILE_NAME: &str = "config.json";
 /// Subdirectory of `$HOME` where the global config and state live.
 pub const GLOBAL_CONFIG_DIR_NAME: &str = ".wisetree";
 
-/// Filename of the global config.
-pub const GLOBAL_CONFIG_FILE_NAME: &str = "settings.json";
+/// Filename of the global config. Deliberately the same basename as the
+/// project-local config ([`LOCAL_CONFIG_FILE_NAME`]): the two files hold the
+/// same schema and differ only in scope, so they read as one concept.
+pub const GLOBAL_CONFIG_FILE_NAME: &str = "config.json";
 
 /// Filename of the app state cache.
 pub const APP_STATE_FILE_NAME: &str = "state.json";
@@ -83,7 +85,7 @@ pub fn global_config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(GLOBAL_CONFIG_DIR_NAME))
 }
 
-/// Path to the global config file (`~/.wisetree/settings.json`).
+/// Path to the global config file (`~/.wisetree/config.json`).
 pub fn global_config_file() -> PathBuf {
     global_config_dir().join(GLOBAL_CONFIG_FILE_NAME)
 }

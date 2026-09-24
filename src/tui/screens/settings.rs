@@ -58,9 +58,9 @@ pub enum SettingsStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyDirection {
     /// Overwrite (or create) the project-local `.wisetree.json` with the
-    /// contents of `~/.wisetree/settings.json`.
+    /// contents of `~/.wisetree/config.json`.
     GlobalToLocal,
-    /// Overwrite (or create) `~/.wisetree/settings.json` with the contents
+    /// Overwrite (or create) `~/.wisetree/config.json` with the contents
     /// of the project-local `.wisetree.json`.
     LocalToGlobal,
 }

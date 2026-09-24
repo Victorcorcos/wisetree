@@ -232,7 +232,7 @@ Without the dashboard, the only way to answer "which of my five agents has somet
 
 Dashboard → Pull Request Commands → **Split** turns one large committed branch into an ordered stack of reviewable pull requests. The planner organizes layers by semantic responsibility and the Single Responsibility Principle first; `MAX` is a soft ceiling on additions plus deletions (tests included) in each parent-to-child PR diff — a guideline, not a target size, and never a reason to cut across a responsibility. A layer that has to run past `MAX` to stay coherent is kept whole and flagged on the review page with its exact overflow and the planner's reason for keeping it together, so Approve/Reject is an informed decision rather than a silent compromise. Lower PRs target the preceding dependency, and the selected source branch is rewritten as a deterministic, single-parent top commit with exactly the original source tree. The source files stay unchanged while the resulting top PR exposes only its assigned responsibility and the branch chain remains linear as GitHub stacks require—these are stacked PRs, not sibling PRs that all target `main`.
 
-The confirmation page describes the full operation. The planner then runs in an embedded terminal, like Explain, Develop and the conflict-resolution flow: Tab focuses it so you can read its reasoning and steer it mid-run, PgUp/PgDn scroll its scrollback, and Esc cancels. Its session is read-only — a planner that edits anything is rejected — and the harness, not the AI, writes the proposal to `.wisetree/split_plan.md`; Approve continues, while Reject collects feedback and regenerates the proposal with the same planner until it is approved. Configure both `dashboard.ai.split.plan` (strong semantic planner) and `dashboard.ai.split.open` (focused title/description writer). They follow the normal configuration resolution: mother-worktree `.wisetree/config.json`, current-worktree `.wisetree/config.json`, then global `~/.wisetree/settings.json`; sources are selected, never merged.
+The confirmation page describes the full operation. The planner then runs in an embedded terminal, like Explain, Develop and the conflict-resolution flow: Tab focuses it so you can read its reasoning and steer it mid-run, PgUp/PgDn scroll its scrollback, and Esc cancels. Its session is read-only — a planner that edits anything is rejected — and the harness, not the AI, writes the proposal to `.wisetree/split_plan.md`; Approve continues, while Reject collects feedback and regenerates the proposal with the same planner until it is approved. Configure both `dashboard.ai.split.plan` (strong semantic planner) and `dashboard.ai.split.open` (focused title/description writer). They follow the normal configuration resolution: mother-worktree `.wisetree/config.json`, current-worktree `.wisetree/config.json`, then global `~/.wisetree/config.json`; sources are selected, never merged.
 
 ```json
 {
@@ -342,7 +342,7 @@ When run inside a child worktree, the mother worktree is checked first:
 
 1. `.wisetree/config.json` in the mother worktree (project-local, never committed — see the ignore note above).
 2. `.wisetree/config.json` in the current worktree.
-3. `~/.wisetree/settings.json` (global, your personal defaults — auto-created on first run).
+3. `~/.wisetree/config.json` (global, your personal defaults — auto-created on first run).
 
 Any field you omit falls back to the built-in default below, not to the global file.
 
@@ -424,7 +424,7 @@ Every AI slot under `dashboard.ai` stores `model`, `thinking`, and `harness`. Th
 
 Install and authenticate the selected binary before starting a workflow. Wisetree uses each CLI's existing authentication; it never stores provider credentials. Claude Code captured workflows require version `2.1.214` or newer. Codex and Claude Code run without approval prompts or CLI sandbox enforcement, so use Wisetree only with repositories and instructions you trust. The confirmation screen shows the resolved role, model, thinking level, harness, and effective permission policy before any AI command launches.
 
-Settings saves to the active configuration source: the mother `.wisetree/config.json`, then the current worktree’s `.wisetree/config.json`, otherwise `~/.wisetree/settings.json`. These sources are selected, not merged. AI metering is reported by the selected harness when it exposes usage; OpenCode session telemetry is correlated by session title. Dashboard AI Status is independent of workflow execution and metering: it only reads local Claude Code, OpenCode, Codex CLI, and Gemini CLI state/session files to report activity.
+Settings saves to the active configuration source: the mother `.wisetree/config.json`, then the current worktree’s `.wisetree/config.json`, otherwise `~/.wisetree/config.json`. These sources are selected, not merged. AI metering is reported by the selected harness when it exposes usage; OpenCode session telemetry is correlated by session title. Dashboard AI Status is independent of workflow execution and metering: it only reads local Claude Code, OpenCode, Codex CLI, and Gemini CLI state/session files to report activity.
 
 # 📟 Wisetree CLI
 

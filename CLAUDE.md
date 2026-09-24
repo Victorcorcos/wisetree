@@ -77,7 +77,7 @@ src/
 ├── git/                       # thin async wrapper around git binary (no libgit2)
 ├── worktree/service.rs        # high-level create/delete orchestration (git + config + files)
 ├── files/                     # copy patterns, symlink cache, PTY post-create commands
-├── config/                    # loads .wisetree.json (project) or ~/.wisetree/settings.json (global)
+├── config/                    # loads .wisetree/config.json (project) or ~/.wisetree/config.json (global)
 └── errors.rs                  # WisetreeError + GitErrorCode; user_friendly_message()
 ```
 
@@ -86,7 +86,7 @@ src/
 - **Git as subprocess**: all git ops spawn the `git` binary via `tokio::Command`; parse stdout/stderr.
 - **Screen pattern**: each screen struct has `new()`, `handle_key()`, `render()`. Heavy state lives in the screen, not in widgets.
 - **Async everywhere**: TUI runs on a Tokio multi-threaded runtime; background tasks send results back via `AppEvent` channels.
-- **Config fallback**: project-local `.wisetree.json` → global `~/.wisetree/settings.json` → built-in defaults.
+- **Config fallback**: project-local `.wisetree/config.json` → global `~/.wisetree/config.json` → built-in defaults. Same basename, different scope.
 - **Serde field names**: use `camelCase` (`#[serde(rename_all = "camelCase")]`) to match the upstream TypeScript wire format.
 - **Error handling**: propagate with `?`; map git stderr substrings to `GitErrorCode` variants for branching logic.
 - **PTY rendering**: `portable-pty` spawns shells; `vt100` parses escape sequences for ratatui display.

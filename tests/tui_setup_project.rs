@@ -11,6 +11,7 @@ use tempfile::tempdir;
 
 use wisetree::config::schema::WorktreeConfig;
 use wisetree::config::service::ConfigService;
+use wisetree::constants::local_config_file;
 use wisetree::services::presets::{catalog, discover_wise, PresetId, WisePresetDiscovery};
 use wisetree::tui::screens::setup_project::{
     PresetChoice, SetupProjectAction, SetupProjectScreen, SetupProjectStep,
