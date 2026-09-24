@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use tempfile::TempDir;
 use wisetree::config::{LinkStrategy, WorktreeConfig};
-use wisetree::constants::LOCAL_CONFIG_FILE_NAME;
+use wisetree::constants::local_config_file;
 use wisetree::git::types::WorktreeCreateOptions;
 use wisetree::worktree::WorktreeService;
 
@@ -171,9 +171,12 @@ async fn create_worktree_from_child_uses_mother_path_as_anchor() {
     });
 }
 
-#[tokio::test]
-async fn create_worktree_from_child_uses_mother_config_over_child_config() {
-    with_isolated_home(|| {
+// Deliberately a plain `#[test]`: the body drives its own runtime, and a
+// `#[tokio::test]` would already be inside one — `Runtime::new()` then panics
+// with "Cannot start a runtime from within a runtime".
+#[test]
+fn create_worktree_from_child_uses_mother_config_over_child_config() {
+    with_isolated_home_checked(|| {
         let body = async {
             let fx = build_fixture();
             let mother_config = WorktreeConfig {
@@ -181,8 +184,9 @@ async fn create_worktree_from_child_uses_mother_config_over_child_config() {
                 post_create_cmd: vec!["echo mother > config-source.txt".into()],
                 ..WorktreeConfig::default()
             };
+            fs::create_dir_all(local_config_file(&fx.repo).parent().unwrap()).unwrap();
             fs::write(
-                fx.repo.join(LOCAL_CONFIG_FILE_NAME),
+                local_config_file(&fx.repo),
                 serde_json::to_string_pretty(&mother_config).unwrap(),
             )
             .unwrap();
@@ -208,17 +212,23 @@ async fn create_worktree_from_child_uses_mother_config_over_child_config() {
                 post_create_cmd: vec!["echo child > config-source.txt".into()],
                 ..WorktreeConfig::default()
             };
+            fs::create_dir_all(local_config_file(&first.worktree_path).parent().unwrap()).unwrap();
             fs::write(
-                first.worktree_path.join(LOCAL_CONFIG_FILE_NAME),
+                local_config_file(&first.worktree_path),
                 serde_json::to_string_pretty(&child_config).unwrap(),
             )
             .unwrap();
 
             let mut child_svc = WorktreeService::new(Some(first.worktree_path.clone()));
             child_svc.initialize().await.expect("init child");
+            // macOS resolves the tempdir through /private, and the service
+            // canonicalises what it loads — compare canonical paths.
             assert_eq!(
-                child_svc.config_service().config_path(),
-                Some(fx.repo.join(LOCAL_CONFIG_FILE_NAME).as_path())
+                child_svc
+                    .config_service()
+                    .config_path()
+                    .map(|path| path.canonicalize().unwrap()),
+                Some(local_config_file(&fx.repo).canonicalize().unwrap())
             );
             assert_eq!(
                 child_svc.config_service().config().post_create_cmd,

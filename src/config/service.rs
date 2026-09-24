@@ -1,6 +1,6 @@
 //! `ConfigService` — discovery, load, save, reset.
 //!
-//! Resolution order is the project-local `.wisetree/.wisetree.json` first,
+//! Resolution order is the project-local `.wisetree/config.json` first,
 //! then `~/.wisetree/settings.json`, falling back to
 //! `WorktreeConfig::default()`.
 

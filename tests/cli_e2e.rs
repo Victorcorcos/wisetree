@@ -155,7 +155,7 @@ fn cache_list_json_outputs_object() {
     let fx = repo_with_commit();
     let home = isolated_home();
 
-    let config_path = fx.repo.join(".wisetree").join(".wisetree.json");
+    let config_path = fx.repo.join(".wisetree").join("config.json");
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
     std::fs::write(
         config_path,

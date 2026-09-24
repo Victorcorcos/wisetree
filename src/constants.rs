@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 pub const LOCAL_DIR_NAME: &str = ".wisetree";
 
 /// Filename of the project-local config, inside [`LOCAL_DIR_NAME`].
-pub const LOCAL_CONFIG_FILE_NAME: &str = ".wisetree.json";
+pub const LOCAL_CONFIG_FILE_NAME: &str = "config.json";
 
 /// Subdirectory of `$HOME` where the global config and state live.
 pub const GLOBAL_CONFIG_DIR_NAME: &str = ".wisetree";
@@ -108,7 +108,7 @@ pub fn dashboard_pr_cache_file() -> PathBuf {
     global_config_dir().join(DASHBOARD_PR_CACHE_FILE_NAME)
 }
 
-/// Path to a repository's project config: `<root>/.wisetree/.wisetree.json`.
+/// Path to a repository's project config: `<root>/.wisetree/config.json`.
 /// The only location Wisetree reads or writes.
 pub fn local_config_file(repo_root: &Path) -> PathBuf {
     repo_root.join(LOCAL_DIR_NAME).join(LOCAL_CONFIG_FILE_NAME)
@@ -171,7 +171,7 @@ mod tests {
     fn the_project_config_lives_inside_the_wisetree_directory() {
         assert_eq!(
             local_config_file(Path::new("/repo")),
-            Path::new("/repo/.wisetree/.wisetree.json")
+            Path::new("/repo/.wisetree/config.json")
         );
     }
 
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn the_owning_root_is_the_repository_not_the_wisetree_directory() {
         assert_eq!(
-            local_config_root(Path::new("/repo/.wisetree/.wisetree.json")),
+            local_config_root(Path::new("/repo/.wisetree/config.json")),
             Some(Path::new("/repo"))
         );
     }

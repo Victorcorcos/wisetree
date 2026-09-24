@@ -747,7 +747,7 @@ impl SplitPullRequestScreen {
             Ok(max)
         } else {
             Err(format!(
-                "Configure {} in .wisetree/.wisetree.json before starting Split.",
+                "Configure {} in .wisetree/config.json before starting Split.",
                 missing.join(" and ")
             ))
         }

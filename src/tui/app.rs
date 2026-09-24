@@ -8153,7 +8153,7 @@ impl App {
             None => {
                 self.show_toast(
                     ToastVariant::Error,
-                    "No git repository in scope — cannot write .wisetree/.wisetree.json.",
+                    "No git repository in scope — cannot write .wisetree/config.json.",
                 );
                 return;
             }
@@ -8174,7 +8174,7 @@ impl App {
         if let Err(err) = writer.save(&config, Some(&local_path)) {
             self.show_toast(
                 ToastVariant::Error,
-                format!("Failed to write .wisetree/.wisetree.json: {err}"),
+                format!("Failed to write .wisetree/config.json: {err}"),
             );
             return;
         }
@@ -8187,7 +8187,7 @@ impl App {
 
         self.show_toast(
             ToastVariant::Success,
-            format!("Applied {applied_label} to .wisetree/.wisetree.json"),
+            format!("Applied {applied_label} to .wisetree/config.json"),
         );
         self.back_to_menu();
     }
@@ -14560,7 +14560,7 @@ mod tests {
     }
 
     fn initialized_menu_app() -> App {
-        // A persistent tempdir with a stub `.wisetree/.wisetree.json` so
+        // A persistent tempdir with a stub `.wisetree/config.json` so
         // `has_local_config()` is true and the "Setup Project Config"
         // entry is hidden — keeping menu ordering stable for these tests.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -16599,7 +16599,7 @@ mod tests {
             assert_eq!(toast.variant, ToastVariant::Success);
             assert_eq!(
                 toast.message,
-                "Applied Wise Preset to .wisetree/.wisetree.json"
+                "Applied Wise Preset to .wisetree/config.json"
             );
         });
     }

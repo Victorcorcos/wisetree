@@ -974,7 +974,7 @@ impl SetupProjectScreen {
         let intro = Line::from(vec![
             Span::styled("Pick a project preset to bootstrap ", info),
             Span::styled(
-                ".wisetree/.wisetree.json",
+                ".wisetree/config.json",
                 Style::default()
                     .fg(colors::EMPHASIS)
                     .add_modifier(Modifier::BOLD),
@@ -1015,7 +1015,7 @@ impl SetupProjectScreen {
 
         let footer_lines = vec![
             Line::from(Span::styled(
-                "Confirming will replace Copy Patterns, Ignore Patterns, Shared Cache Links, and Post-Create Commands in .wisetree/.wisetree.json with the chosen preset.",
+                "Confirming will replace Copy Patterns, Ignore Patterns, Shared Cache Links, and Post-Create Commands in .wisetree/config.json with the chosen preset.",
                 Style::default().fg(colors::MUTED),
             )),
             Line::from(Span::styled(
@@ -1112,7 +1112,7 @@ impl SetupProjectScreen {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                ".wisetree/.wisetree.json",
+                ".wisetree/config.json",
                 Style::default()
                     .fg(colors::EMPHASIS)
                     .add_modifier(Modifier::BOLD),

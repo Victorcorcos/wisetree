@@ -29,7 +29,7 @@ fn with_home<F: FnOnce(&TempDir)>(f: F) {
 /// Path to a project's config in its current home, creating `.wisetree/` so a
 /// plain `fs::write` succeeds.
 fn project_config(root: &std::path::Path) -> std::path::PathBuf {
-    let path = root.join(".wisetree").join(".wisetree.json");
+    let path = root.join(".wisetree").join("config.json");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     path
 }
@@ -312,7 +312,7 @@ fn malformed_local_config_returns_error_with_path() {
         let mut svc = ConfigService::new();
         let err = svc.load(Some(project.path())).expect_err("must error");
         let msg = format!("{err}");
-        assert!(msg.contains(".wisetree.json"), "{msg}");
+        assert!(msg.contains(".wisetree/config.json"), "{msg}");
         let _ = home;
     });
 }

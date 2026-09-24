@@ -15,7 +15,6 @@ Cargo.lock.bak
 
 # AI related
 local/
-.wisetree.json
 
 # Scratch artifacts written into a worktree by Wisetree's own PR commands
 # (Develop writes PLAN.md, Bugkill writes BUG_INVESTIGATION.md). They describe
@@ -23,7 +22,7 @@ local/
 PLAN.md
 BUG_INVESTIGATION.md
 
-# Repository-local Wisetree state: Split plans and drafts, the hand-written
-# guide index, and the reviewer's project test patterns. All of it is personal
-# to one checkout, so it is never committed for the team.
-.wisetree/
+# Wisetree's own working area for this checkout: the project config, the
+# hand-written guide index, Split plans and drafts, and Review run history.
+# None of it is ever committed, here or in any other repository.
+.wisetree/*

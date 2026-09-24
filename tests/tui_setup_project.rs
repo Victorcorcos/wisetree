@@ -83,7 +83,7 @@ fn preset_list_renders_intro_and_didactic_footer() {
     let screen = SetupProjectScreen::new(None);
     let dumped = dump(120, 40, |frame| screen.render(frame, frame.area()));
     assert!(dumped.contains("Pick a project preset"));
-    assert!(dumped.contains(".wisetree.json"));
+    assert!(dumped.contains(".wisetree/config.json"));
     assert!(dumped.contains("Confirming will replace"));
     assert!(dumped.contains("Shared Cache Links"));
     assert!(dumped.contains("Type to filter"));
@@ -177,7 +177,7 @@ fn wise_discovery_completion_renders_four_blocks_and_yes_no() {
     screen.complete_wise_discovery(discover_wise(tmp.path()).expect("wise preset"));
 
     let dumped = dump(120, 60, |frame| screen.render(frame, frame.area()));
-    assert!(dumped.contains("Apply Wise Preset to .wisetree/.wisetree.json?"));
+    assert!(dumped.contains("Apply Wise Preset to .wisetree/config.json?"));
     assert!(dumped.contains("worktreeCopyPatterns"));
     assert!(dumped.contains("worktreeCopyIgnores"));
     assert!(dumped.contains("worktreeLinkPatterns"));
@@ -344,7 +344,7 @@ fn end_to_end_apply_writes_local_config_with_wise_values() {
     };
 
     let mut service = ConfigService::new();
-    let local_path = tmp.path().join(".wisetree.json");
+    let local_path = local_config_file(tmp.path());
     service.save(&config, Some(&local_path)).unwrap();
 
     let written: WorktreeConfig =
