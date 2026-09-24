@@ -1500,13 +1500,6 @@ pub struct ReviewSummaryAttempt {
     pub telemetry: ReviewScanTelemetry,
 }
 
-/// Read-only result of running the production Review discovery pipeline for a benchmark case.
-#[derive(Debug)]
-pub struct ReviewBenchmarkOutcome {
-    pub findings: Vec<ReviewFinding>,
-    pub usage: ReviewTokenUsage,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewVerification {
     Confirmed {
@@ -4550,248 +4543,6 @@ impl DashboardService {
             raw_output,
             &selection,
         )
-    }
-
-    /// Run the production Review discovery, retry, omission-audit, and
-    /// selective-verification pipeline against an already captured diff.
-    /// This entry point exists for the read-only benchmark adapter; it never
-    /// posts comments, submits a review, or invokes `git`/`gh`.
-    pub async fn benchmark_review_diff(
-        &self,
-        worktree_path: &str,
-        diff: &str,
-    ) -> Result<ReviewBenchmarkOutcome> {
-        let mut files = parse_review_diff(diff);
-        let (mut files, _) = partition_reviewable_files(std::mem::take(&mut files));
-        if files.is_empty() {
-            return Ok(ReviewBenchmarkOutcome {
-                findings: Vec::new(),
-                usage: ReviewTokenUsage::default(),
-            });
-        }
-        attach_review_file_contents(Path::new(worktree_path), &mut files).await;
-        let context = build_review_context(Path::new(worktree_path), &files).await;
-        let mode = review_scan_mode(&files);
-        let groups = review_file_groups(&files, mode);
-        let coverage_groups = review_coverage_groups(&files, mode);
-        let mut usage = None;
-        let mut findings = Vec::new();
-        let mut tester_findings = Vec::new();
-
-        for group in &groups {
-            let group_findings = self
-                .benchmark_scan_group_with_retries(worktree_path, group, &context, &mut usage)
-                .await?;
-            if group.profile == ReviewGroupProfile::Tester {
-                tester_findings.extend(group_findings.clone());
-            }
-            findings.extend(group_findings);
-        }
-
-        for coverage_files in &coverage_groups {
-            let coverage_findings = self
-                .benchmark_scan_coverage_with_retries(
-                    worktree_path,
-                    coverage_files,
-                    &context,
-                    &tester_findings,
-                    mode,
-                    &mut usage,
-                )
-                .await?;
-            findings.extend(coverage_findings);
-        }
-
-        let mut audit_titles = BTreeSet::new();
-        if mode == ReviewScanMode::Split && coverage_groups.len() > 1 {
-            let relationships = groups
-                .iter()
-                .filter_map(|group| {
-                    (!group.relationship_summary.is_empty())
-                        .then_some(group.relationship_summary.as_str())
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join("\n");
-            let attempt = self
-                .scan_review_gap_audit(
-                    worktree_path,
-                    &files,
-                    &context,
-                    &relationships,
-                    &[],
-                    &findings,
-                )
-                .await;
-            accumulate_review_usage(&mut usage, &attempt.telemetry.usage);
-            if let Ok(audit) = attempt.result {
-                audit_titles.extend(
-                    audit
-                        .iter()
-                        .map(|finding| finding.title.to_ascii_lowercase()),
-                );
-                findings.extend(audit);
-            }
-        }
-
-        let (mut findings, _) = split_run_duplicate_findings(findings);
-        let mut verified = Vec::with_capacity(findings.len());
-        for finding in findings.drain(..) {
-            let cross_group = groups.iter().any(|group| {
-                review_relationship_summary_has_endpoint(&group.relationship_summary, &finding.file)
-            });
-            let requires_verification = matches!(
-                finding.severity,
-                ReviewSeverity::Critical | ReviewSeverity::High
-            ) || finding.category.eq_ignore_ascii_case("security")
-                || finding.line.is_none()
-                || audit_titles.contains(&finding.title.to_ascii_lowercase())
-                || cross_group;
-            if !requires_verification {
-                verified.push(finding);
-                continue;
-            }
-            let Some(file) = files.iter().find(|file| file.path == finding.file) else {
-                continue;
-            };
-            let strong = matches!(
-                finding.severity,
-                ReviewSeverity::Critical | ReviewSeverity::High
-            ) || finding.category.eq_ignore_ascii_case("security")
-                || cross_group;
-            let attempt = self
-                .verify_review_findings(
-                    worktree_path,
-                    file,
-                    std::slice::from_ref(&finding),
-                    &context,
-                    strong,
-                )
-                .await;
-            accumulate_review_usage(&mut usage, &attempt.telemetry.usage);
-            match attempt.results.into_iter().next().flatten() {
-                Some(Ok(ReviewVerification::Confirmed { .. })) => verified.push(finding),
-                Some(Ok(ReviewVerification::RejectedFalsePositive { .. })) | Some(Err(_)) => {}
-                Some(Ok(ReviewVerification::Revise {
-                    finding: revised, ..
-                })) => verified.push(revised),
-                None => {}
-            }
-        }
-        let (findings, _) = split_run_duplicate_findings(verified);
-        Ok(ReviewBenchmarkOutcome {
-            findings,
-            usage: usage.unwrap_or_default(),
-        })
-    }
-
-    async fn benchmark_scan_group_with_retries(
-        &self,
-        worktree_path: &str,
-        group: &ReviewFileGroup,
-        context: &ReviewContext,
-        usage: &mut Option<ReviewTokenUsage>,
-    ) -> Result<Vec<ReviewFinding>> {
-        let first = self.scan_review_group(worktree_path, group, context).await;
-        accumulate_review_usage(usage, &first.telemetry.usage);
-        let raw = first.raw_output.clone();
-        let retry_full = first
-            .result
-            .as_ref()
-            .err()
-            .is_some_and(|error| !review_failure_repeats_on_rescan(&error.to_string()));
-        if let Ok(findings) = first.result {
-            return Ok(findings);
-        }
-        if let Some(raw) = raw {
-            let reformatted = self
-                .reformat_review_group_output(worktree_path, group, &raw)
-                .await;
-            accumulate_review_usage(usage, &reformatted.telemetry.usage);
-            if let Ok(findings) = reformatted.result {
-                return Ok(findings);
-            }
-            if reformatted
-                .result
-                .as_ref()
-                .err()
-                .is_some_and(|error| review_failure_repeats_on_rescan(&error.to_string()))
-            {
-                return reformatted.result;
-            }
-        }
-        if !retry_full {
-            return Err(WisetreeError::other(
-                "review group failure cannot succeed on an identical full rescan.",
-            ));
-        }
-        let full = self.scan_review_group(worktree_path, group, context).await;
-        accumulate_review_usage(usage, &full.telemetry.usage);
-        full.result
-    }
-
-    async fn benchmark_scan_coverage_with_retries(
-        &self,
-        worktree_path: &str,
-        files: &[ReviewFile],
-        context: &ReviewContext,
-        tester_findings: &[ReviewFinding],
-        mode: ReviewScanMode,
-        usage: &mut Option<ReviewTokenUsage>,
-    ) -> Result<Vec<ReviewFinding>> {
-        let first = if mode == ReviewScanMode::Merged {
-            self.scan_review_merged(worktree_path, files, context, tester_findings)
-                .await
-        } else {
-            self.scan_review_coverage(worktree_path, files, context, tester_findings)
-                .await
-        };
-        accumulate_review_usage(usage, &first.telemetry.usage);
-        let raw = first.raw_output.clone();
-        let retry_full = first
-            .result
-            .as_ref()
-            .err()
-            .is_some_and(|error| !review_failure_repeats_on_rescan(&error.to_string()));
-        if let Ok(findings) = first.result {
-            return Ok(findings);
-        }
-        if let Some(raw) = raw {
-            let reformatted = if mode == ReviewScanMode::Merged {
-                self.reformat_review_merged_output(worktree_path, files, &raw)
-                    .await
-            } else {
-                self.reformat_review_coverage_output(worktree_path, files, &raw)
-                    .await
-            };
-            accumulate_review_usage(usage, &reformatted.telemetry.usage);
-            if let Ok(findings) = reformatted.result {
-                return Ok(findings);
-            }
-            if reformatted
-                .result
-                .as_ref()
-                .err()
-                .is_some_and(|error| review_failure_repeats_on_rescan(&error.to_string()))
-            {
-                return reformatted.result;
-            }
-        }
-        if !retry_full {
-            return Err(WisetreeError::other(
-                "review coverage failure cannot succeed on an identical full rescan.",
-            ));
-        }
-        let full = if mode == ReviewScanMode::Merged {
-            self.scan_review_merged(worktree_path, files, context, tester_findings)
-                .await
-        } else {
-            self.scan_review_coverage(worktree_path, files, context, tester_findings)
-                .await
-        };
-        accumulate_review_usage(usage, &full.telemetry.usage);
-        full.result
     }
 
     /// Repair a malformed per-file result without sending the diff again.
@@ -11319,57 +11070,6 @@ fn review_scan_attempt(
     }
 }
 
-/// Retrying an identical discovery prompt cannot recover from a provider
-/// timeout or size/context rejection. Network and process failures remain
-/// eligible for the one full retry.
-fn review_failure_repeats_on_rescan(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "timed out",
-        "timeout",
-        "too large",
-        "too long",
-        "context length",
-        "context window",
-        "maximum context",
-        "prompt is too",
-        "argument list too long",
-    ]
-    .iter()
-    .any(|marker| message.contains(marker))
-}
-
-fn accumulate_review_usage(total: &mut Option<ReviewTokenUsage>, next: &ReviewTokenUsage) {
-    let Some(current) = total.as_mut() else {
-        *total = Some(next.clone());
-        return;
-    };
-    current.uncached_input = current
-        .uncached_input
-        .zip(next.uncached_input)
-        .map(|(left, right)| left.saturating_add(right));
-    current.cache_read = current
-        .cache_read
-        .zip(next.cache_read)
-        .map(|(left, right)| left.saturating_add(right));
-    current.cache_write = current
-        .cache_write
-        .zip(next.cache_write)
-        .map(|(left, right)| left.saturating_add(right));
-    current.output = current
-        .output
-        .zip(next.output)
-        .map(|(left, right)| left.saturating_add(right));
-    current.reasoning = current
-        .reasoning
-        .zip(next.reasoning)
-        .map(|(left, right)| left.saturating_add(right));
-    current.cost_usd = current
-        .cost_usd
-        .zip(next.cost_usd)
-        .map(|(left, right)| left + right);
-}
-
 /// The whole call failed, so no candidate was judged. Reported per candidate
 /// as the same error; a failed call is never re-asked candidate by candidate,
 /// which would replay the same failure once per finding.
@@ -11434,7 +11134,7 @@ async fn materialize_review_tables() -> String {
     path.to_string_lossy().to_string()
 }
 
-/// Legacy path classifier retained for diagnostics and benchmark fixtures.
+/// Legacy path classifier retained for diagnostics.
 /// These classes are not sufficient proof that a textual change is harmless,
 /// so [`review_file_skip_reason`] does not use them as unconditional skips.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -13980,19 +13680,6 @@ new file mode 100644
         assert_eq!(skipped[0].reason, "binary file without reviewable text");
     }
 
-    #[tokio::test]
-    async fn benchmark_review_diff_returns_without_model_calls_for_empty_input() {
-        let directory = tempfile::tempdir().unwrap();
-        let service =
-            DashboardService::new(directory.path().to_path_buf(), DashboardConfig::default());
-        let outcome = service
-            .benchmark_review_diff(directory.path().to_str().unwrap(), "")
-            .await
-            .unwrap();
-        assert!(outcome.findings.is_empty());
-        assert_eq!(outcome.usage, ReviewTokenUsage::default());
-    }
-
     #[test]
     fn parse_review_diff_keeps_renames_and_svg_visible_while_pdf_is_skipped() {
         let diff = "\
@@ -15531,18 +15218,6 @@ copy to src/copied_again.rs
         assert!(merged.contains("CATEGORY: <Code Smell | Security"));
         assert!(merged.contains("FILE: <one exact path from a `### FILE:` section>"));
         assert!(merged.contains("bad merged output"));
-    }
-
-    #[test]
-    fn full_rescan_skips_terminal_prompt_failures() {
-        assert!(review_failure_repeats_on_rescan("request timed out"));
-        assert!(review_failure_repeats_on_rescan("request body too large"));
-        assert!(review_failure_repeats_on_rescan(
-            "input exceeds the maximum context length"
-        ));
-        assert!(!review_failure_repeats_on_rescan(
-            "connection reset by peer"
-        ));
     }
 
     #[test]
