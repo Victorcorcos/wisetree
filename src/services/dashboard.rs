@@ -18969,6 +18969,18 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
     }
 
     #[test]
+    fn build_explain_prompt_includes_concise_writing_and_section_rules() {
+        let prompt =
+            build_explain_prompt("main", "fix", "", "Fix", "diff", EXPLAIN_TEMPLATE_FALLBACK);
+        assert!(prompt.contains("Never use the em dash character (U+2014)"));
+        assert!(prompt.contains("usually 2 to 4 sentences"));
+        assert!(prompt.contains("Reserve `# Overview` exclusively for screenshots"));
+        assert!(prompt.contains("leave the section empty"));
+        assert!(prompt.contains("# Technical Details 📟"));
+        assert!(prompt.contains("even if the template does not include it; omit it otherwise"));
+    }
+
+    #[test]
     fn truncate_for_prompt_caps_oversized_diff() {
         let big = "x".repeat(10);
         let out = truncate_for_prompt(&big, 4);

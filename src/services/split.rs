@@ -516,12 +516,18 @@ pub fn validate_split_draft_template(template: &str, draft: &SplitDraft) -> Resu
             && !is_description_heading(trimmed)
             && !trimmed.to_ascii_lowercase().contains("ticket")
     }) {
-        if lines
+        let count = lines
             .iter()
             .filter(|line| line.trim() == heading.trim())
-            .count()
-            != 1
-        {
+            .count();
+        let optional_technical_details = heading
+            .trim()
+            .trim_start_matches('#')
+            .trim()
+            .trim_end_matches('📟')
+            .trim()
+            .eq_ignore_ascii_case("Technical Details");
+        if count != 1 && !(optional_technical_details && count == 0) {
             return Err(WisetreeError::validation(format!(
                 "Split body_content must fill the template section `{}` exactly once.",
                 heading.trim()

@@ -309,6 +309,12 @@ fn split_draft_contract_prompt_and_title_keep_ai_out_of_bookkeeping() {
     );
     assert!(prompt.contains("Do not create branches, commits, pushes, files"));
     assert!(prompt.contains("Do not run git or gh"));
+    assert!(prompt.contains("Never use the em dash character (U+2014)"));
+    assert!(prompt.contains("usually 2 to 4 sentences"));
+    assert!(prompt.contains("Reserve `# Overview` exclusively for screenshots"));
+    assert!(prompt.contains("leave the section empty"));
+    assert!(prompt.contains("# Technical Details 📟"));
+    assert!(prompt.contains("The Split Plan is mandatory in the final PR"));
     assert!(!prompt.contains("https://github.com/owner/repo/pull/41"));
 
     let draft = parse_split_draft(
@@ -373,6 +379,49 @@ fn split_body_is_deterministic_and_requires_filled_template_sections() {
     .unwrap();
     assert!(without.starts_with("# Description ✍️\n\n### Split Plan 📋"));
     assert!(without.contains("# Overview\n\nmedia is explained"));
+}
+
+#[test]
+fn split_optional_technical_details_and_empty_overview_preserve_the_split_plan() {
+    let publication = published_stack();
+    for technical_heading in ["# Technical Details 📟", "# Technical Details"] {
+        let template = format!(
+            "# Description ✍️\n\n# Overview 🔍\n\n{technical_heading}\n\n# Test Guidance 🦮"
+        );
+        for technical in [
+            String::new(),
+            format!("{technical_heading}\n\nRetries reuse the same request key.\n\n"),
+        ] {
+            let draft = format!(
+                "# Description ✍️\n\nFailed payments can be retried.\n\n# Overview 🔍\n\n{technical}# Test Guidance 🦮\n\n1. Retry a failed payment and confirm it succeeds."
+            );
+            let body =
+                compose_split_body(&template, &draft, &publication.pull_requests, 2).unwrap();
+            validate_split_body(&body, &publication.pull_requests, 2).unwrap();
+            assert!(body.starts_with("# Description ✍️\n\n### Split Plan 📋\n"));
+            assert_eq!(body.matches("### Split Plan 📋").count(), 1);
+            assert!(body.contains("1. https://github.com/owner/repo/pull/41 **(←)**"));
+            assert!(body.contains("2. https://github.com/owner/repo/pull/42 **(●)**"));
+            assert!(body.contains("3. https://github.com/owner/repo/pull/43 **(→)**"));
+            assert!(body.contains("# Overview 🔍\n\n"));
+            assert_eq!(body.contains(technical_heading), !technical.is_empty());
+            if !technical.is_empty() {
+                let duplicate = format!("{draft}\n\n{technical}");
+                assert!(
+                    compose_split_body(&template, &duplicate, &publication.pull_requests, 2)
+                        .is_err()
+                );
+                // Templates without Technical Details also accept the optional section.
+                compose_split_body(
+                    "# Description ✍️\n\n# Overview 🔍",
+                    &draft,
+                    &publication.pull_requests,
+                    2,
+                )
+                .unwrap();
+            }
+        }
+    }
 }
 
 #[test]
