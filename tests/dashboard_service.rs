@@ -957,6 +957,91 @@ async fn submit_new_pr_passes_resolved_base_to_gh_create() {
     );
 }
 
+#[tokio::test]
+async fn explain_update_preserves_split_plan_and_replaces_explanation() {
+    let parent = tempfile::tempdir().unwrap();
+    let old_body = "# Description ✍️\n\n### Split Plan 📋\n\n1. https://github.com/example/repo/pull/41\n2. https://github.com/example/repo/pull/42 **(current PR)**\n3. https://github.com/example/repo/pull/43 **(future PR)**\n\nOld explanation\n\n# Overview 🔍\n\n![screenshot](https://github.com/example/repo/assets/1/2)\n";
+    let view_path = parent.path().join("pr.json");
+    fs::write(
+        &view_path,
+        serde_json::json!({"title": "Split title", "body": old_body}).to_string(),
+    )
+    .unwrap();
+    let submitted_path = parent.path().join("submitted.md");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(
+        &gh_path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then cat \"{view}\"; exit 0; fi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"edit\" ]; then\n  shift 3\n  while [ \"$#\" -gt 0 ]; do\n    if [ \"$1\" = \"--title\" ]; then exit 2; fi\n    if [ \"$1\" = \"--body\" ]; then printf '%s' \"$2\" > \"{submitted}\"; exit 0; fi\n    shift\n  done\nfi\nexit 3\n",
+            view = view_path.display(),
+            submitted = submitted_path.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+
+    let service = DashboardService::new(parent.path().to_path_buf(), DashboardConfig::default())
+        .with_gh_binary(gh_path);
+    let request = ExplainSubmitRequest {
+        worktree_path: parent.path().to_string_lossy().to_string(),
+        branch: "split-layer-2".to_string(),
+        number: Some(42),
+        base_ref: None,
+        title: "Replacement title".to_string(),
+        body: "# Description ✍️\n\nNew explanation\n\n# Overview 🔍\n\nUpdated overview\n"
+            .to_string(),
+        labels: vec![],
+        existing_title: Some("Split title".to_string()),
+        existing_labels: vec![],
+    };
+    let outcome = service.submit_pull_request(&request, None).await.unwrap();
+    assert!(matches!(
+        outcome,
+        ExplainSubmitOutcome::Updated { number: 42 }
+    ));
+
+    let submitted = fs::read_to_string(submitted_path).unwrap();
+    let plan = "### Split Plan 📋\n\n1. https://github.com/example/repo/pull/41\n2. https://github.com/example/repo/pull/42 **(current PR)**\n3. https://github.com/example/repo/pull/43 **(future PR)**";
+    assert!(submitted.starts_with(&format!("# Description ✍️\n\n{plan}\n\nNew explanation")));
+    assert_eq!(submitted.matches("### Split Plan 📋").count(), 1);
+    assert!(!submitted.contains("Old explanation"));
+    assert!(submitted.contains("Updated overview"));
+    assert!(submitted.contains("![screenshot](https://github.com/example/repo/assets/1/2)"));
+}
+
+#[tokio::test]
+async fn explain_update_stops_if_current_pr_body_cannot_be_read() {
+    let parent = tempfile::tempdir().unwrap();
+    let edited_path = parent.path().join("edited");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(
+        &gh_path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then exit 1; fi\nif [ \"$1\" = \"pr\" ] && [ \"$2\" = \"edit\" ]; then touch \"{edited}\"; fi\n",
+            edited = edited_path.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+
+    let service = DashboardService::new(parent.path().to_path_buf(), DashboardConfig::default())
+        .with_gh_binary(gh_path);
+    let request = ExplainSubmitRequest {
+        worktree_path: parent.path().to_string_lossy().to_string(),
+        branch: "split-layer-2".to_string(),
+        number: Some(42),
+        base_ref: None,
+        title: "Replacement title".to_string(),
+        body: "Replacement description".to_string(),
+        labels: vec![],
+        existing_title: Some("Split title".to_string()),
+        existing_labels: vec![],
+    };
+    let outcome = service.submit_pull_request(&request, None).await.unwrap();
+    assert!(matches!(outcome, ExplainSubmitOutcome::SubmitFailed(_)));
+    assert!(!edited_path.exists());
+}
+
 fn row_with(merge_status: Option<MergeStatus>, behind: Option<u64>) -> DashboardRow {
     DashboardRow {
         worktree: GitWorktree {
