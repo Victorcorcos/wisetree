@@ -574,10 +574,9 @@ fn published_chain_ids(pull_requests: &[SplitPublishedPullRequest]) -> Vec<usize
 /// One line of the harness-owned Split Plan list. Composition and validation
 /// share it so the rendered body and the contract can never drift.
 ///
-/// The marker states the relationship to the pull request being described. Only
-/// work stacked above it in the *same* chain is "future": a pull request in
-/// another chain targets the trunk on its own schedule, and one below it in the
-/// same chain is a prerequisite rather than pending work.
+/// The marker states the relationship to the pull request being described.
+/// Earlier and later layers in the same chain are previous and next;
+/// pull requests in other chains are independent.
 fn split_plan_entry(
     index: usize,
     pull_request: &SplitPublishedPullRequest,
@@ -590,13 +589,13 @@ fn split_plan_entry(
         .zip(chains.get(current_order.saturating_sub(1)))
         .is_some_and(|(entry, current)| entry == current);
     let marker = if number == current_order {
-        " **(current PR)**"
+        " **(●)**"
     } else if !same_chain {
-        " **(independent PR)**"
+        " **(◇)**"
     } else if number > current_order {
-        " **(future PR)**"
+        " **(→)**"
     } else {
-        ""
+        " **(←)**"
     };
     format!("{number}. {}{marker}", pull_request.url)
 }
@@ -630,7 +629,7 @@ pub fn validate_split_body(
         let expected = split_plan_entry(index, pull_request, current_order, &chains);
         if !body.lines().any(|line| line == expected) {
             return Err(WisetreeError::validation(
-                "Split body contains an incorrect current/future marker or URL order.",
+                "Split body contains an incorrect PR relationship marker or URL order.",
             ));
         }
     }

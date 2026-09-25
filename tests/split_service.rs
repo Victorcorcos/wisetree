@@ -337,9 +337,9 @@ fn split_body_is_deterministic_and_requires_filled_template_sections() {
     )
     .unwrap();
     validate_split_body(&body, &publication.pull_requests, 2).unwrap();
-    assert!(body.contains("1. https://github.com/owner/repo/pull/41\n"));
-    assert!(body.contains("2. https://github.com/owner/repo/pull/42 **(current PR)**"));
-    assert!(body.contains("3. https://github.com/owner/repo/pull/43 **(future PR)**"));
+    assert!(body.contains("1. https://github.com/owner/repo/pull/41 **(←)**"));
+    assert!(body.contains("2. https://github.com/owner/repo/pull/42 **(●)**"));
+    assert!(body.contains("3. https://github.com/owner/repo/pull/43 **(→)**"));
     assert!(body.find("### Split Plan 📋").unwrap() < body.find("This layer").unwrap());
     assert!(body.contains("Shows the contract flow."));
     assert!(body.contains("1. Exercise the contract."));
@@ -1452,7 +1452,7 @@ fn a_plan_with_no_independent_layer_stays_one_chain() {
 }
 
 #[test]
-fn the_split_plan_list_marks_future_work_only_inside_the_same_chain() {
+fn the_split_plan_list_marks_previous_and_next_only_inside_the_same_chain() {
     // chain A: PRs 1 -> 2 | chain B: PRs 3 -> 4
     let independent = [false, false, true, false];
     let pull_requests = (0..4)
@@ -1475,27 +1475,36 @@ fn the_split_plan_list_marks_future_work_only_inside_the_same_chain() {
     let filled = "# Description ✍️\n\nThe first layer of the first chain.\n";
 
     let from_chain_a = compose_split_body(template, filled, &pull_requests, 1).unwrap();
-    assert!(from_chain_a.contains("1. https://github.com/owner/repo/pull/41 **(current PR)**"));
+    assert!(from_chain_a.contains("1. https://github.com/owner/repo/pull/41 **(●)**"));
     assert!(
-        from_chain_a.contains("2. https://github.com/owner/repo/pull/42 **(future PR)**"),
+        from_chain_a.contains("2. https://github.com/owner/repo/pull/42 **(→)**"),
         "same chain, stacked above: {from_chain_a}"
     );
     assert!(
-        from_chain_a.contains("3. https://github.com/owner/repo/pull/43 **(independent PR)**"),
-        "another chain is never this PR's future work: {from_chain_a}"
+        from_chain_a.contains("3. https://github.com/owner/repo/pull/43 **(◇)**"),
+        "another chain is independent of this PR: {from_chain_a}"
     );
     assert!(
-        from_chain_a.contains("4. https://github.com/owner/repo/pull/44 **(independent PR)**"),
+        from_chain_a.contains("4. https://github.com/owner/repo/pull/44 **(◇)**"),
         "including the layers stacked inside that other chain: {from_chain_a}"
     );
     validate_split_body(&from_chain_a, &pull_requests, 1).unwrap();
 
+    let from_chain_a_top = compose_split_body(template, filled, &pull_requests, 2).unwrap();
+    assert!(from_chain_a_top.contains("1. https://github.com/owner/repo/pull/41 **(←)**"));
+    assert!(from_chain_a_top.contains("2. https://github.com/owner/repo/pull/42 **(●)**"));
+    validate_split_body(&from_chain_a_top, &pull_requests, 2).unwrap();
+
     let from_chain_b = compose_split_body(template, filled, &pull_requests, 3).unwrap();
-    assert!(from_chain_b.contains("1. https://github.com/owner/repo/pull/41 **(independent PR)**"));
-    assert!(from_chain_b.contains("2. https://github.com/owner/repo/pull/42 **(independent PR)**"));
-    assert!(from_chain_b.contains("3. https://github.com/owner/repo/pull/43 **(current PR)**"));
-    assert!(from_chain_b.contains("4. https://github.com/owner/repo/pull/44 **(future PR)**"));
+    assert!(from_chain_b.contains("1. https://github.com/owner/repo/pull/41 **(◇)**"));
+    assert!(from_chain_b.contains("2. https://github.com/owner/repo/pull/42 **(◇)**"));
+    assert!(from_chain_b.contains("3. https://github.com/owner/repo/pull/43 **(●)**"));
+    assert!(from_chain_b.contains("4. https://github.com/owner/repo/pull/44 **(→)**"));
     validate_split_body(&from_chain_b, &pull_requests, 3).unwrap();
+
+    let from_chain_b_top = compose_split_body(template, filled, &pull_requests, 4).unwrap();
+    assert!(from_chain_b_top.contains("3. https://github.com/owner/repo/pull/43 **(←)**"));
+    validate_split_body(&from_chain_b_top, &pull_requests, 4).unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -960,7 +960,7 @@ async fn submit_new_pr_passes_resolved_base_to_gh_create() {
 #[tokio::test]
 async fn explain_update_preserves_split_plan_and_replaces_explanation() {
     let parent = tempfile::tempdir().unwrap();
-    let old_body = "# Description ✍️\n\n### Split Plan 📋\n\n1. https://github.com/example/repo/pull/41\n2. https://github.com/example/repo/pull/42 **(current PR)**\n3. https://github.com/example/repo/pull/43 **(future PR)**\n\nOld explanation\n\n# Overview 🔍\n\n![screenshot](https://github.com/example/repo/assets/1/2)\n";
+    let old_body = "# Description ✍️\n\n### Split Plan 📋\n\n1. https://github.com/example/repo/pull/41 **(←)**\n2. https://github.com/example/repo/pull/42 **(●)**\n3. https://github.com/example/repo/pull/43 **(→)**\n\nOld explanation\n\n# Overview 🔍\n\n![screenshot](https://github.com/example/repo/assets/1/2)\n";
     let view_path = parent.path().join("pr.json");
     fs::write(
         &view_path,
@@ -1001,7 +1001,7 @@ async fn explain_update_preserves_split_plan_and_replaces_explanation() {
     ));
 
     let submitted = fs::read_to_string(submitted_path).unwrap();
-    let plan = "### Split Plan 📋\n\n1. https://github.com/example/repo/pull/41\n2. https://github.com/example/repo/pull/42 **(current PR)**\n3. https://github.com/example/repo/pull/43 **(future PR)**";
+    let plan = "### Split Plan 📋\n\n1. https://github.com/example/repo/pull/41 **(←)**\n2. https://github.com/example/repo/pull/42 **(●)**\n3. https://github.com/example/repo/pull/43 **(→)**";
     assert!(submitted.starts_with(&format!("# Description ✍️\n\n{plan}\n\nNew explanation")));
     assert_eq!(submitted.matches("### Split Plan 📋").count(), 1);
     assert!(!submitted.contains("Old explanation"));
