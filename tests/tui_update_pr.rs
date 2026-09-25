@@ -880,7 +880,7 @@ async fn update_branch_reports_working_tree_dirty_before_merging() {
 }
 
 /// Untracked files alone must not trip the dirty guard — wisetree itself
-/// drops untracked files (e.g. `pull_request.md`) into worktrees, and git
+/// drops untracked files (e.g. `.wisetree/explain/pull_request.md`) into worktrees, and git
 /// would still merge cleanly around them.
 #[tokio::test]
 async fn update_branch_ignores_untracked_files() {

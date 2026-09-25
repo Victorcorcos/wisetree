@@ -1,10 +1,10 @@
 //! Pure, synchronous Develop logic: the plan data model, the plan-contract
-//! parser, the `PLAN.md` renderer + resume parser, and the section-progress
+//! parser, the `.wisetree/develop/PLAN.md` renderer + resume parser, and the section-progress
 //! helpers. No I/O lives here — `DashboardService` owns every git/AI call and
 //! `App` owns the async orchestration, so everything in this module is
 //! unit-testable with plain strings.
 //!
-//! Token-efficiency invariant: the AI never reads or writes `PLAN.md`. The
+//! Token-efficiency invariant: the AI never reads or writes `.wisetree/develop/PLAN.md`. The
 //! plan AI emits compact delimited blocks (parsed here), the harness holds
 //! the model in memory and re-renders the whole file from it after every
 //! mutation, and the implement AI receives only the section(s) it must build
@@ -13,7 +13,7 @@
 use crate::tui::image_upload::ImageAttachment;
 
 /// The rendered plan file — harness-owned output at the worktree root.
-pub const PLAN_FILE: &str = "PLAN.md";
+pub const PLAN_FILE: &str = ".wisetree/develop/PLAN.md";
 
 /// Maximum number of sections kept after a contract parse; overflow is
 /// dropped so a runaway plan cannot spawn an unbounded implement loop.
@@ -34,13 +34,13 @@ pub struct PlanSection {
     pub done: bool,
 }
 
-/// The in-memory plan — the single source of truth `PLAN.md` is rendered
+/// The in-memory plan — the single source of truth `.wisetree/develop/PLAN.md` is rendered
 /// from. Recovered from disk on Resume via [`parse_plan_md`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevelopPlan {
     pub task_description: String,
     /// Durable image references supplied with the task or plan feedback.
-    /// They are rendered into PLAN.md so Resume retains multimodal context.
+    /// They are rendered into .wisetree/develop/PLAN.md so Resume retains multimodal context.
     pub attachments: Vec<ImageAttachment>,
     /// Fibonacci-style complexity estimate in points.
     pub complexity: u8,
@@ -274,7 +274,7 @@ fn checkbox_lines(field: &str) -> String {
     out
 }
 
-// ── PLAN.md renderer + resume parser ────────────────────────────────────
+// ── .wisetree/develop/PLAN.md renderer + resume parser ────────────────────────────────────
 
 const TASK_HEADING: &str = "## Task Description";
 const OVERVIEW_HEADING: &str = "## Overview";
@@ -293,7 +293,7 @@ fn render_section_name(name: &str) -> String {
     }
 }
 
-/// Render the whole `PLAN.md` from the in-memory model. The harness rewrites
+/// Render the whole `.wisetree/develop/PLAN.md` from the in-memory model. The harness rewrites
 /// the file with this after **every** mutation — the file is output for the
 /// human, never input for the AI.
 pub fn render_plan_md(plan: &DevelopPlan) -> String {

@@ -36,7 +36,7 @@ A `DELETED FILE` section is authoritative old-side evidence. Judge lost or weake
 4. **Performance** — patterns that slow the whole suite: real network calls, real sleeps instead of controlled time, needlessly large fixtures or loops.
 5. **Convention** — deviations from how the sibling test files actually name, place, and structure their tests: framework idioms, shared-helper usage, file naming, contradictions with `README.md` / `AGENTS.md` / `CLAUDE.md`.
 
-These checklists are a starting point, not a ceiling — flag any real issue you can point to in the changed code, and only what is actually present (never speculate). If you are unsure how to classify or judge a suspected issue, the harness provides a path to the full curated reference tables (reason + recommended solution per item) below — read that file only when you need it.
+These checklists are a starting point, not a ceiling — flag any real issue you can point to in the changed code, and only what is actually present (never speculate). If you are unsure how to classify or judge a suspected issue, consult the curated reference tables below (reason + recommended solution per item) when you need them.
 
 ## Quality rules
 
@@ -98,7 +98,11 @@ RELATIONSHIP_EDGES
 ```
 FILE_PATH
 ```
-- Curated reference tables path: `TABLES_PATH`
+- Curated reference tables (consult when needed):
+
+```
+TABLES_CONTENT
+```
 - Authoritative test-file evidence, grouped by `### FILE:`. Bounded files appear once as numbered current files; large/unavailable files retain numbered diff hunks and targeted read guidance:
 
 ```

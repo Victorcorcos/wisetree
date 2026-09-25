@@ -197,9 +197,9 @@ fn materialize(screen: &mut SplitPullRequestScreen, worktree: &std::path::Path) 
             ),
         ],
     };
-    std::fs::create_dir_all(worktree.join(".wisetree")).expect("plan directory");
+    std::fs::create_dir_all(worktree.join(".wisetree/split")).expect("plan directory");
     std::fs::write(
-        worktree.join(".wisetree/split_plan.md"),
+        worktree.join(".wisetree/split/split_plan.md"),
         format!(
             "<!-- wisetree-split-materialization {} -->",
             serde_json::to_string(&materialization).expect("materialization json")

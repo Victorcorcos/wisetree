@@ -308,7 +308,7 @@ enum AppEvent {
     },
     /// `git revert` of the attempt commit finished.
     BugkillRolledBack(Result<(), String>),
-    /// Rewriting `BUG_INVESTIGATION.md` failed (best-effort warning).
+    /// Rewriting `.wisetree/bugkill/BUG_INVESTIGATION.md` failed (best-effort warning).
     BugkillFileWriteFailed(String),
     /// "Develop": deterministic preflight finished (gates, base ref, resume
     /// detection).
@@ -336,7 +336,7 @@ enum AppEvent {
         preexisting_paths: Vec<String>,
         result: Result<Box<DevelopHandoff>, String>,
     },
-    /// Rewriting `PLAN.md` finished (best-effort warning on failure).
+    /// Rewriting `.wisetree/develop/PLAN.md` finished (best-effort warning on failure).
     DevelopFileRewritten {
         operation_id: u64,
         generation: u64,
@@ -650,7 +650,7 @@ pub struct App {
     /// section's run and opens the next. `Some` only while one is live.
     develop_watch: Option<AiTurnWatcher>,
     /// Same idea for the Explain screen's drafting TUI — advances straight
-    /// to Review once opencode finishes writing `pull_request.md`. `Some`
+    /// to Review once opencode finishes writing `.wisetree/explain/pull_request.md`. `Some`
     /// only while the `Explaining` step is active.
     explain_draft: Option<AiTurnWatcher>,
     /// Same idea for the Fix screen's apply TUI — commits each fix + replies
@@ -2811,7 +2811,7 @@ impl App {
                 self.explain_draft = None;
                 self.show_toast(
                     ToastVariant::Info,
-                    "Draft saved to pull_request.md — no pull request was opened.".to_string(),
+                    "Draft saved to .wisetree/explain/pull_request.md — no pull request was opened.".to_string(),
                 );
                 self.explain_pr = None;
                 self.enter_screen(Screen::Dashboard, tx);
@@ -2825,7 +2825,7 @@ impl App {
         }
     }
 
-    /// The AI CLI finished drafting: read `pull_request.md` from the worktree,
+    /// The AI CLI finished drafting: read `.wisetree/explain/pull_request.md` from the worktree,
     /// parse the title + body, and move the screen into Review. A missing or
     /// empty file surfaces an error (the AI likely didn't finish).
     /// The Explaining TUI exited before the watcher auto-advanced (the user
@@ -2857,24 +2857,25 @@ impl App {
         let Some(screen) = self.explain_pr.as_mut() else {
             return;
         };
-        let path = PathBuf::from(&screen.request().worktree_path).join("pull_request.md");
+        let path = PathBuf::from(&screen.request().worktree_path)
+            .join(".wisetree/explain/pull_request.md");
         match std::fs::read_to_string(&path) {
             Ok(content) => match parse_pull_request_md(&content) {
                 Some((title, body, labels)) => screen.enter_review(title, body, labels),
                 None => screen.set_error(
-                    "pull_request.md has no title line yet — let the AI CLI finish, then retry."
+                    ".wisetree/explain/pull_request.md has no title line yet — let the AI CLI finish, then retry."
                         .to_string(),
                 ),
             },
             Err(_) => screen.set_error(format!(
-                "pull_request.md not found at {}. Wait for the AI CLI to write it before confirming.",
+                ".wisetree/explain/pull_request.md not found at {}. Wait for the AI CLI to write it before confirming.",
                 path.display()
             )),
         }
     }
 
     /// The Explain turn watcher fired — advance exactly like a PTY exit
-    /// would (reading `pull_request.md` off disk), just without requiring
+    /// would (reading `.wisetree/explain/pull_request.md` off disk), just without requiring
     /// the user to quit opencode or confirm the draft is ready themselves.
     /// Clears the watcher immediately on a terminal outcome — `set_error`
     /// does not change the screen's step, so the tick loop's `is_explaining`
@@ -4739,7 +4740,7 @@ impl App {
                 self.back_to_dashboard_action_menu(worktree_path, tx);
             }
             BugkillAction::Confirmed => {
-                // Preflight first: when a resumable BUG_INVESTIGATION.md
+                // Preflight first: when a resumable .wisetree/bugkill/BUG_INVESTIGATION.md
                 // exists, the Resume prompt already carries the description —
                 // asking for it again would be wasted effort. DescribeBug is
                 // only shown for the start-fresh paths.
@@ -5101,8 +5102,8 @@ impl App {
         self.enter_screen(Screen::Dashboard, tx);
     }
 
-    /// Re-render `BUG_INVESTIGATION.md` from the in-memory model and write
-    /// it to the worktree root (invariant I1: called after every mutation).
+    /// Re-render `.wisetree/bugkill/BUG_INVESTIGATION.md` from the in-memory model and write
+    /// it under `.wisetree/bugkill/` (invariant I1: called after every mutation).
     fn rewrite_bugkill_file(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let Some(screen) = self.bugkill_pr.as_ref() else {
             return;
@@ -5112,7 +5113,7 @@ impl App {
         let content = screen.render_investigation();
         let tx = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = tokio::fs::write(&path, content).await {
+            if let Err(err) = write_workflow_file(&path, content).await {
                 let _ = tx.send(AppEvent::BugkillFileWriteFailed(err.to_string()));
             }
         });
@@ -6516,7 +6517,7 @@ impl App {
     }
 
     /// Accept the current section (check passed or the user overrode it):
-    /// push its note + mark it ✅, rewrite `PLAN.md`, then commit the
+    /// push its note + mark it ✅, rewrite `.wisetree/develop/PLAN.md`, then commit the
     /// checkpoint (if the toggle is on) or advance straight to the next run.
     fn finalize_develop_section(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let Some(operation_id) = self.active_develop_operation_id else {
@@ -6616,8 +6617,8 @@ impl App {
         self.enter_screen(Screen::Dashboard, tx);
     }
 
-    /// Re-render `PLAN.md` from the in-memory model and write it to the
-    /// worktree root (called after every mutation — the AI never touches
+    /// Re-render `.wisetree/develop/PLAN.md` from the in-memory model and write it to the
+    /// `.wisetree/develop/` directory (called after every mutation — the AI never touches
     /// the file).
     fn rewrite_develop_file(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let (content, path) = {
@@ -6676,7 +6677,10 @@ impl App {
             if let Err(error) = result {
                 self.show_toast(
                     ToastVariant::Warning,
-                    format!("Could not write PLAN.md: {}", truncate_error(&error)),
+                    format!(
+                        "Could not write .wisetree/develop/PLAN.md: {}",
+                        truncate_error(&error)
+                    ),
                 );
             }
         }
@@ -8635,7 +8639,7 @@ impl App {
             } => self.apply_split_drafted(operation_id, generation, result),
             AppEvent::BugkillFileWriteFailed(err) => self.show_toast(
                 ToastVariant::Warning,
-                format!("Could not write BUG_INVESTIGATION.md: {err}"),
+                format!("Could not write .wisetree/bugkill/BUG_INVESTIGATION.md: {err}"),
             ),
             AppEvent::FixPrPushed(result) => {
                 if let Some(screen) = self.fix_pr.as_mut() {
@@ -12699,9 +12703,16 @@ fn kick_off_develop_commit(
     });
 }
 
+async fn write_workflow_file(path: &Path, content: String) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, content).await
+}
+
 fn kick_off_develop_file_write(write: DevelopFileWrite, tx: mpsc::UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
-        let result = tokio::fs::write(write.path, write.content)
+        let result = write_workflow_file(&write.path, write.content)
             .await
             .map_err(|err| err.to_string());
         let _ = tx.send(AppEvent::DevelopFileRewritten {
@@ -15797,6 +15808,49 @@ mod tests {
     }
 
     #[test]
+    fn explain_reads_only_the_command_directory_draft() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::write(
+            repo.path().join("pull_request.md"),
+            "# Root notes\n\nLeave intact",
+        )
+        .unwrap();
+        let mut app = initialized_menu_app();
+        app.explain_pr = Some(ExplainPullRequestScreen::new(
+            ExplainPullRequestRequest {
+                branch: "feature/explain".into(),
+                worktree_path: repo.path().to_string_lossy().into_owned(),
+                base_ref: Some("main".into()),
+                pr_base_ref: None,
+                number: None,
+                title: None,
+                url: None,
+                existing_labels: Vec::new(),
+            },
+            crate::config::schema::AiModelConfig::default(),
+        ));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.on_explain_ready_to_review(&tx);
+        assert_eq!(app.explain_pr.as_ref().unwrap().draft_title(), None);
+        let directory = repo.path().join(".wisetree/explain");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("pull_request.md"),
+            "# Correct draft\n\nDescription",
+        )
+        .unwrap();
+        app.on_explain_ready_to_review(&tx);
+        assert_eq!(
+            app.explain_pr.as_ref().unwrap().draft_title(),
+            Some("Correct draft")
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("pull_request.md")).unwrap(),
+            "# Root notes\n\nLeave intact"
+        );
+    }
+
+    #[test]
     fn explain_opening_terminal_activity_uses_full_height_panel() {
         let mut app = initialized_menu_app();
         app.screen = Screen::ExplainPullRequest;
@@ -18046,5 +18100,31 @@ mod tests {
             AppEvent::DevelopCommitted { result: Err(message), .. }
                 if message == "Could not resolve git root."
         ));
+    }
+}
+
+#[cfg(test)]
+mod workflow_file_tests {
+    use super::write_workflow_file;
+
+    #[tokio::test]
+    async fn writes_and_updates_workflow_files_without_touching_root_files() {
+        let repo = tempfile::tempdir().unwrap();
+        for relative in [
+            crate::services::develop::PLAN_FILE,
+            crate::services::bugkill::INVESTIGATION_FILE,
+        ] {
+            let path = repo.path().join(relative);
+            let root_file = repo.path().join(path.file_name().unwrap());
+            std::fs::write(&root_file, "user notes").unwrap();
+            write_workflow_file(&path, "first".to_string())
+                .await
+                .unwrap();
+            write_workflow_file(&path, "updated".to_string())
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated");
+            assert_eq!(std::fs::read_to_string(root_file).unwrap(), "user notes");
+        }
     }
 }

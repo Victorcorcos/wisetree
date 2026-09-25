@@ -424,7 +424,7 @@ impl Default for AiBugkillConfig {
 }
 
 /// Per-role models for the "Develop" pipeline. `plan` investigates the
-/// codebase and decomposes the described task into `PLAN.md` sections with a
+/// codebase and decomposes the described task into `.wisetree/develop/PLAN.md` sections with a
 /// strong reasoning model; `implement` realizes the approved plan live in the
 /// embedded opencode TUI, one section (Ralph Loop) or all sections at a time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

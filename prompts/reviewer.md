@@ -25,7 +25,7 @@ The harness may provide findings from those tester specialists. A scenario whose
 
 The deterministic coverage ledger maps every changed application behavior to changed and unchanged test candidates and concrete assertion digests. `TARGETED-READ-REQUIRED` is mandatory: read that exact real test before emitting or suppressing the behavior's coverage finding. Name/path similarity alone never proves coverage; deleted tests are lost protection.
 
-The checklists are a starting point, not a ceiling. Flag only concrete issues introduced or modified by numbered `+` lines. Do not flag pre-existing issues unless the change directly breaks them. The harness supplies curated reference tables below; read them only when classification is ambiguous.
+The checklists are a starting point, not a ceiling. Flag only concrete issues introduced or modified by numbered `+` lines. Do not flag pre-existing issues unless the change directly breaks them. The harness supplies curated reference tables below; consult them when classification is ambiguous.
 
 ## Quality rules
 
@@ -77,7 +77,11 @@ Rules: `CATEGORY`, `SEVERITY`, `FILE`, `LINE`, `START_LINE`, and `TITLE` are sin
 REPO_CONTEXT
 ```
 
-- Curated reference tables path: `TABLES_PATH`
+- Curated reference tables (consult when needed):
+
+```
+TABLES_CONTENT
+```
 - Test-quality findings from completed tester scans (advisory evidence; empty when none):
 
 ```

@@ -5,7 +5,7 @@
 //!   resolved-config footer + `ConfirmationModal` (**Cancel** default).
 //! - `DescribeBug` : multiline input page (Enter = submit, Ctrl+J = newline).
 //!   Shown after the preflight, and only when there is nothing to resume
-//!   (no parseable `BUG_INVESTIGATION.md`, or Start fresh / Overwrite).
+//!   (no parseable `.wisetree/bugkill/BUG_INVESTIGATION.md`, or Start fresh / Overwrite).
 //! - `Working`     : quiet spinner covering every captured / deterministic
 //!   phase (preflight, snapshots, commit, revert, judge).
 //! - `Investigating`: the embedded configured AI harness (AI Activity panel,
@@ -26,7 +26,7 @@
 //!
 //! All async + git/AI work is owned by `App`; this screen is a presentation
 //! state machine over the in-memory `Vec<BugHypothesis>`. The screen also
-//! renders `BUG_INVESTIGATION.md` from that model (`render_investigation`) —
+//! renders `.wisetree/bugkill/BUG_INVESTIGATION.md` from that model (`render_investigation`) —
 //! the file is output for the human, never input for the AI (invariant I1).
 
 use std::cell::Cell;
@@ -334,7 +334,7 @@ impl BugkillPullRequestScreen {
     pub fn has_pty(&self) -> bool {
         self.pty.is_some()
     }
-    /// The rendered `BUG_INVESTIGATION.md` for the current model — the App
+    /// The rendered `.wisetree/bugkill/BUG_INVESTIGATION.md` for the current model — the App
     /// rewrites the file with this after every mutation.
     pub fn render_investigation(&self) -> String {
         render_investigation_md(
@@ -1258,8 +1258,7 @@ impl BugkillPullRequestScreen {
         // commands now mirror through the shared confirm view.
         let steps = [
             "You describe the bug.",
-            "The investigate AI explores the code read-only and ranks likely root causes \
-             into `BUG_INVESTIGATION.md`.",
+            "The AI ranks causes in `.wisetree/bugkill/BUG_INVESTIGATION.md`.",
             "You pick one proposed fix from the ranked table.",
             "The fix AI applies only that fix, live, in an embedded selected-AI terminal.",
             "You confirm whether the bug is gone — Yes keeps the fix (committed on the \
@@ -1378,11 +1377,11 @@ impl BugkillPullRequestScreen {
                 colors::WARNING,
             ),
             ResumeVariant::Resume => (
-                "An existing BUG_INVESTIGATION.md was found for this worktree.".to_string(),
+                "An existing .wisetree/bugkill/BUG_INVESTIGATION.md was found for this worktree.".to_string(),
                 colors::INFO,
             ),
             ResumeVariant::Overwrite => (
-                "Existing BUG_INVESTIGATION.md is not in Bugkill's format and will be replaced."
+                "Existing .wisetree/bugkill/BUG_INVESTIGATION.md is not in Bugkill's format and will be replaced."
                     .to_string(),
                 colors::WARNING,
             ),
@@ -1461,7 +1460,7 @@ impl BugkillPullRequestScreen {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(
-                    "{} · BUG_INVESTIGATION.md written to the worktree root",
+                    "{} · .wisetree/bugkill/BUG_INVESTIGATION.md saved in the worktree",
                     self.request.branch
                 ),
                 Style::default().fg(colors::GRAY_DARK),
@@ -1913,7 +1912,7 @@ impl BugkillPullRequestScreen {
     /// The Verdict context panel: the bug's observed effect (the user's own
     /// report), the suspected root cause behind this attempt, what the fix
     /// changed, and the files it touched — everything needed to judge the
-    /// attempt without opening BUG_INVESTIGATION.md.
+    /// attempt without opening .wisetree/bugkill/BUG_INVESTIGATION.md.
     fn verdict_detail_lines(&self) -> Vec<Line<'static>> {
         let header = |text: &str, color| {
             Line::from(Span::styled(
@@ -2145,7 +2144,7 @@ impl BugkillPullRequestScreen {
         if !self.done_success {
             return vec![Line::from(Span::styled(
                 "Re-run Bugkill with a more specific bug description, or investigate manually \
-                 — BUG_INVESTIGATION.md keeps the full record, and each attempt + revert pair \
+                 — .wisetree/bugkill/BUG_INVESTIGATION.md keeps the full record, and each attempt + revert pair \
                  remains in the branch history."
                     .to_string(),
                 Style::default().fg(colors::GRAY_LIGHT),
@@ -2424,7 +2423,10 @@ mod tests {
         let mut s = screen();
         let dump = render_dump(&mut s, 110, 30);
         assert!(dump.contains("You describe the bug."), "{dump}");
-        assert!(dump.contains("BUG_INVESTIGATION.md"), "{dump}");
+        assert!(
+            dump.contains(".wisetree/bugkill/BUG_INVESTIGATION.md"),
+            "{dump}"
+        );
         assert!(dump.contains("Role"), "{dump}");
         assert!(dump.contains("Model"), "{dump}");
         assert!(dump.contains("Thinking"), "{dump}");
@@ -2660,7 +2662,7 @@ mod tests {
         let dump = render_dump(&mut s, 110, 30);
         assert!(dump.contains("Ranked Causes"), "{dump}");
         assert!(
-            dump.contains("BUG_INVESTIGATION.md written to the worktree root"),
+            dump.contains(".wisetree/bugkill/BUG_INVESTIGATION.md saved in the worktree"),
             "{dump}"
         );
         assert!(dump.contains("★★★★"), "{dump}");

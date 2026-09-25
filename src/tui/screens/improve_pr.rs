@@ -1109,7 +1109,7 @@ impl ImprovePullRequestScreen {
                 )),
                 Line::default(),
                 Line::from(
-                    "Uncommitted changes remain, but Wisetree cannot distinguish prior AI edits from user edits made after interruption. Back up & reset preserves all current edits in Git metadata, restores the pre-attempt snapshot, and lets you safely retry this same finding with the current configured model.",
+                    "Uncommitted changes remain, but Wisetree cannot distinguish prior AI edits from user edits made after interruption. Back up & reset preserves all current edits in .wisetree/improve/, restores the pre-attempt snapshot, and lets you safely retry this same finding with the current configured model.",
                 ),
             ])
             .block(

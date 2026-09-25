@@ -207,10 +207,7 @@ const DEVELOP_CHECK_TIMEOUT: Duration = Duration::from_secs(600);
 /// Bytes of the check command's combined output kept (the tail) for the UI
 /// and the corrective prompt — the failing assertions are near the end.
 const DEVELOP_CHECK_OUTPUT_MAX_BYTES: usize = 12_000;
-/// The harness-owned plan file, always excluded from a section commit — like
-/// Bugkill's `BUG_INVESTIGATION.md`, it is output for the human, not part of
-/// the delivered change.
-const DEVELOP_PLAN_FILE: &str = "PLAN.md";
+
 /// Priority list for the base ref the "Update Pull Request" flow merges
 /// in. Kept in one place so the dashboard's behind probe and the update
 /// pipeline never drift apart.
@@ -625,13 +622,13 @@ pub enum UpdateBranchOutcome {
 
 /// Result of the read-only preparation phase of the "Explain Pull Request"
 /// pipeline (`prepare_explain`). On `HandedOffToUi` the UI spawns opencode in
-/// its embedded PTY to draft `pull_request.md`; the other variants are
+/// its embedded PTY to draft `.wisetree/explain/pull_request.md`; the other variants are
 /// terminal and map straight to a toast.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExplainPreparation {
     /// Diff/log gathered, prompt built, `ai.model` set and `opencode` on PATH.
     /// The UI owns the PTY lifecycle from here; once opencode finishes the
-    /// screen reads `pull_request.md` and offers to open/update the PR.
+    /// screen reads `.wisetree/explain/pull_request.md` and offers to open/update the PR.
     HandedOffToUi {
         command: AiCommand,
         harness: AiHarness,
@@ -1586,14 +1583,14 @@ impl ReviewFinding {
 pub struct BugkillSnapshot {
     pub tracked: Vec<String>,
     /// `(path, content hash)` for every untracked file, excluding
-    /// `BUG_INVESTIGATION.md`.
+    /// `.wisetree/bugkill/BUG_INVESTIGATION.md`.
     pub untracked: Vec<(String, String)>,
     /// Original bytes for untracked files. Improve uses these to restore an
     /// attempt that modified a user-owned untracked file without committing it.
     pub untracked_contents: Vec<(String, Vec<u8>)>,
 }
 
-/// An attempt row recovered from `BUG_INVESTIGATION.md` that was committed
+/// An attempt row recovered from `.wisetree/bugkill/BUG_INVESTIGATION.md` that was committed
 /// but never got its Verdict answer (wisetree crashed in between). Resume
 /// re-enters the Verdict step for this row instead of stranding it
 /// permanently ineligible. `sha` is recovered from `git log` by the
@@ -1608,7 +1605,7 @@ pub struct BugkillUnverdicted {
 /// What the preflight found on disk about a previous Bugkill run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BugkillResumeState {
-    /// No `BUG_INVESTIGATION.md` — continue straight to the investigation.
+    /// No `.wisetree/bugkill/BUG_INVESTIGATION.md` — continue straight to the investigation.
     Absent,
     /// The file exists but is not in Bugkill's format — Overwrite/Cancel.
     Unparseable,
@@ -1645,7 +1642,7 @@ pub enum BugkillPreflightOutcome {
     DirtyTree {
         count: usize,
     },
-    /// Tracked changes *plus* a parseable `BUG_INVESTIGATION.md` — almost
+    /// Tracked changes *plus* a parseable `.wisetree/bugkill/BUG_INVESTIGATION.md` — almost
     /// certainly debris from a fix attempt interrupted mid-`Fixing`. The UI
     /// asks before discarding; never discard automatically.
     LeftoverAttempt {
@@ -1656,7 +1653,7 @@ pub enum BugkillPreflightOutcome {
 /// What the Develop preflight found on disk about a previous run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DevelopResumeState {
-    /// No `PLAN.md` — collect a task description.
+    /// No `.wisetree/develop/PLAN.md` — collect a task description.
     Absent,
     /// The file exists but is not in Develop's format — Overwrite/Cancel.
     Unparseable,
@@ -2858,7 +2855,7 @@ impl DashboardService {
     /// branch name, reads the repo's PR template (falling back to the
     /// embedded one), and renders `prompts/explainer.md` into the opencode
     /// command the UI will spawn. No git mutation happens here — the AI's
-    /// only job is to write `pull_request.md`.
+    /// only job is to write `.wisetree/explain/pull_request.md`.
     pub async fn prepare_explain(
         &self,
         worktree_path: &str,
@@ -2897,6 +2894,7 @@ impl DashboardService {
         if model.is_empty() {
             return Ok(ExplainPreparation::AiNotConfigured);
         }
+        tokio::fs::create_dir_all(cwd.join(".wisetree/explain")).await?;
         let ticket = extract_ticket(branch).unwrap_or_default();
         let template = read_pr_template(&cwd).await;
         let prompt =
@@ -3425,7 +3423,7 @@ impl DashboardService {
         // Stage only what this fix touched: the targeted file when known. A
         // PR-level fix has no single anchor file, so fall back to `add -u`
         // (tracked modifications only) — never `-A`, which would sweep stray
-        // untracked files (a leftover `pull_request.md`, `.DS_Store`, …) into
+        // untracked files (a leftover `.wisetree/explain/pull_request.md`, `.DS_Store`, …) into
         // the review-fix commit.
         let stage_args: Vec<&str> = match &group.file {
             Some(file) => vec!["add", "--", file.as_str()],
@@ -3741,6 +3739,12 @@ impl DashboardService {
         .await
         .map_err(|_| WisetreeError::other("git status timed out"))?
         .map_err(WisetreeError::other)?;
+        let parsed_status = parse_porcelain_v2(&status);
+        let dirty = parsed_status
+            .tracked
+            .iter()
+            .chain(&parsed_status.untracked)
+            .any(|path| !path.starts_with(".wisetree/"));
         let saved_run = match load_improve_run(&state_path) {
             Ok(run) => run,
             Err(error) => {
@@ -3770,9 +3774,7 @@ impl DashboardService {
                 .await?;
             if run.next_index().is_some() {
                 let next = run.next_index().expect("checked above");
-                if !status.is_empty()
-                    && !matches!(run.items[next].state, ImproveItemState::Applying { .. })
-                {
+                if dirty && !matches!(run.items[next].state, ImproveItemState::Applying { .. }) {
                     return Ok(ImprovePreparation::DirtyWorktree);
                 }
                 let head = run_command(&self.git_binary, &["rev-parse", "HEAD"], Some(&cwd))
@@ -3789,7 +3791,7 @@ impl DashboardService {
                 return Ok(ImprovePreparation::Resume {
                     state_path,
                     run,
-                    dirty: !status.is_empty(),
+                    dirty,
                 });
             }
             clear_improve_run(&state_path)?;
@@ -3838,7 +3840,7 @@ impl DashboardService {
             }
         }
 
-        if !status.is_empty() {
+        if dirty {
             return Ok(ImprovePreparation::DirtyWorktree);
         }
 
@@ -4022,8 +4024,7 @@ impl DashboardService {
                 &selection,
             );
         }
-        let tables_path = materialize_review_tables().await;
-        let prompt = build_review_scan_prompt(file, context, &tables_path);
+        let prompt = build_review_scan_prompt(file, context, REVIEW_TABLES);
         self.execute_review_file_prompt(cwd, file, scan, started, prompt, selection)
             .await
     }
@@ -4061,12 +4062,11 @@ impl DashboardService {
                 &selection,
             );
         }
-        let tables_path = materialize_review_tables().await;
         let prompt = build_review_group_prompt_with_relationships(
             &group.files,
             group.profile,
             context,
-            &tables_path,
+            REVIEW_TABLES,
             &group.relationship_summary,
         );
         let prompt_bytes = prompt.len();
@@ -4165,7 +4165,9 @@ impl DashboardService {
         let scan = format!("verify:{}:{}", file.path, findings.len());
         let mut validations = Vec::with_capacity(findings.len());
         for finding in findings {
-            validations.push(validate_review_suggestion_isolated(file, finding).await);
+            validations.push(
+                validate_review_suggestion_isolated(Path::new(worktree_path), file, finding).await,
+            );
         }
         let prompt = build_review_verifier_prompt(file, findings, context, &validations);
         let prompt_bytes = prompt.len();
@@ -4448,8 +4450,7 @@ impl DashboardService {
                 &selection,
             );
         }
-        let tables_path = materialize_review_tables().await;
-        let prompt = build_review_merged_prompt(files, context, tester_findings, &tables_path);
+        let prompt = build_review_merged_prompt(files, context, tester_findings, REVIEW_TABLES);
         let prompt_bytes = prompt.len();
         let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
         let (result, raw_output) = match output {
@@ -4826,7 +4827,7 @@ impl DashboardService {
 
     /// Deterministic Bugkill pre-flight: investigation harness gate, the
     /// clean-tree gate, the untracked baseline snapshot, base-ref
-    /// resolution, and detection of a resumable `BUG_INVESTIGATION.md`.
+    /// resolution, and detection of a resumable `.wisetree/bugkill/BUG_INVESTIGATION.md`.
     pub async fn bugkill_preflight(&self, worktree_path: &str) -> Result<BugkillPreflightOutcome> {
         if self.config.ai.bugkill.investigate.model.trim().is_empty() {
             return Ok(BugkillPreflightOutcome::AiNotConfigured);
@@ -5046,7 +5047,7 @@ impl DashboardService {
         let untracked = hash_untracked(&cwd, &status.untracked).await;
         let mut untracked_contents = Vec::new();
         for path in &status.untracked {
-            if path != INVESTIGATION_FILE {
+            if !path.starts_with(".wisetree/") {
                 if let Ok(contents) = tokio::fs::read(cwd.join(path)).await {
                     untracked_contents.push((path.clone(), contents));
                 }
@@ -5095,8 +5096,7 @@ impl DashboardService {
 
     /// Preserve the complete interrupted working state before the user asks
     /// Improve to discard it. Tracked edits are stored as a binary Git patch;
-    /// untracked files are copied verbatim under the worktree's private Git
-    /// metadata. Cleanup never runs if this backup cannot be created.
+    /// untracked files are copied verbatim under `.wisetree/improve/`. Cleanup never runs if this backup cannot be created.
     pub async fn improve_backup_interrupted_attempt(&self, worktree_path: &str) -> Result<PathBuf> {
         let cwd = PathBuf::from(worktree_path);
         let state_path = resolve_improve_state_path(&cwd).await?;
@@ -5192,7 +5192,7 @@ impl DashboardService {
 
     /// Commit one applied attempt — the harness, never the AI. Stages each
     /// change-set path individually (never `git add -A`/`-u`; the modified
-    /// pre-existing untracked files and `BUG_INVESTIGATION.md` are already
+    /// pre-existing untracked files and `.wisetree/bugkill/BUG_INVESTIGATION.md` are already
     /// excluded from `commit_paths`), then commits as
     /// `bugkill: attempt #N — <solution first line>`, or amends the existing
     /// attempt commit on a retry-with-feedback (safe: that commit is
@@ -5316,7 +5316,14 @@ impl DashboardService {
         .await
         .map_err(|_| WisetreeError::other("git status timed out"))?
         .map_err(WisetreeError::other)?;
-        Ok(parse_porcelain_v2(&output))
+        let mut status = parse_porcelain_v2(&output);
+        status
+            .tracked
+            .retain(|path| !path.starts_with(".wisetree/"));
+        status
+            .untracked
+            .retain(|path| !path.starts_with(".wisetree/"));
+        Ok(status)
     }
 
     /// Newest commit whose subject starts `bugkill: attempt #N — `, for the
@@ -5385,11 +5392,9 @@ impl DashboardService {
             .split('\0')
             .filter(|entry| !entry.is_empty())
             .filter(|entry| {
-                entry.get(3..).map_or(true, |path| {
-                    path != SPLIT_PLAN_FILE
-                        && !path.starts_with(SPLIT_PLAN_ARCHIVE_PREFIX)
-                        && !path.starts_with(SPLIT_DRAFT_DIRECTORY)
-                })
+                entry
+                    .get(3..)
+                    .map_or(true, |path| !path.starts_with(".wisetree/"))
             })
             .collect::<Vec<_>>();
         if !dirty.is_empty() {
@@ -5656,7 +5661,7 @@ impl DashboardService {
                 live_identity
             } else if live_identity.max != record.identity.max {
                 return Err(WisetreeError::validation(format!(
-                    "This worktree already has a Split run recorded with MAX {}. Finish it, or archive .wisetree/split_plan.md, before splitting again with MAX {}.",
+                    "This worktree already has a Split run recorded with MAX {}. Finish it, or archive .wisetree/split/split_plan.md, before splitting again with MAX {}.",
                     record.identity.max, live_identity.max
                 )));
             } else if !input_matches {
@@ -7363,11 +7368,11 @@ impl DashboardService {
         Ok(())
     }
 
-    // gates, PLAN.md rendering/parsing, progress tracking, the approval
-    // loop — is deterministic Rust. The AI never reads or writes PLAN.md.
+    // gates, .wisetree/develop/PLAN.md rendering/parsing, progress tracking, the approval
+    // loop — is deterministic Rust. The AI never reads or writes .wisetree/develop/PLAN.md.
 
     /// Deterministic Develop pre-flight: model + harness gates, base-ref
-    /// resolution, and detection of a resumable `PLAN.md`.
+    /// resolution, and detection of a resumable `.wisetree/develop/PLAN.md`.
     pub async fn develop_preflight(&self, worktree_path: &str) -> Result<DevelopPreflightOutcome> {
         if self.config.ai.develop.plan.model.trim().is_empty()
             || self.config.ai.develop.implement.model.trim().is_empty()
@@ -7414,11 +7419,11 @@ impl DashboardService {
             .await
             .map_err(WisetreeError::other)?;
         let status = parse_porcelain_v2(&status);
-        let has_non_plan_changes = !status.tracked.is_empty()
-            || status
-                .untracked
-                .iter()
-                .any(|path| path != DEVELOP_PLAN_FILE);
+        let has_non_plan_changes = status
+            .tracked
+            .iter()
+            .chain(&status.untracked)
+            .any(|path| !path.starts_with(".wisetree/"));
         if has_non_plan_changes {
             return Err(WisetreeError::other(
                 "Develop requires a clean worktree before starting.".to_string(),
@@ -7638,9 +7643,9 @@ impl DashboardService {
     /// Ralph-canon checkpoint. `preexisting_paths` holds the paths that were
     /// already dirty before this section's run started; they are left
     /// untouched so unrelated worktree changes are not absorbed into the
-    /// checkpoint. The harness-owned `PLAN.md` is also excluded. Returns the
+    /// checkpoint. The harness-owned `.wisetree/develop/PLAN.md` is also excluded. Returns the
     /// new sha, or `Ok(None)` when there was nothing to commit (the run made
-    /// no change, or touched only pre-existing work / `PLAN.md`).
+    /// no change, or touched only pre-existing work / `.wisetree/develop/PLAN.md`).
     pub async fn develop_commit_section(
         &self,
         worktree_path: &str,
@@ -7649,7 +7654,7 @@ impl DashboardService {
     ) -> Result<Option<String>> {
         let cwd = PathBuf::from(worktree_path);
         // Ensure a plan staged before this checkpoint cannot be committed.
-        self.develop_git(&cwd, &["reset", "--", DEVELOP_PLAN_FILE])
+        self.develop_git(&cwd, &["reset", "--", ".wisetree"])
             .await
             .map_err(WisetreeError::other)?;
         // Compute the current dirty files and drop anything that was already
@@ -7666,7 +7671,7 @@ impl DashboardService {
             .tracked
             .into_iter()
             .chain(current.untracked)
-            .filter(|p| *p != DEVELOP_PLAN_FILE && !preexisting_paths.contains(p))
+            .filter(|p| !p.starts_with(".wisetree/") && !preexisting_paths.contains(p))
             .collect();
         section_paths.sort();
         section_paths.dedup();
@@ -10319,14 +10324,14 @@ async fn run_command_combined(
     }
 }
 
-/// Hash every untracked file (excluding `BUG_INVESTIGATION.md`) so a later
+/// Hash every untracked file (excluding `.wisetree/bugkill/BUG_INVESTIGATION.md`) so a later
 /// scan can tell attempt-created files from pre-existing ones and detect
 /// modifications to the latter. Unreadable files hash as an empty string —
 /// equal before and after, so they never show up as attempt changes.
 async fn hash_untracked(cwd: &Path, untracked: &[String]) -> Vec<(String, String)> {
     let mut snapshot = Vec::new();
     for path in untracked {
-        if path == INVESTIGATION_FILE {
+        if path.starts_with(".wisetree/") {
             continue;
         }
         let hash = match tokio::fs::read(cwd.join(path)).await {
@@ -11121,18 +11126,8 @@ fn review_verification_attempt(
     }
 }
 
-/// Write the curated reference tables next to the temp dir so the scan AI
-/// can read them on demand instead of paying their token cost on every call.
-/// Best-effort: on a write failure the prompt just points at "(unavailable)"
-/// and the AI reviews from its compact checklists alone.
-async fn materialize_review_tables() -> String {
-    const TABLES: &str = include_str!("../../prompts/reviewer_tables.md");
-    let path = std::env::temp_dir().join("wisetree-reviewer-tables.md");
-    if tokio::fs::write(&path, TABLES).await.is_err() {
-        return "(unavailable)".to_string();
-    }
-    path.to_string_lossy().to_string()
-}
+/// Curated review guidance comes from the tracked prompt source at compile time.
+const REVIEW_TABLES: &str = include_str!("../../prompts/reviewer_tables.md");
 
 /// Legacy path classifier retained for diagnostics.
 /// These classes are not sufficient proof that a textual change is harmless,
@@ -11413,33 +11408,29 @@ fn review_output_contract(prompt: &str) -> &str {
 /// Render the per-file scan prompt: `prompts/reviewer_tester.md` for test
 /// files (test-quality lens), `prompts/reviewer_application.md` for
 /// application code (every file [`is_test_file`] doesn't classify as a test).
-fn build_review_scan_prompt(
-    file: &ReviewFile,
-    context: &ReviewContext,
-    tables_path: &str,
-) -> String {
+fn build_review_scan_prompt(file: &ReviewFile, context: &ReviewContext, tables: &str) -> String {
     let profile = if review_file_is_test(file) {
         ReviewGroupProfile::Tester
     } else {
         ReviewGroupProfile::Application
     };
-    build_review_group_prompt(std::slice::from_ref(file), profile, context, tables_path)
+    build_review_group_prompt(std::slice::from_ref(file), profile, context, tables)
 }
 
 fn build_review_group_prompt(
     files: &[ReviewFile],
     profile: ReviewGroupProfile,
     context: &ReviewContext,
-    tables_path: &str,
+    tables: &str,
 ) -> String {
-    build_review_group_prompt_with_relationships(files, profile, context, tables_path, "")
+    build_review_group_prompt_with_relationships(files, profile, context, tables, "")
 }
 
 fn build_review_group_prompt_with_relationships(
     files: &[ReviewFile],
     profile: ReviewGroupProfile,
     context: &ReviewContext,
-    tables_path: &str,
+    tables: &str,
     relationship_summary: &str,
 ) -> String {
     const SOURCE_PROMPT: &str = include_str!("../../prompts/reviewer_application.md");
@@ -11482,7 +11473,7 @@ fn build_review_group_prompt_with_relationships(
     substitute_review_prompt(
         template,
         &[
-            ("TABLES_PATH", tables_path),
+            ("TABLES_CONTENT", tables),
             ("FILE_PATH", &paths),
             ("REPO_CONTEXT", &context),
             ("RELATIONSHIP_EDGES", &relationships),
@@ -11588,7 +11579,11 @@ fn build_review_verifier_prompt(
     )
 }
 
-async fn validate_review_suggestion_isolated(file: &ReviewFile, finding: &ReviewFinding) -> String {
+async fn validate_review_suggestion_isolated(
+    cwd: &Path,
+    file: &ReviewFile,
+    finding: &ReviewFinding,
+) -> String {
     let deterministic = deterministic_suggestion_validation(file, finding);
     if !deterministic.starts_with("VALID-RANGE:") {
         return deterministic;
@@ -11611,9 +11606,14 @@ async fn validate_review_suggestion_isolated(file: &ReviewFile, finding: &Review
     );
     let candidate = format!("{}\n", lines.join("\n"));
     let digest = blake3::hash(format!("{}\0{start}\0{end}\0{suggestion}", file.path).as_bytes());
-    let directory =
-        std::env::temp_dir().join(format!("wisetree-review-verify-{}", &digest.to_hex()[..16]));
-    if tokio::fs::create_dir(&directory).await.is_err() {
+    let directory = cwd
+        .join(".wisetree/review")
+        .join(format!("verify-{}", &digest.to_hex()[..16]));
+    if tokio::fs::create_dir_all(cwd.join(".wisetree/review"))
+        .await
+        .is_err()
+        || tokio::fs::create_dir(&directory).await.is_err()
+    {
         return format!("{deterministic} Isolated parser/formatter check unavailable.");
     }
     let name = Path::new(&file.path)
@@ -11847,7 +11847,7 @@ fn build_review_merged_prompt(
     files: &[ReviewFile],
     context: &ReviewContext,
     tester_findings: &[ReviewFinding],
-    tables_path: &str,
+    tables: &str,
 ) -> String {
     const MERGED_PROMPT: &str = include_str!("../../prompts/reviewer.md");
     build_review_whole_diff_prompt(
@@ -11855,7 +11855,7 @@ fn build_review_merged_prompt(
         files,
         context,
         tester_findings,
-        Some(tables_path),
+        Some(tables),
         false,
     )
 }
@@ -11865,7 +11865,7 @@ fn build_review_whole_diff_prompt(
     files: &[ReviewFile],
     context: &ReviewContext,
     tester_findings: &[ReviewFinding],
-    tables_path: Option<&str>,
+    tables: Option<&str>,
     compact_applications: bool,
 ) -> String {
     let mut diff = String::new();
@@ -11920,7 +11920,7 @@ fn build_review_whole_diff_prompt(
     substitute_review_prompt(
         template,
         &[
-            ("TABLES_PATH", tables_path.unwrap_or("")),
+            ("TABLES_CONTENT", tables.unwrap_or("")),
             ("REPO_CONTEXT", &context),
             ("TEST_QUALITY_FINDINGS", &tester_findings),
             ("COVERAGE_LEDGER", &coverage_ledger),
@@ -13170,7 +13170,7 @@ fn truncate_for_prompt(text: &str, max_bytes: usize) -> String {
     )
 }
 
-/// Parse a drafted `pull_request.md`: the first non-empty line is the PR
+/// Parse a drafted `.wisetree/explain/pull_request.md`: the first non-empty line is the PR
 /// title (any leading `# ` is stripped), everything after it (leading blank
 /// lines trimmed) is the body, and any `<!-- wisetree-labels: ... -->` comment
 /// is extracted as the label list (and stripped from the body).
@@ -13468,10 +13468,10 @@ error: could not fetch gustavo";
             build_develop_implement_prompt("task", "s", "o", "", None, &index),
             build_bug_investigate_prompt("bug", None, &index),
             build_bug_fix_prompt("bug", &row, None, &index),
-            build_review_scan_prompt(&application, &context, "/tmp/tables.md"),
-            build_review_scan_prompt(&test, &context, "/tmp/tables.md"),
+            build_review_scan_prompt(&application, &context, "sample reference table"),
+            build_review_scan_prompt(&test, &context, "sample reference table"),
             build_review_coverage_prompt(&files, &context, &[]),
-            build_review_merged_prompt(&files, &context, &[], "/tmp/tables.md"),
+            build_review_merged_prompt(&files, &context, &[], "sample reference table"),
         ];
 
         for prompt in prompts {
@@ -13509,7 +13509,7 @@ error: could not fetch gustavo";
         // Only the header travels; the body stays on disk for the harness to
         // read on demand, which is the whole point of the index.
         assert!(!context.guides.contains("Long body"));
-        let prompt = build_review_scan_prompt(&files[0], &context, "/tmp/tables.md");
+        let prompt = build_review_scan_prompt(&files[0], &context, "sample reference table");
         assert!(prompt.contains("### Repository guides"), "{prompt}");
         assert!(prompt.contains(".wisetree/guides/tenancy.md"), "{prompt}");
     }
@@ -13529,7 +13529,7 @@ error: could not fetch gustavo";
         let context = build_review_context(worktree.path(), &files).await;
 
         assert_eq!(context.guides, guides::NO_GUIDES);
-        let prompt = build_review_scan_prompt(&files[0], &context, "/tmp/tables.md");
+        let prompt = build_review_scan_prompt(&files[0], &context, "sample reference table");
         assert!(prompt.contains(guides::NO_GUIDES), "{prompt}");
     }
 
@@ -14569,11 +14569,11 @@ copy to src/copied_again.rs
             guides: String::new(),
             coverage_ledger: ReviewCoverageLedger::default(),
         };
-        let prompt = build_review_scan_prompt(&file, &context, "/tmp/tables.md");
+        let prompt = build_review_scan_prompt(&file, &context, "sample reference table");
         assert!(prompt.contains("src/lib.rs"));
         assert!(prompt.contains("     1 +fn complete() { let x = 1; }"));
         assert!(prompt.contains("- line 1: rename this"));
-        assert!(prompt.contains("/tmp/tables.md"));
+        assert!(prompt.contains("sample reference table"));
         assert!(prompt.contains("Use surgical changes."));
         assert!(prompt.contains("- main.rs"));
         assert!(prompt.contains("fn complete() { let x = 1; }"));
@@ -14583,7 +14583,7 @@ copy to src/copied_again.rs
             "FILE_PATH",
             "FILE_DIFF",
             "EXISTING_COMMENTS",
-            "TABLES_PATH",
+            "TABLES_CONTENT",
             "REPO_CONTEXT",
             "FILE_CONTENT",
             "RELATIONSHIP_EDGES",
@@ -14600,7 +14600,11 @@ copy to src/copied_again.rs
             full_content: None,
             ..file
         };
-        let prompt = build_review_scan_prompt(&not_inlined, &ReviewContext::default(), "/tmp/t.md");
+        let prompt = build_review_scan_prompt(
+            &not_inlined,
+            &ReviewContext::default(),
+            "sample reference table",
+        );
         assert!(prompt
             .contains("MUST read `src/lib.rs` before completing this file's discovery judgment"));
     }
@@ -14626,14 +14630,14 @@ copy to src/copied_again.rs
             &[file("src/first.rs")],
             ReviewGroupProfile::Application,
             &context,
-            "/tmp/tables.md",
+            "sample reference table",
             "first relationship",
         );
         let second = build_review_group_prompt_with_relationships(
             &[file("src/second.rs")],
             ReviewGroupProfile::Application,
             &context,
-            "/tmp/tables.md",
+            "sample reference table",
             "second relationship",
         );
         let context_end = first.find("- Cross-group relationship edges").unwrap();
@@ -14693,7 +14697,7 @@ copy to src/copied_again.rs
             std::slice::from_ref(&file),
             ReviewGroupProfile::Application,
             &ReviewContext::default(),
-            "/tmp/tables.md",
+            "sample reference table",
         );
         assert_eq!(prompt.matches("new_call();").count(), 1, "{prompt}");
         assert!(!prompt.contains("FILE_CONTENT"));
@@ -15077,8 +15081,15 @@ copy to src/copied_again.rs
             suggestion: Some("fn value() -> i32 { 2 }".to_string()),
         };
         let before = file.full_content.clone();
-        let validation = validate_review_suggestion_isolated(&file, &finding).await;
+        let repo = tempfile::tempdir().unwrap();
+        let validation = validate_review_suggestion_isolated(repo.path(), &file, &finding).await;
         assert!(validation.contains("VALID-RANGE"), "{validation}");
+        assert_eq!(
+            std::fs::read_dir(repo.path().join(".wisetree/review"))
+                .unwrap()
+                .count(),
+            0
+        );
         assert_eq!(
             file.full_content, before,
             "validation must not mutate source"
@@ -15578,8 +15589,8 @@ copy to src/copied_again.rs
             guides: String::new(),
             coverage_ledger: ReviewCoverageLedger::default(),
         };
-        let source_prompt = build_review_scan_prompt(&source, &context, "/tmp/t.md");
-        let test_prompt = build_review_scan_prompt(&test, &context, "/tmp/t.md");
+        let source_prompt = build_review_scan_prompt(&source, &context, "sample reference table");
+        let test_prompt = build_review_scan_prompt(&test, &context, "sample reference table");
         assert!(source_prompt.starts_with("You are reviewing one focused group"));
         assert!(test_prompt.starts_with("You are reviewing one focused group"));
         assert!(test_prompt.contains("test-quality specialist"));
@@ -15801,8 +15812,12 @@ copy to src/copied_again.rs
         assert!(coverage.contains("     2 +    audit(user);"));
         assert!(!coverage.contains("     3      user.is_admin"));
 
-        let merged =
-            build_review_merged_prompt(&[file], &ReviewContext::default(), &[], "/tmp/tables.md");
+        let merged = build_review_merged_prompt(
+            &[file],
+            &ReviewContext::default(),
+            &[],
+            "sample reference table",
+        );
         assert!(merged.contains("     3      user.is_admin"));
     }
 
@@ -15976,7 +15991,7 @@ copy to src/copied_again.rs
             &files,
             ReviewGroupProfile::Application,
             &ReviewContext::default(),
-            "/tmp/tables.md",
+            "sample reference table",
         );
         assert!(prompt.contains("### FILE: src/a.rs"));
         assert!(prompt.contains("### FILE: src/b.rs"));
@@ -16052,8 +16067,12 @@ copy to src/copied_again.rs
             explanation: "Mocks the unit under test.".to_string(),
             suggestion: None,
         }];
-        let prompt =
-            build_review_merged_prompt(&[app, test], &context, &tester_findings, "/tmp/tables.md");
+        let prompt = build_review_merged_prompt(
+            &[app, test],
+            &context,
+            &tester_findings,
+            "sample reference table",
+        );
         assert!(prompt.contains(
             "CATEGORY: <Code Smell | Security | Performance | Test Quality | Convention>"
         ));
@@ -16065,8 +16084,8 @@ copy to src/copied_again.rs
             1
         );
         assert!(prompt.contains("assert!(x);"));
-        assert!(prompt.contains("/tmp/tables.md"));
-        assert!(!prompt.contains("TABLES_PATH"));
+        assert!(prompt.contains("sample reference table"));
+        assert!(!prompt.contains("TABLES_CONTENT"));
         assert!(prompt.contains("merged convention"));
         assert!(prompt.contains("merged inventory"));
         assert!(prompt.contains("never your ability to read the real files"));
@@ -18933,6 +18952,7 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("work");
         std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(repo.join(".wisetree/develop")).unwrap();
         git(&repo, &["init", "-q"]);
         git(&repo, &["config", "user.name", "t"]);
         git(&repo, &["config", "user.email", "t@example.com"]);
@@ -19314,7 +19334,7 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
         let (_tmp, repo) = develop_repo();
         git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         std::fs::write(repo.join(PLAN_FILE), "# Not a development plan").unwrap();
-        git(&repo, &["add", PLAN_FILE]);
+        git(&repo, &["add", "-f", PLAN_FILE]);
         git(&repo, &["commit", "-q", "-m", "add malformed plan"]);
         let expected_base_ref = Some("origin/main".to_string());
         let service = DashboardService::new(repo.clone(), DashboardConfig::default())
@@ -19350,6 +19370,9 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
             }],
             notes: vec!["Planning complete".to_string()],
         };
+        std::fs::write(repo.join("PLAN.md"), "# Root notes").unwrap();
+        git(&repo, &["add", "PLAN.md"]);
+        git(&repo, &["commit", "-q", "-m", "keep root notes"]);
         std::fs::write(repo.join(PLAN_FILE), render_plan_md(&expected_plan)).unwrap();
         let expected_base_ref = Some("origin/main".to_string());
         let service = DashboardService::new(repo.clone(), DashboardConfig::default())
@@ -19444,15 +19467,86 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
     }
 
     #[tokio::test]
+    async fn workflow_artifacts_are_not_attempt_changes_even_without_gitignore() {
+        let repo = initialized_temp_repo();
+        git(repo.path(), &["config", "core.excludesFile", ""]);
+        let service = DashboardService::new(repo.path().to_path_buf(), DashboardConfig::default());
+        for relative in [
+            ".wisetree/explain/pull_request.md",
+            PLAN_FILE,
+            INVESTIGATION_FILE,
+            ".wisetree/improve/run.json",
+            ".wisetree/review/report.json",
+            SPLIT_PLAN_FILE,
+        ] {
+            let path = repo.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "workflow state").unwrap();
+        }
+        std::fs::write(repo.path().join("new_source.txt"), "source").unwrap();
+        let snapshot = service
+            .bugkill_snapshot(repo.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.untracked.len(), 1);
+        assert_eq!(snapshot.untracked[0].0, "new_source.txt");
+        assert_eq!(snapshot.untracked_contents.len(), 1);
+    }
+
+    #[test]
+    fn review_tables_come_from_the_tracked_prompt_without_a_runtime_copy() {
+        assert_eq!(
+            REVIEW_TABLES,
+            include_str!("../../prompts/reviewer_tables.md")
+        );
+        let file = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "     1 +fn changed() {}".to_string(),
+            full_content: Some("fn changed() {}".to_string()),
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let prompt = build_review_scan_prompt(&file, &ReviewContext::default(), REVIEW_TABLES);
+        assert!(prompt.contains(REVIEW_TABLES));
+        assert!(!prompt.contains("TABLES_CONTENT"));
+    }
+
+    #[tokio::test]
+    async fn explain_prepares_its_output_directory_and_preserves_root_notes() {
+        let (_tmp, repo) = develop_repo();
+        git(&repo, &["branch", "base"]);
+        std::fs::write(repo.join("seed.txt"), "changed").unwrap();
+        git(&repo, &["commit", "-am", "change"]);
+        std::fs::write(repo.join("pull_request.md"), "user notes").unwrap();
+        let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+            .with_opencode_binary(PathBuf::from("git"));
+        let result = service
+            .prepare_explain(repo.to_str().unwrap(), "feature", "base")
+            .await
+            .unwrap();
+        assert!(matches!(result, ExplainPreparation::HandedOffToUi { .. }));
+        assert!(repo.join(".wisetree/explain").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("pull_request.md")).unwrap(),
+            "user notes"
+        );
+    }
+
+    #[tokio::test]
     async fn develop_commit_section_commits_everything_but_plan_md() {
         let (_tmp, repo) = develop_repo();
         let repo_str = repo.to_str().unwrap();
         let service = DashboardService::new(repo.clone(), DashboardConfig::default());
 
-        // A source change plus a harness-owned PLAN.md write.
+        // A source change plus a harness-owned .wisetree/develop/PLAN.md write.
         std::fs::write(repo.join("src.txt"), "impl").unwrap();
-        std::fs::write(repo.join("PLAN.md"), "# plan").unwrap();
+        std::fs::write(repo.join(".wisetree/develop/PLAN.md"), "# plan").unwrap();
 
+        // Other commands' artifacts must also stay outside the checkpoint.
+        std::fs::create_dir_all(repo.join(".wisetree/explain")).unwrap();
+        std::fs::write(repo.join(".wisetree/explain/pull_request.md"), "draft").unwrap();
+        git(&repo, &["add", "-f", ".wisetree"]);
         let sha = service
             .develop_commit_section(
                 repo_str,
@@ -19467,10 +19561,11 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
             git(&repo, &["log", "-1", "--format=%s"]),
             "develop: section 2 — Exporter"
         );
-        // src.txt is committed; PLAN.md stays uncommitted (still dirty).
+        assert!(git(&repo, &["ls-files", ".wisetree"]).is_empty());
+        // src.txt is committed; .wisetree/develop/PLAN.md stays uncommitted (still dirty).
         assert!(git(&repo, &["ls-files", "src.txt"]).contains("src.txt"));
-        assert!(git(&repo, &["ls-files", "PLAN.md"]).is_empty());
-        assert!(git(&repo, &["status", "--porcelain"]).contains("PLAN.md"));
+        assert!(git(&repo, &["ls-files", ".wisetree/develop/PLAN.md"]).is_empty());
+        assert!(repo.join(PLAN_FILE).is_file());
     }
 
     #[tokio::test]
@@ -19480,7 +19575,7 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
         let service = DashboardService::new(repo.clone(), DashboardConfig::default());
 
         // Only the harness-owned plan file changed → nothing to checkpoint.
-        std::fs::write(repo.join("PLAN.md"), "# plan").unwrap();
+        std::fs::write(repo.join(".wisetree/develop/PLAN.md"), "# plan").unwrap();
         let sha = service
             .develop_commit_section(
                 repo_str,
@@ -20017,7 +20112,7 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
         assert!(prompt.contains("Anything marked `later` in the outline belongs to a future run"));
         assert!(prompt.contains("Do NOT run `git add`"));
         assert!(prompt.contains("do NOT run any `gh` command"));
-        assert!(prompt.contains("Do NOT create, read, or modify `PLAN.md`"));
+        assert!(prompt.contains("Do NOT create, read, or modify `.wisetree/develop/PLAN.md`"));
         assert!(prompt.contains(
             "Stop and state in one short line what you implemented and whether the tests pass."
         ));

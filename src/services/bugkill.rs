@@ -1,5 +1,5 @@
 //! Pure, synchronous Bugkill logic: the hypothesis data model, the
-//! investigate-contract parser, the `BUG_INVESTIGATION.md` renderer + resume
+//! investigate-contract parser, the `.wisetree/bugkill/BUG_INVESTIGATION.md` renderer + resume
 //! parser, the attempt change-set computation, and the ranking/quality
 //! clamping. No I/O lives here — `DashboardService` owns every git/AI call
 //! and `App` owns the async orchestration, so everything in this module is
@@ -39,7 +39,7 @@ impl EvidenceQuality {
     }
 }
 
-/// One ranked root-cause hypothesis — a row of `BUG_INVESTIGATION.md`. The
+/// One ranked root-cause hypothesis — a row of `.wisetree/bugkill/BUG_INVESTIGATION.md`. The
 /// harness holds the `Vec<BugHypothesis>` in memory and re-renders the whole
 /// file from it after every mutation; the file is output for the human,
 /// never input for the AI.
@@ -233,7 +233,7 @@ pub fn parse_judge_verdict(transcript: &str) -> Option<BugkillVerdict> {
     result.map(|result| BugkillVerdict { result, reason })
 }
 
-// ── BUG_INVESTIGATION.md renderer + resume parser ───────────────────────
+// ── .wisetree/bugkill/BUG_INVESTIGATION.md renderer + resume parser ───────────────────────
 
 const RANKED_CAUSES_HEADING: &str = "## Ranked Causes and Solutions";
 const TABLE_HEADER: &str =
@@ -251,7 +251,7 @@ fn unescape_cell(value: &str) -> String {
     value.replace("<br>", "\n").replace("\\|", "|")
 }
 
-/// Render the whole `BUG_INVESTIGATION.md` from the in-memory model. Rows in
+/// Render the whole `.wisetree/bugkill/BUG_INVESTIGATION.md` from the in-memory model. Rows in
 /// `number` order; the `## Attempt Notes` section is omitted when `notes` is
 /// empty. The harness rewrites the file with this after **every** mutation.
 pub fn render_investigation_md(
@@ -301,7 +301,7 @@ pub fn render_investigation_md(
     out
 }
 
-/// The model recovered from an existing `BUG_INVESTIGATION.md` on Resume.
+/// The model recovered from an existing `.wisetree/bugkill/BUG_INVESTIGATION.md` on Resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedInvestigation {
     pub bug_description: String,
@@ -544,7 +544,7 @@ pub fn parse_porcelain_v2(output: &str) -> PorcelainStatus {
 
 /// The rendered investigation file — always excluded from snapshots,
 /// change-sets, and commits (invariant I1: it is harness-owned output).
-pub const INVESTIGATION_FILE: &str = "BUG_INVESTIGATION.md";
+pub const INVESTIGATION_FILE: &str = ".wisetree/bugkill/BUG_INVESTIGATION.md";
 
 /// What one fix attempt touched, computed by diffing the post-attempt
 /// `git status` against the pre-attempt untracked snapshot.
@@ -571,7 +571,7 @@ impl AttemptChanges {
 
 /// Compute the attempt change-set: all tracked-change paths, plus untracked
 /// paths absent from the pre-attempt snapshot, plus pre-attempt untracked
-/// paths whose sha256 changed — always excluding `BUG_INVESTIGATION.md`.
+/// paths whose sha256 changed — always excluding `.wisetree/bugkill/BUG_INVESTIGATION.md`.
 pub fn compute_attempt_changes(
     tracked: &[String],
     untracked_after: &[(String, String)],
@@ -579,14 +579,14 @@ pub fn compute_attempt_changes(
 ) -> AttemptChanges {
     let mut changes = AttemptChanges::default();
     for path in tracked {
-        if path == INVESTIGATION_FILE {
+        if path.starts_with(".wisetree/") {
             continue;
         }
         changes.all.push(path.clone());
         changes.commit_paths.push(path.clone());
     }
     for (path, hash) in untracked_after {
-        if path == INVESTIGATION_FILE {
+        if path.starts_with(".wisetree/") {
             continue;
         }
         match pre_untracked.iter().find(|(pre, _)| pre == path) {

@@ -1,8 +1,7 @@
 //! Durable state for one Improve walkthrough.
 //!
-//! The journal lives in the worktree-specific Git directory, not in the
-//! checkout, so it survives Wisetree restarts without making the worktree
-//! dirty. Discovery is frozen once; subsequent runs resume the first item
+//! The journal lives in `.wisetree/improve/` inside the selected worktree.
+//! Discovery is frozen once; subsequent runs resume the first item
 //! without a terminal outcome.
 
 use std::fs;
@@ -18,7 +17,7 @@ use crate::git::execute_git_command;
 use crate::services::dashboard::{BugkillSnapshot, ReviewFile, ReviewFinding, ReviewSkippedFile};
 
 const SCHEMA_VERSION: u32 = 1;
-const STATE_GIT_PATH: &str = "wisetree/improve/run.json";
+const STATE_PATH: &str = ".wisetree/improve/run.json";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,16 +207,7 @@ impl ImproveItemState {
 }
 
 pub async fn resolve_improve_state_path(worktree: &Path) -> Result<PathBuf> {
-    let result = execute_git_command(
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            STATE_GIT_PATH,
-        ],
-        Some(worktree),
-    )
-    .await;
+    let result = execute_git_command(&["rev-parse", "--show-toplevel"], Some(worktree)).await;
     if !result.success {
         return Err(WisetreeError::other(format!(
             "could not resolve Improve state path: {}",
@@ -230,7 +220,7 @@ pub async fn resolve_improve_state_path(worktree: &Path) -> Result<PathBuf> {
             "Git returned a relative Improve state path.",
         ));
     }
-    Ok(path)
+    Ok(path.join(STATE_PATH))
 }
 
 pub fn load_improve_run(path: &Path) -> Result<Option<ImproveRun>> {
@@ -485,6 +475,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn journal_lifecycle_stays_in_the_command_directory() {
+        let repo = repository();
+        let legacy = repo.path().join("run.json");
+        fs::write(&legacy, "root notes").unwrap();
+        let path = resolve_improve_state_path(repo.path()).await.unwrap();
+        let mut expected = run();
+        save_improve_run(&path, &expected).unwrap();
+        expected.items[0].state = ImproveItemState::Skipped;
+        save_improve_run(&path, &expected).unwrap();
+        assert_eq!(load_improve_run(&path).unwrap(), Some(expected.clone()));
+        let archived = archive_improve_run(&path).unwrap().unwrap();
+        assert_eq!(archived.parent(), path.parent());
+        assert_eq!(load_improve_run(&archived).unwrap(), Some(expected.clone()));
+        assert!(!path.exists());
+        save_improve_run(&path, &expected).unwrap();
+        clear_improve_run(&path).unwrap();
+        assert!(!path.exists());
+        assert!(archived.is_file());
+        assert_eq!(fs::read_to_string(legacy).unwrap(), "root notes");
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
     async fn state_path_is_private_to_each_linked_worktree() {
         let repo = repository();
         let linked_parent = TempDir::new().unwrap();
@@ -497,10 +510,10 @@ mod tests {
         let main_path = resolve_improve_state_path(repo.path()).await.unwrap();
         let linked_path = resolve_improve_state_path(&linked).await.unwrap();
         assert_ne!(main_path, linked_path);
-        let main_git_dir = PathBuf::from(git(repo.path(), &["rev-parse", "--absolute-git-dir"]));
-        let linked_git_dir = PathBuf::from(git(&linked, &["rev-parse", "--absolute-git-dir"]));
-        assert_eq!(main_path, main_git_dir.join(STATE_GIT_PATH));
-        assert_eq!(linked_path, linked_git_dir.join(STATE_GIT_PATH));
+        let main_root = PathBuf::from(git(repo.path(), &["rev-parse", "--show-toplevel"]));
+        let linked_root = PathBuf::from(git(&linked, &["rev-parse", "--show-toplevel"]));
+        assert_eq!(main_path, main_root.join(STATE_PATH));
+        assert_eq!(linked_path, linked_root.join(STATE_PATH));
 
         save_improve_run(&linked_path, &run()).unwrap();
         assert!(load_improve_run(&main_path).unwrap().is_none());

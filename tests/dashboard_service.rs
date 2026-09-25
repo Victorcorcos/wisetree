@@ -1169,8 +1169,11 @@ async fn split_preflight_freezes_identity_and_uses_only_read_only_gh_commands() 
         .await
         .expect("stale pre-approval plan should restart safely");
     assert_eq!(recovered.identity.source_head, advanced_source);
-    assert!(!worktree.join(".wisetree/split_plan.md").exists());
-    let archived_plan = worktree.join(format!(".wisetree/split_plan.{}.md", &local_head[..8]));
+    assert!(!worktree.join(".wisetree/split/split_plan.md").exists());
+    let archived_plan = worktree.join(format!(
+        ".wisetree/split/split_plan.{}.md",
+        &local_head[..8]
+    ));
     assert!(archived_plan.is_file());
     assert!(fs::read_to_string(archived_plan)
         .unwrap()

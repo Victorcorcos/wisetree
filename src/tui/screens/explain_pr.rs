@@ -5,7 +5,7 @@
 //! - `Confirm` : details panel on top, `ConfirmationModal` (Yes/No, **No**
 //!   default). Enter on Yes returns `ExplainAction::Confirmed`.
 //! - `Explaining` : spinner + a bordered "AI Activity" panel that embeds the
-//!   real opencode TUI inside a PTY. opencode drafts `pull_request.md`.
+//!   real opencode TUI inside a PTY. opencode drafts `.wisetree/explain/pull_request.md`.
 //!   The TUI never exits on its own, so the App watches opencode's
 //!   database with an `OpencodeTurnWatcher` and advances automatically
 //!   when the turn completes. Tab toggles focus between Wisetree and
@@ -14,7 +14,7 @@
 //!   Either way the screen surfaces `ReadyToReview`.
 //! - `Review`  : shows the drafted title and a `[ Open/Update PR ] [ Finish ]`
 //!   button row. Open submits (create or update); Finish keeps
-//!   `pull_request.md` on disk and returns to the dashboard.
+//!   `.wisetree/explain/pull_request.md` on disk and returns to the dashboard.
 //! - `Opening` : spinner while `App` pushes + runs `gh pr create`/`gh pr edit`.
 //!
 //! Async work (base-ref resolution, prompt prep, PR submission) is owned by
@@ -81,11 +81,11 @@ pub enum ExplainAction {
     /// User confirmed the explanation panel — start the explain pipeline.
     Confirmed,
     /// opencode finished (exited or the user confirmed the draft is ready).
-    /// The App reads `pull_request.md` and calls `enter_review` / `set_error`.
+    /// The App reads `.wisetree/explain/pull_request.md` and calls `enter_review` / `set_error`.
     ReadyToReview,
     /// Review step: open the new PR / update the existing one.
     Submit,
-    /// Review step: keep `pull_request.md` and return to the dashboard.
+    /// Review step: keep `.wisetree/explain/pull_request.md` and return to the dashboard.
     Finish,
     /// Done page: user pressed a key; caller should return to dashboard.
     Done,
@@ -117,7 +117,7 @@ pub struct ExplainPullRequestScreen {
     /// Esc on outer focus would abandon the whole explain run, so it goes
     /// through this confirmation first (Cancel preselected).
     abort_confirm: Option<ConfirmationModal>,
-    /// Drafted title, body, and labels parsed from `pull_request.md`,
+    /// Drafted title, body, and labels parsed from `.wisetree/explain/pull_request.md`,
     /// populated when the App transitions us into Review.
     draft_title: Option<String>,
     draft_body: Option<String>,
@@ -207,7 +207,7 @@ impl ExplainPullRequestScreen {
         self.pty.is_some()
     }
 
-    /// The drafted title/body/labels parsed from `pull_request.md` (available
+    /// The drafted title/body/labels parsed from `.wisetree/explain/pull_request.md` (available
     /// once the screen has entered Review).
     pub fn draft_title(&self) -> Option<&str> {
         self.draft_title.as_deref()
@@ -282,7 +282,7 @@ impl ExplainPullRequestScreen {
 
     /// Poll the embedded PTY for child exit and resize it to the panel.
     /// Returns `true` exactly once — on the tick opencode exits — so the App
-    /// can read `pull_request.md` and move the screen into Review.
+    /// can read `.wisetree/explain/pull_request.md` and move the screen into Review.
     pub fn tick_pty(&mut self, panel_inner: Option<(u16, u16)>) -> bool {
         let Some(pty) = self.pty.as_mut() else {
             return false;
@@ -1131,7 +1131,7 @@ impl ExplainPullRequestScreen {
             Paragraph::new(labeled_line(
                 "Saved to",
                 Span::styled(
-                    "pull_request.md".to_string(),
+                    ".wisetree/explain/pull_request.md".to_string(),
                     Style::default().fg(colors::EMPHASIS),
                 ),
                 None,
@@ -1230,7 +1230,7 @@ fn build_abort_modal() -> ConfirmationModal {
 fn build_finalize_modal() -> ConfirmationModal {
     ConfirmationModal::new()
         .with_title("Draft ready?")
-        .with_subtitle("Has the AI CLI finished writing pull_request.md?")
+        .with_subtitle("Has the AI CLI finished writing .wisetree/explain/pull_request.md?")
         .with_confirm_text("Yes")
         .with_cancel_text("No")
         .with_color("#eada61")
@@ -1342,7 +1342,8 @@ fn build_steps(request: &ExplainPullRequestRequest) -> Vec<String> {
     };
     vec![
         "Gather commit log + diff vs base ref".to_string(),
-        "Configured AI drafts `pull_request.md` (title + description)".to_string(),
+        "Configured AI drafts `.wisetree/explain/pull_request.md` (title + description)"
+            .to_string(),
         "You review the draft, then Open/Update or Finish".to_string(),
         submit_step,
     ]

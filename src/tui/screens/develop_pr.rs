@@ -25,7 +25,7 @@
 //!
 //! All async + git/AI work is owned by `App`; this screen is a presentation
 //! state machine over the in-memory `DevelopPlan`. The screen also renders
-//! `PLAN.md` from that model (`render_plan`) — the file is output for the
+//! `.wisetree/develop/PLAN.md` from that model (`render_plan`) — the file is output for the
 //! human, never input for the AI.
 
 use std::cell::Cell;
@@ -119,7 +119,7 @@ impl ResumeVariant {
 pub enum DevelopAction {
     Continue,
     /// Back to the dashboard (Esc/Cancel on any abandonable step). Progress
-    /// is never lost — `PLAN.md` stays on disk for a later Resume.
+    /// is never lost — `.wisetree/develop/PLAN.md` stays on disk for a later Resume.
     Cancelled,
     /// Confirm panel accepted — the `App` runs the preflight.
     Confirmed,
@@ -368,7 +368,7 @@ impl DevelopPullRequestScreen {
     pub fn has_pty(&self) -> bool {
         self.pty.is_some()
     }
-    /// The rendered `PLAN.md` for the current model — the App rewrites the
+    /// The rendered `.wisetree/develop/PLAN.md` for the current model — the App rewrites the
     /// file with this after every mutation.
     pub fn render_plan(&self) -> Option<String> {
         self.plan.as_ref().map(render_plan_md)
@@ -551,7 +551,7 @@ impl DevelopPullRequestScreen {
     pub fn show_feedback_input(&mut self) {
         self.input = Some(
             InputPrompt::new(
-                "Explain what to change — the plan AI revises PLAN.md from this feedback.",
+                "Explain what to change — the plan AI revises .wisetree/develop/PLAN.md from this feedback.",
             )
             .multiline()
             .expand_to_fill(),
@@ -1168,7 +1168,7 @@ impl DevelopPullRequestScreen {
                 self.finalize_confirm = Some(build_finalize_modal(self.current_section.is_some()));
                 DevelopAction::Continue
             }
-            // Pause: edits stay in the worktree, PLAN.md keeps the progress
+            // Pause: edits stay in the worktree, .wisetree/develop/PLAN.md keeps the progress
             // already marked — running Develop again offers Resume.
             KeyCode::Esc => {
                 self.abort_confirm = Some(build_abort_modal());
@@ -1325,12 +1325,12 @@ impl DevelopPullRequestScreen {
             "wisetree runs the configured check after each section; a failure lets you fix \
              it with AI, accept it, or pause."
         } else {
-            "wisetree marks each finished section ✅ in `PLAN.md`; edits stay uncommitted for \
+            "wisetree marks each finished section ✅ in `.wisetree/develop/PLAN.md`; edits stay uncommitted for \
              your review."
         };
         let steps = [
             "You describe the feature or task.".to_string(),
-            "The plan AI explores the code read-only and decomposes the task into `PLAN.md` \
+            "The plan AI explores the code read-only and decomposes the task into `.wisetree/develop/PLAN.md` \
              sections."
                 .to_string(),
             "You approve the plan — or answer No with feedback until it's right.".to_string(),
@@ -1483,18 +1483,18 @@ impl DevelopPullRequestScreen {
                     .unwrap_or(0);
                 (
                     format!(
-                        "An existing PLAN.md was found for this worktree with {pending} pending \
+                        "An existing .wisetree/develop/PLAN.md was found for this worktree with {pending} pending \
                          section(s)."
                     ),
                     colors::INFO,
                 )
             }
             ResumeVariant::Overwrite => (
-                "Existing PLAN.md is not in Develop's format and will be replaced.".to_string(),
+                "Existing .wisetree/develop/PLAN.md is not in Develop's format and will be replaced.".to_string(),
                 colors::WARNING,
             ),
             ResumeVariant::Completed => (
-                "The existing PLAN.md is fully implemented (every section ✅).".to_string(),
+                "The existing .wisetree/develop/PLAN.md is fully implemented (every section ✅).".to_string(),
                 colors::SUCCESS,
             ),
         };
@@ -1969,7 +1969,7 @@ impl DevelopPullRequestScreen {
                 Style::default().fg(colors::WARNING),
             ));
             spans.push(Span::styled(
-                "Pause (PLAN.md keeps progress)".to_string(),
+                "Pause (.wisetree/develop/PLAN.md keeps progress)".to_string(),
                 muted_dim(),
             ));
         }
@@ -2044,7 +2044,7 @@ impl DevelopPullRequestScreen {
                     Style::default().fg(colors::INFO),
                 ),
                 (
-                    "· PLAN.md in the worktree root".to_string(),
+                    "· .wisetree/develop/PLAN.md in the worktree".to_string(),
                     Style::default().fg(colors::MUTED),
                 ),
             ],
@@ -2263,7 +2263,7 @@ impl DevelopPullRequestScreen {
         let mut lines = vec![Line::from(vec![
             Span::styled("Plan        ".to_string(), muted_dim()),
             Span::styled(
-                "PLAN.md kept at the worktree root — the tracker shows every section ✅"
+                ".wisetree/develop/PLAN.md kept in the worktree — the tracker shows every section ✅"
                     .to_string(),
                 Style::default().fg(colors::WHITE),
             ),
@@ -2861,7 +2861,7 @@ mod tests {
             "{dump}"
         );
         assert!(dump.contains("You describe the feature or task."), "{dump}");
-        assert!(dump.contains("PLAN.md"), "{dump}");
+        assert!(dump.contains(".wisetree/develop/PLAN.md"), "{dump}");
         assert!(dump.contains("plan"), "{dump}");
         assert!(dump.contains("openai/gpt-5.6-sol"), "{dump}");
         assert!(dump.contains("implement"), "{dump}");

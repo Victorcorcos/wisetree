@@ -26,7 +26,7 @@ Review ONLY the lines introduced or modified in this diff (the numbered `+` line
 
 Out of scope for this scan: **test coverage**. A separate whole-diff pass — the only reviewer in this pipeline allowed to raise missing-test findings — judges whether the PR's changed behavior is protected by tests, with every changed file and test in view at once. Never emit an "add a test for this" / "this change is untested" finding here, no matter how obviously uncovered the changed code looks: raising it anyway just duplicates that pass's finding as a second PR comment.
 
-These checklists are a starting point, not a ceiling — flag any real issue you can point to in the changed code, and only what is actually present (never speculate). If you are unsure how to classify or judge a suspected issue, the harness provides a path to the full curated reference tables (reason + recommended solution per item) below — read that file only when you need it.
+These checklists are a starting point, not a ceiling — flag any real issue you can point to in the changed code, and only what is actually present (never speculate). If you are unsure how to classify or judge a suspected issue, consult the curated reference tables below (reason + recommended solution per item) when you need them.
 
 ## Quality rules
 
@@ -88,7 +88,11 @@ RELATIONSHIP_EDGES
 ```
 FILE_PATH
 ```
-- Curated reference tables path: `TABLES_PATH`
+- Curated reference tables (consult when needed):
+
+```
+TABLES_CONTENT
+```
 - Authoritative file evidence, grouped by `### FILE:`. Bounded files appear once as numbered current files; large/unavailable files retain numbered diff hunks and targeted read guidance:
 
 ```

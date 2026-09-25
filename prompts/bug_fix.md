@@ -48,7 +48,7 @@ Make **no edit** and state so in one line. The harness detects an empty change a
 ## Forbidden
 
 - Do NOT run `git add`, `git commit`, `git push`, `git fetch`, `git pull`, `git merge`, `git reset`, or `git checkout`, and do NOT run any `gh` command or touch `.git/` — the harness owns all version-control state.
-- Do NOT create, read, or modify `BUG_INVESTIGATION.md`.
+- Do NOT create, read, or modify `.wisetree/bugkill/BUG_INVESTIGATION.md`.
 
 ## When done
 

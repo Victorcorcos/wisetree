@@ -181,8 +181,8 @@ impl ImageStorage {
         self.cleanup_unreferenced_at(referenced, SystemTime::now())
     }
 
-    /// Find references written into active `PLAN.md` and
-    /// `BUG_INVESTIGATION.md` workflow files before cleanup. Partial or
+    /// Find references written into active `.wisetree/develop/PLAN.md` and
+    /// `.wisetree/bugkill/BUG_INVESTIGATION.md` workflow files before cleanup. Partial or
     /// malformed metadata is ignored conservatively: no valid reference is
     /// needed before an unrelated stale upload can become eligible.
     pub fn cleanup_unreferenced_in_worktrees(
@@ -191,7 +191,10 @@ impl ImageStorage {
     ) -> std::io::Result<usize> {
         let mut referenced = Vec::new();
         for worktree in worktrees {
-            for name in ["PLAN.md", "BUG_INVESTIGATION.md"] {
+            for name in [
+                crate::services::develop::PLAN_FILE,
+                crate::services::bugkill::INVESTIGATION_FILE,
+            ] {
                 let Ok(content) = fs::read_to_string(worktree.join(name)) else {
                     continue;
                 };
@@ -506,24 +509,56 @@ mod tests {
 
     #[test]
     fn cleanup_reads_live_plan_and_investigation_references() {
-        let dir = tempdir().unwrap();
-        let storage = ImageStorage::new(dir.path().join("uploads"));
-        let attachment = storage.ingest_bytes(PNG).unwrap();
-        fs::write(
-            dir.path().join("PLAN.md"),
-            format!(
-                "<!-- wisetree:image-attachments:{} -->",
-                serde_json::json!([attachment])
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            storage
-                .cleanup_unreferenced_in_worktrees([dir.path().to_path_buf()])
-                .unwrap(),
-            0
-        );
-        assert!(storage.root().read_dir().unwrap().next().is_some());
+        for relative in [
+            crate::services::develop::PLAN_FILE,
+            crate::services::bugkill::INVESTIGATION_FILE,
+        ] {
+            let dir = tempdir().unwrap();
+            let storage = ImageStorage::new(dir.path().join("uploads"));
+            let attachment = storage.ingest_bytes(PNG).unwrap();
+            let stale = storage.root().join("unused.png");
+            fs::write(&stale, PNG).unwrap();
+            let old = SystemTime::now()
+                - Duration::from_secs((IMAGE_UPLOAD_RETENTION_DAYS + 1) * 24 * 60 * 60);
+            for path in [&attachment.path, &stale] {
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(old))
+                    .unwrap();
+            }
+            let workflow = dir.path().join(relative);
+            fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+            fs::write(
+                &workflow,
+                format!(
+                    "<!-- wisetree:image-attachments:{} -->",
+                    serde_json::json!([attachment])
+                ),
+            )
+            .unwrap();
+            // A malformed old root document must not short-circuit cleanup.
+            let legacy = dir.path().join(workflow.file_name().unwrap());
+            fs::write(&legacy, "<!-- wisetree:image-attachments: [not-json -->").unwrap();
+            assert_eq!(
+                storage
+                    .cleanup_unreferenced_in_worktrees([dir.path().to_path_buf()])
+                    .unwrap(),
+                1
+            );
+            assert!(attachment.path.is_file());
+            assert!(!stale.exists());
+            fs::remove_file(workflow).unwrap();
+            assert_eq!(
+                storage
+                    .cleanup_unreferenced_in_worktrees([dir.path().to_path_buf()])
+                    .unwrap(),
+                1
+            );
+            assert!(!attachment.path.exists());
+            assert!(legacy.is_file());
+        }
     }
 
     #[test]

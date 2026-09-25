@@ -1,4 +1,4 @@
-You are drafting a single GitHub pull request for an automated pipeline. Your ONLY job is to write a high-quality PR **title** and **description** into the file `pull_request.md` at the repository root. Everything else (collecting the diff, detecting the base branch, extracting the ticket, pushing, and opening the PR) is already handled deterministically by the harness — do not do any of it.
+You are drafting a single GitHub pull request for an automated pipeline. Your ONLY job is to write a high-quality PR **title** and **description** into the file `.wisetree/explain/pull_request.md` relative to the worktree root. Everything else (collecting the diff, detecting the base branch, extracting the ticket, pushing, and opening the PR) is already handled deterministically by the harness — do not do any of it.
 
 ## Inputs (provided by the harness)
 
@@ -25,7 +25,7 @@ PR_TEMPLATE
 
 ## What to write
 
-Create (or overwrite) `pull_request.md` at the repository root with EXACTLY this layout:
+Create (or overwrite) `.wisetree/explain/pull_request.md` relative to the worktree root with EXACTLY this layout:
 
 1. **Line 1 — the PR title.** A single line, imperative mood, max 72 characters. If `TICKET` is non-empty, prefix it: `TICKET Short description` (e.g. `DIGIT-3131 Add payment retry logic`). Do not wrap the title in markdown heading syntax — just the plain title text on the first line.
 2. **Line 2 — the label comment.** A single `<!-- wisetree-labels: ... -->` comment listing the applicable labels (see **Label selection** below). Example: `<!-- wisetree-labels: bug 🐛, user story 💬 -->`. This line is invisible when the PR is rendered.
@@ -56,6 +56,6 @@ Multiple labels are allowed and encouraged when a PR spans several categories (e
 
 ## Output contract
 
-- Write the result to `pull_request.md` only. Do not run git, gh, or any other command. Do not commit anything.
+- Write the result to `.wisetree/explain/pull_request.md` only. Do not run git, gh, or any other command. Do not commit anything.
 - The first line must be the title and nothing else. The rest of the file is the body.
 - When the file is written, stop.

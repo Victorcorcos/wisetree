@@ -123,7 +123,7 @@ pub struct ClosePullRequestRequest {
 }
 
 /// Payload the dashboard hands to the "Explain Pull Request" screen. The AI
-/// drafts a title + description into `pull_request.md`; the harness then
+/// drafts a title + description into `.wisetree/explain/pull_request.md`; the harness then
 /// either creates a new PR (`number == None`) or updates the existing one
 /// (`number == Some`). `base_ref` is resolved by the app layer before the
 /// pipeline runs, exactly like `UpdatePullRequestRequest`.
@@ -383,7 +383,7 @@ pub enum DashboardAction {
     /// attempts (commit on success, `git revert` on failure). Offered on
     /// every non-mother worktree — no PR required.
     Bugkill(Box<BugkillRequest>),
-    /// Plan a described task into `PLAN.md`, gate on user approval, then
+    /// Plan a described task into `.wisetree/develop/PLAN.md`, gate on user approval, then
     /// implement it section by section with the AI. Offered on every
     /// non-mother worktree — no PR required.
     Develop(Box<DevelopRequest>),
@@ -1181,7 +1181,7 @@ impl DashboardScreen {
                 color: colors::DARK_GREEN,
             });
         }
-        // Develop plans a described task into PLAN.md and implements it
+        // Develop plans a described task into .wisetree/develop/PLAN.md and implements it
         // section by section. Same gate as Bugkill: every non-mother
         // worktree, PR or not.
         if build_develop_request(row).is_some() {

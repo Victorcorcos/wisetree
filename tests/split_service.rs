@@ -982,7 +982,7 @@ exit 1
         )
         .await;
     if let Err(error) = &result {
-        let cache = fs::read_dir(fixture.source.join(".wisetree/split_drafts"))
+        let cache = fs::read_dir(fixture.source.join(".wisetree/split/split_drafts"))
             .unwrap()
             .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
             .collect::<Vec<_>>();
@@ -1069,7 +1069,8 @@ exit 1
         fs::read(third_path.join("tests/shared.txt")).unwrap(),
         source_before
     );
-    let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
+    let document =
+        fs::read_to_string(fixture.source.join(".wisetree/split/split_plan.md")).unwrap();
     let persisted = parse_materialization(&document).unwrap().unwrap();
     let published = parse_publication(&document).unwrap().unwrap();
     assert_eq!(
@@ -1196,7 +1197,8 @@ async fn materializes_deletion_rename_and_binary_and_rejects_moved_artifacts() {
         .await
         .unwrap();
 
-    let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
+    let document =
+        fs::read_to_string(fixture.source.join(".wisetree/split/split_plan.md")).unwrap();
     let persisted = parse_materialization(&document).unwrap().unwrap();
     assert_eq!(persisted.layers.len(), plan.responsibilities.len());
     for layer in &persisted.layers {
@@ -1263,7 +1265,7 @@ fn draft_cache_identity_scopes_a_retry_to_the_incomplete_pull_request() {
 
     let path = split_draft_cache_path("/tmp/worktree", &first);
     assert!(
-        path.ends_with(format!(".wisetree/split_drafts/{first}.json")),
+        path.ends_with(format!(".wisetree/split/split_drafts/{first}.json")),
         "{path:?}"
     );
     assert_ne!(path, split_draft_cache_path("/tmp/worktree", &second));
@@ -1591,7 +1593,8 @@ async fn two_chains_and_a_leaf_materialize_side_by_side_off_the_base() {
         .await
         .unwrap();
 
-    let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
+    let document =
+        fs::read_to_string(fixture.source.join(".wisetree/split/split_plan.md")).unwrap();
     let layers = parse_materialization(&document).unwrap().unwrap().layers;
     assert_eq!(layers.len(), 5);
 
@@ -1964,7 +1967,8 @@ async fn publishing_a_forest_stacks_the_chains_and_opens_the_leaf_against_the_tr
         .await
         .unwrap();
 
-    let document = fs::read_to_string(fixture.source.join(".wisetree/split_plan.md")).unwrap();
+    let document =
+        fs::read_to_string(fixture.source.join(".wisetree/split/split_plan.md")).unwrap();
     let layers = parse_materialization(&document).unwrap().unwrap().layers;
     let branches = layers
         .iter()

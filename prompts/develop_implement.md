@@ -52,7 +52,7 @@ CHECK_FAILURE
 ## Forbidden
 
 - Do NOT run `git add`, `git commit`, `git push`, `git fetch`, `git pull`, `git merge`, `git reset`, or `git checkout`, and do NOT run any `gh` command or touch `.git/` — the harness owns all version-control state.
-- Do NOT create, read, or modify `PLAN.md` — the harness owns the plan file and marks sections done itself.
+- Do NOT create, read, or modify `.wisetree/develop/PLAN.md` — the harness owns the plan file and marks sections done itself.
 
 ## When done
 

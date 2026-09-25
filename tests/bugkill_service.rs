@@ -100,6 +100,8 @@ impl Fixture {
         // global git config (repo convention).
         git(&repo, &["config", "user.email", "test@example.com"]);
         git(&repo, &["config", "user.name", "Wisetree Test"]);
+        git(&repo, &["config", "core.excludesFile", ""]);
+        fs::create_dir_all(repo.join(".wisetree/bugkill")).unwrap();
         fs::write(repo.join("src.txt"), "original\n").unwrap();
         git(&repo, &["add", "src.txt"]);
         git(&repo, &["commit", "-q", "-m", "init"]);
@@ -165,7 +167,7 @@ impl Fixture {
 
     fn write_investigation(&self, hypotheses: &[BugHypothesis]) {
         fs::write(
-            self.repo.join("BUG_INVESTIGATION.md"),
+            self.repo.join(".wisetree/bugkill/BUG_INVESTIGATION.md"),
             render_investigation_md("Saving crashes.", hypotheses, &[], &[]),
         )
         .unwrap();
@@ -209,7 +211,11 @@ async fn preflight_blocks_on_tracked_change_and_passes_with_untracked() {
 #[tokio::test]
 async fn preflight_flags_unparseable_investigation_file() {
     let fx = Fixture::new();
-    fs::write(fx.repo.join("BUG_INVESTIGATION.md"), "# my own notes\n").unwrap();
+    fs::write(
+        fx.repo.join(".wisetree/bugkill/BUG_INVESTIGATION.md"),
+        "# my own notes\n",
+    )
+    .unwrap();
     match fx.service().bugkill_preflight(fx.repo_str()).await.unwrap() {
         BugkillPreflightOutcome::Ready(preflight) => {
             assert_eq!(preflight.resume, BugkillResumeState::Unparseable);
@@ -218,6 +224,31 @@ async fn preflight_flags_unparseable_investigation_file() {
         }
         other => panic!("expected Ready, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn resume_reads_only_the_command_directory() {
+    let fx = Fixture::new();
+    let root = fx.repo.join("BUG_INVESTIGATION.md");
+    fs::write(&root, "# Root notes").unwrap();
+    let service = fx.service();
+    let BugkillPreflightOutcome::Ready(preflight) =
+        service.bugkill_preflight(fx.repo_str()).await.unwrap()
+    else {
+        panic!("expected ready");
+    };
+    assert_eq!(preflight.resume, BugkillResumeState::Absent);
+    fx.write_investigation(&[fx.hypothesis(false, None)]);
+    let BugkillPreflightOutcome::Ready(preflight) =
+        service.bugkill_preflight(fx.repo_str()).await.unwrap()
+    else {
+        panic!("expected ready");
+    };
+    assert!(matches!(
+        preflight.resume,
+        BugkillResumeState::Parsed { .. }
+    ));
+    assert_eq!(fs::read_to_string(root).unwrap(), "# Root notes");
 }
 
 // ── leftover-attempt recovery ───────────────────────────────────────────
@@ -326,7 +357,7 @@ async fn attempt_commit_contains_only_the_change_set() {
     // attempt); only untracked files remain — the user's notes and the
     // harness-owned investigation file, which is never committed.
     let status = git_output(&fx.repo, &["status", "--porcelain"]);
-    assert_eq!(status, "?? BUG_INVESTIGATION.md\n?? notes.txt");
+    assert_eq!(status, "?? .wisetree/\n?? notes.txt");
 }
 
 #[tokio::test]
@@ -656,7 +687,7 @@ async fn resume_preserves_original_bug_image_and_rejects_it_if_removed() {
     fs::write(&image_path, "original").unwrap();
     let original = attachment(image_path.clone(), "original");
     fs::write(
-        fx.repo.join("BUG_INVESTIGATION.md"),
+        fx.repo.join(".wisetree/bugkill/BUG_INVESTIGATION.md"),
         render_investigation_md(
             "Saving crashes.",
             &[fx.hypothesis(false, None)],

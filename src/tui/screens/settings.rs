@@ -1259,7 +1259,7 @@ impl AiSlot {
                 "Judges a freeform \"Other\" answer — fixed or not (Bugkill · judge)"
             }
             AiSlot::DevelopPlan => {
-                "Plans the described task into PLAN.md sections — pick a stronger model \
+                "Plans .wisetree/develop/PLAN.md — pick a stronger model \
                  (Develop · plan)"
             }
             AiSlot::DevelopImplement => {
@@ -7150,11 +7150,7 @@ mod tests {
             .unwrap();
         focus_ai_slot(&mut screen, idx);
 
-        assert_selected_slot_metadata(
-            &screen,
-            "Develop · plan",
-            "Plans the described task into PLAN.md sections",
-        );
+        assert_selected_slot_metadata(&screen, "Develop · plan", "Plans .wisetree/develop/PLAN.md");
 
         screen.apply_ai_selection("plan-model".to_string(), "high".to_string());
         screen.ai_settings_editor.as_mut().unwrap().selection = AiSettingsSelection::Save;
