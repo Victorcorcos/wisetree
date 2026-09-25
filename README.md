@@ -237,7 +237,7 @@ Pull Request Commands keep generated helper files under `.wisetree/<command>/` i
 | Explain | `explain/pull_request.md` |
 | Develop | `develop/PLAN.md` |
 | Bugkill | `bugkill/BUG_INVESTIGATION.md` |
-| Split | `split/split_plan.md`, archived plans, `split/split_drafts/*.json` |
+| Split | `split/split_plan.md`, archived plans, `split/drafts/*.json` |
 | Improve | `improve/run.json`, archived runs, `improve/recovery-*/` backups |
 | Review | temporary `review/verify-*/` candidates (removed after checking), `review/test_patterns.txt`, `review/report.json` |
 
@@ -268,7 +268,7 @@ The confirmation page describes the full operation. The planner then runs in an 
 
 While the drafting stage runs, each pull request has its own row showing whether its AI title and description are queued, drafting, being applied, already live on GitHub, or failed, and ↑/↓ switches which PR's activity stream is shown. The completion page then lists every pull request with the title that is now live and whether the AI metadata was applied or the provisional title was kept.
 
-Drafting failures are scoped to one pull request. If one of the concurrent jobs fails, the board stays on screen with that PR selected and its error readable next to the ones that already succeeded, and Enter/R retries in place. The retry re-runs only the incomplete work: every valid draft is cached under `.wisetree/split/split_drafts/` keyed by source head, layer and PR number, so a PR that was already drafted costs no second AI call, and a PR that was already updated on GitHub is not edited again. A draft that succeeded but failed to apply keeps its prose and only repeats the `gh pr edit`. The same reconciliation happens if you quit and start Split again with the same identity.
+Drafting failures are scoped to one pull request. If one of the concurrent jobs fails, the board stays on screen with that PR selected and its error readable next to the ones that already succeeded, and Enter/R retries in place. The retry re-runs only the incomplete work: every valid draft is cached under `.wisetree/split/drafts/` keyed by source head, layer and PR number, so a PR that was already drafted costs no second AI call, and a PR that was already updated on GitHub is not edited again. A draft that succeeded but failed to apply keeps its prose and only repeats the `gh pr edit`. The same reconciliation happens if you quit and start Split again with the same identity. Drafts from earlier Wisetree versions under `.wisetree/split/split_drafts/` move into `drafts/` when their run resumes.
 
 Split requires an authenticated GitHub CLI and the `gh stack` preview commands (`gh stack init`, `gh stack link`, and `gh stack submit`) to be available. Publication invokes `gh stack link --base <trunk> --remote <remote> --open <branches...>` once, with the frozen GitHub repository remote and branches ordered bottom-to-top. It then verifies every live head/base/URL and applies provisional metadata before any metadata AI runs. Each metadata AI fills the repository's complete pull-request template without placeholders; the harness then inserts `### Split Plan 📋` immediately below `# Description ✍️`, with ordered canonical URLs marking the current PR and all future dependent PRs.
 

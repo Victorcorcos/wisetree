@@ -14,7 +14,7 @@ use crate::errors::{Result, WisetreeError};
 pub const SPLIT_DIRECTORY: &str = ".wisetree/split";
 pub const SPLIT_PLAN_FILE: &str = ".wisetree/split/split_plan.md";
 pub const SPLIT_PLAN_ARCHIVE_PREFIX: &str = ".wisetree/split/split_plan.";
-pub const SPLIT_DRAFT_DIRECTORY: &str = ".wisetree/split/split_drafts";
+pub const SPLIT_DRAFT_DIRECTORY: &str = ".wisetree/split/drafts";
 const MATERIALIZATION_MARKER: &str = "<!-- wisetree-split-materialization ";
 const PUBLICATION_MARKER: &str = "<!-- wisetree-split-publication ";
 const RUN_MARKER: &str = "<!-- wisetree-split-run ";

@@ -6454,6 +6454,7 @@ impl DashboardService {
                 pull_request.number,
             );
             let cache_path = split_draft_cache_path(&preflight.worktree_path, &job_id);
+            Self::migrate_legacy_split_draft(source, &cache_path).await?;
             let cached = match tokio::fs::read_to_string(&cache_path).await {
                 Ok(json) => serde_json::from_str::<SplitDraftRecord>(&json).ok(),
                 Err(_) => None,
@@ -6890,6 +6891,30 @@ impl DashboardService {
         }
         self.save_split_draft_record(preflight, &record).await?;
         Ok(record)
+    }
+
+    /// Move a draft made before the `split_drafts` → `drafts` directory rename.
+    /// A current draft always wins if both locations exist.
+    async fn migrate_legacy_split_draft(source: &Path, destination: &Path) -> Result<()> {
+        if destination.exists() {
+            return Ok(());
+        }
+        let Some(file_name) = destination.file_name() else {
+            return Err(WisetreeError::other(
+                "Split draft cache path has no filename.",
+            ));
+        };
+        let old_directory = source.join(".wisetree/split/split_drafts");
+        let old_path = old_directory.join(file_name);
+        if !old_path.is_file() {
+            return Ok(());
+        }
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::rename(&old_path, destination).await?;
+        let _ = tokio::fs::remove_dir(old_directory).await;
+        Ok(())
     }
 
     async fn save_split_draft_record(
@@ -19464,6 +19489,43 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
 
         assert_eq!(clipped, "…βγ");
         assert!(clipped.strip_prefix('…').unwrap().len() <= 5);
+    }
+
+    #[tokio::test]
+    async fn split_draft_cache_moves_to_the_new_directory_on_resume() {
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = "0123456789ab-layer-1-pr-41";
+        let old = worktree.path().join(".wisetree/split/split_drafts");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join(format!("{job_id}.json")), "cached draft").unwrap();
+        let current = split_draft_cache_path(worktree.path().to_str().unwrap(), job_id);
+
+        DashboardService::migrate_legacy_split_draft(worktree.path(), &current)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), "cached draft");
+        assert!(!old.exists());
+        DashboardService::migrate_legacy_split_draft(worktree.path(), &current)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), "cached draft");
+    }
+
+    #[tokio::test]
+    async fn current_split_draft_takes_precedence_over_legacy_copy() {
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = "0123456789ab-layer-1-pr-41";
+        let current = split_draft_cache_path(worktree.path().to_str().unwrap(), job_id);
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, "new draft").unwrap();
+        let old = worktree.path().join(".wisetree/split/split_drafts");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join(format!("{job_id}.json")), "old draft").unwrap();
+
+        DashboardService::migrate_legacy_split_draft(worktree.path(), &current)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(current).unwrap(), "new draft");
     }
 
     #[tokio::test]

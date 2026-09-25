@@ -982,7 +982,7 @@ exit 1
         )
         .await;
     if let Err(error) = &result {
-        let cache = fs::read_dir(fixture.source.join(".wisetree/split/split_drafts"))
+        let cache = fs::read_dir(fixture.source.join(".wisetree/split/drafts"))
             .unwrap()
             .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
             .collect::<Vec<_>>();
@@ -1265,7 +1265,7 @@ fn draft_cache_identity_scopes_a_retry_to_the_incomplete_pull_request() {
 
     let path = split_draft_cache_path("/tmp/worktree", &first);
     assert!(
-        path.ends_with(format!(".wisetree/split/split_drafts/{first}.json")),
+        path.ends_with(format!(".wisetree/split/drafts/{first}.json")),
         "{path:?}"
     );
     assert_ne!(path, split_draft_cache_path("/tmp/worktree", &second));
