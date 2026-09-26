@@ -178,6 +178,11 @@ pub struct SplitPublication {
 pub struct SplitDraft {
     pub title_summary: String,
     pub body_content: String,
+    /// Labels the AI picked from the repository's own catalog. Empty when it
+    /// found none that fit, when the catalog could not be read, or on a draft
+    /// cached before labels were part of the contract.
+    #[serde(default)]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +196,10 @@ pub struct SplitDraftRecord {
     pub draft: Option<SplitDraft>,
     pub final_title: Option<String>,
     pub final_body: Option<String>,
+    /// The draft's labels after the harness resolved them against the
+    /// repository's catalog: the exact values `gh pr edit --add-label` gets.
+    #[serde(default)]
+    pub final_labels: Vec<String>,
     pub applied: bool,
     pub error: Option<String>,
 }
@@ -333,11 +342,16 @@ pub fn build_split_open_prompt(
     commit_log: &str,
     diff: &str,
     template: &str,
+    labels: &[String],
 ) -> String {
     include_str!("../../prompts/split_open.md")
         .replace("RESPONSIBILITY", &responsibility.name)
         .replace("RATIONALE", &responsibility.rationale)
         .replace("TICKET", ticket)
+        .replace(
+            "AVAILABLE_LABELS",
+            &crate::services::pr_labels::render_label_catalog(labels),
+        )
         .replace("COMMIT_LOG", commit_log)
         .replace("VERIFIED_DIFF", diff)
         .replace("PR_TEMPLATE", template)
@@ -387,6 +401,7 @@ pub fn parse_split_draft(response: &str) -> Result<SplitDraft> {
     Ok(SplitDraft {
         title_summary: title.to_string(),
         body_content: body.to_string(),
+        labels: draft.labels.clone(),
     })
 }
 
@@ -480,6 +495,7 @@ pub fn compose_split_body(
         &SplitDraft {
             title_summary: "validated separately".to_string(),
             body_content: filled_body.to_string(),
+            labels: Vec::new(),
         },
     )?;
     let mut plan = String::from("### Split Plan 📋\n\n");

@@ -12,6 +12,7 @@ pub mod guides;
 pub mod improve_run;
 pub mod opencode_models;
 pub mod opencode_turn;
+pub mod pr_labels;
 pub mod presets;
 pub mod review_report;
 pub mod review_telemetry;
@@ -64,6 +65,7 @@ pub use opencode_models::{
     fetch_free_opencode_models, fetch_opencode_model_variants, fetch_opencode_models, OpencodeModel,
 };
 pub use opencode_turn::{OpencodeTurn, OpencodeTurnWatcher};
+pub use pr_labels::{parse_label_names, render_label_catalog, resolve_labels};
 pub use review_telemetry::{
     opencode_usage_for_title, review_scan_title, ReviewScanTelemetry, ReviewTokenUsage,
 };

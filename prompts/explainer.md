@@ -34,16 +34,9 @@ Create (or overwrite) `.wisetree/explain/pull_request.md` relative to the worktr
 
 ## Label selection
 
-Analyse the diff and commit log and choose **all** labels that apply from this list (use the exact strings including emoji):
+Choose 1 or 2 labels from the list below, copied character for character (emoji included). Never invent or reword one. Prefer whichever of `user story`, `bug`, `technical debt`, or `documentation` fits; add a second only when it genuinely applies. If none fits, leave the comment empty: `<!-- wisetree-labels: -->`.
 
-- `user story 💬`: a new end-user-facing feature or user-journey change
-- `bug 🐛`: fixes a defect or incorrect behaviour
-- `technical debt 🛠️`: refactoring, cleanup, or internal improvement with no user-visible change
-- `documentation 📖`: doc-only changes (README, comments, changelogs)
-- `architecture 🏰`: structural/design changes that affect how the system is built
-- `security 🛡️`: security hardening, vulnerability fixes, or auth/permission changes
-
-Multiple labels are allowed and encouraged when a PR spans several categories (e.g. a bug fix that also improves architecture). At least one label must always be chosen.
+AVAILABLE_LABELS
 
 ## Rules for the body
 

@@ -957,6 +957,80 @@ async fn submit_new_pr_passes_resolved_base_to_gh_create() {
     );
 }
 
+/// A label the repository does not have makes `gh pr create` fail and opens no
+/// PR at all, so every drafted label is resolved against `gh label list` first:
+/// a real one is passed with the repository's own spelling, an invented one is
+/// dropped.
+#[tokio::test]
+async fn submit_new_pr_only_passes_labels_the_repository_has() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let origin = parent.path().join("origin.git");
+    git(
+        parent.path(),
+        &["init", "-q", "--bare", origin.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["switch", "-q", "-c", "feat-labels"]);
+    fs::write(repo.join("f.txt"), "x\n").unwrap();
+    git(&repo, &["add", "f.txt"]);
+    git(&repo, &["commit", "-q", "-m", "feature"]);
+
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(
+        &gh_path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = \"label\" ]; then printf '[{{\"name\":\"bug 🐛\"}},{{\"name\":\"WIP 🚧\"}}]\\n'; exit 0; fi\nprintf '%s\\n' \"$*\" >> \"{log}\"\nprintf 'https://github.com/example/repo/pull/9\\n'\n",
+            log = log_path.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+
+    let service =
+        DashboardService::new(repo.clone(), DashboardConfig::default()).with_gh_binary(gh_path);
+    let request = ExplainSubmitRequest {
+        worktree_path: repo.to_string_lossy().to_string(),
+        branch: "feat-labels".to_string(),
+        number: None,
+        base_ref: None,
+        title: "My title".to_string(),
+        body: "Body".to_string(),
+        labels: vec!["bug".to_string(), "enhancement ⏫".to_string()],
+        existing_title: None,
+        existing_labels: vec![],
+    };
+    let outcome = service
+        .submit_pull_request(&request, None)
+        .await
+        .expect("submit");
+    assert!(
+        matches!(outcome, ExplainSubmitOutcome::Created { number: 9, .. }),
+        "expected a created PR, got {outcome:?}"
+    );
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log.contains("--label bug 🐛"),
+        "the repository's own spelling should reach gh, got log: {log}"
+    );
+    assert!(
+        !log.contains("enhancement"),
+        "a label this repository lacks must be dropped, got log: {log}"
+    );
+}
+
 #[tokio::test]
 async fn explain_update_preserves_split_plan_and_replaces_explanation() {
     let parent = tempfile::tempdir().unwrap();

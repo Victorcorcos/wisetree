@@ -17,7 +17,11 @@ Use the repository template, preserving its headings and order subject to the se
 PR_TEMPLATE
 
 Return exactly one JSON object and no markdown fence or commentary:
-{"title_summary":"concise stakeholder-facing summary without ticket or numbering","body_content":"the complete filled PR body, beginning with the template's Description heading"}
+{"title_summary":"concise stakeholder-facing summary without ticket or numbering","body_content":"the complete filled PR body, beginning with the template's Description heading","labels":["a label copied exactly from the list below","an optional second label"]}
+
+Fill `labels` with 1 or 2 labels from the list below, copied character for character (emoji included). Never invent or reword one. Prefer whichever of `user story`, `bug`, `technical debt`, or `documentation` this layer fits; add a second only when it genuinely applies. Return `[]` if none fits.
+
+AVAILABLE_LABELS
 
 Write the title summary in imperative mood. Begin `body_content` with exactly one Description heading. Include every applicable template section exactly once, except optional Technical Details as described below. These rules take precedence over conflicting template instructions:
 

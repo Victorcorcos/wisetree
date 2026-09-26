@@ -548,9 +548,11 @@ fn publication_progress_and_verified_stack_are_visible() {
         draft: Some(SplitDraft {
             title_summary: "Foundation".into(),
             body_content: "# Description ✍️\n\nDetails".into(),
+            labels: vec!["technical debt 🛠️".into()],
         }),
         final_title: Some("Foundation (1/2)".into()),
         final_body: Some("body".into()),
+        final_labels: vec!["technical debt 🛠️".into()],
         applied: true,
         error: None,
     }]);

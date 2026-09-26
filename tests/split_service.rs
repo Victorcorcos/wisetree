@@ -196,6 +196,7 @@ fn durable_run_and_drafting_records_drive_exact_resume() {
         draft: None,
         final_title: None,
         final_body: None,
+        final_labels: Vec::new(),
         applied: false,
         error: Some("retry this PR only".into()),
     };
@@ -306,7 +307,22 @@ fn split_draft_contract_prompt_and_title_keep_ai_out_of_bookkeeping() {
         "commit",
         "diff",
         "# Description ✍️",
+        &["bug 🐛".to_string(), "WIP 🚧".to_string()],
     );
+    // Only the fetched catalog is offered, so the draft cannot name a label
+    // this repository does not have and fail `gh pr edit --add-label`.
+    assert!(prompt.contains("- bug 🐛"));
+    assert!(prompt.contains("- WIP 🚧"));
+    assert!(!prompt.contains("AVAILABLE_LABELS"));
+    assert!(build_split_open_prompt(
+        &responsibility,
+        "DUV-4091",
+        "commit",
+        "diff",
+        "# Description ✍️",
+        &[],
+    )
+    .contains("could not be read, so select no labels at all"));
     assert!(prompt.contains("Do not create branches, commits, pushes, files"));
     assert!(prompt.contains("Do not run git or gh"));
     assert!(prompt.contains("Never use the em dash character (U+2014)"));
@@ -318,13 +334,21 @@ fn split_draft_contract_prompt_and_title_keep_ai_out_of_bookkeeping() {
     assert!(!prompt.contains("https://github.com/owner/repo/pull/41"));
 
     let draft = parse_split_draft(
-        r##"{"title_summary":"2. DUV-4091 Add the contract (9/9)","body_content":"# Description ✍️\n\nAdds the contract and explains how to test it."}"##,
+        r##"{"title_summary":"2. DUV-4091 Add the contract (9/9)","body_content":"# Description ✍️\n\nAdds the contract and explains how to test it.","labels":["bug 🐛"]}"##,
     )
     .unwrap();
     assert_eq!(
         final_split_title("duv4091_change", &draft.title_summary, 2, 3).unwrap(),
         "DUV-4091 Add the contract (2/3)"
     );
+    assert_eq!(draft.labels, vec!["bug 🐛".to_string()]);
+    // A draft cached before labels joined the contract still parses.
+    assert!(parse_split_draft(
+        r##"{"title_summary":"x","body_content":"# Description ✍️\n\nProse."}"##
+    )
+    .unwrap()
+    .labels
+    .is_empty());
     assert!(parse_split_draft(
         r##"{"title_summary":"x","body_content":"# Description ✍️\n\nSee https://example.test"}"##
     )
@@ -1331,9 +1355,11 @@ fn draft_cache_identity_scopes_a_retry_to_the_incomplete_pull_request() {
         draft: Some(SplitDraft {
             title_summary: "Add the consumer".into(),
             body_content: "# Description ✍️\n\nDetails".into(),
+            labels: vec!["user story 💬".into()],
         }),
         final_title: Some("Add the consumer (2/2)".into()),
         final_body: Some("body".into()),
+        final_labels: vec!["user story 💬".into()],
         applied: false,
         error: Some("gh pr edit: server error".into()),
     };

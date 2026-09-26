@@ -85,6 +85,10 @@ const BASE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// read-only but can be large on a long branch; push + `gh pr create/edit`
 /// talk to the network.
 const EXPLAIN_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on the shared `gh label list` read that feeds the PR-command prompts
+/// their label catalog. One small page, so a short leash keeps a stalled `gh`
+/// from holding up Explain or Split drafting.
+const LABEL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const EXPLAIN_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 const EXPLAIN_SUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
 const SPLIT_DRAFT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -2850,6 +2854,35 @@ impl DashboardService {
         }
     }
 
+    /// The labels this repository actually has, newest `gh` page first, shared
+    /// by the Explain and Split prompts and by the validation that runs before
+    /// a label reaches `gh`.
+    ///
+    /// Best-effort on purpose: a missing `gh`, an auth failure, a timeout, or a
+    /// repository without labels all yield an empty catalog. An empty catalog
+    /// tells the AI to pick nothing and drops every choice it made anyway,
+    /// which costs the PR its labels instead of failing `gh pr create` on a
+    /// label that does not exist.
+    async fn fetch_repo_labels(&self, cwd: &Path, repo: Option<&str>) -> Vec<String> {
+        if !self.gh_available {
+            return Vec::new();
+        }
+        let mut args = vec!["label", "list", "--limit", "100", "--json", "name"];
+        if let Some(repo) = repo {
+            args.extend(["--repo", repo]);
+        }
+        match with_timeout(
+            "gh label list",
+            LABEL_FETCH_TIMEOUT,
+            run_gh_command(&self.gh_binary, &args, Some(cwd)),
+        )
+        .await
+        {
+            Ok(Ok(raw)) => crate::services::pr_labels::parse_label_names(&raw),
+            _ => Vec::new(),
+        }
+    }
+
     /// Read-only preparation for the "Explain Pull Request" flow. Gathers the
     /// commit log + diff against `base_ref`, extracts the ticket from the
     /// branch name, reads the repo's PR template (falling back to the
@@ -2897,8 +2930,10 @@ impl DashboardService {
         tokio::fs::create_dir_all(cwd.join(".wisetree/explain")).await?;
         let ticket = extract_ticket(branch).unwrap_or_default();
         let template = read_pr_template(&cwd).await;
-        let prompt =
-            build_explain_prompt(base_ref, branch, &ticket, &git_log, &git_diff, &template);
+        let labels = self.fetch_repo_labels(&cwd, None).await;
+        let prompt = build_explain_prompt(
+            base_ref, branch, &ticket, &git_log, &git_diff, &template, &labels,
+        );
 
         let command = self
             .ai_command(
@@ -2943,6 +2978,11 @@ impl DashboardService {
         } = params;
         self.require_gh()?;
         let cwd = PathBuf::from(worktree_path);
+        // The prompt handed the AI this repository's catalog, but a reworded or
+        // remembered label would make `gh` reject the whole pull request, so
+        // every choice is resolved against the real labels before it is passed.
+        let catalog = self.fetch_repo_labels(&cwd, None).await;
+        let labels = crate::services::pr_labels::resolve_labels(labels, &catalog);
 
         let emit = |text: &str| {
             if let Some(tx) = activity {
@@ -2985,7 +3025,7 @@ impl DashboardService {
                     "@me".into(),
                 ]);
                 if !skip_labels {
-                    for label in labels {
+                    for label in &labels {
                         edit_args.push("--add-label".into());
                         edit_args.push(label.clone());
                     }
@@ -3072,7 +3112,7 @@ impl DashboardService {
                     create_args.push(base_branch.into());
                 }
                 create_args.extend(["--assignee".into(), "@me".into()]);
-                for label in labels {
+                for label in &labels {
                     create_args.push("--label".into());
                     create_args.push(label.clone());
                 }
@@ -6437,6 +6477,11 @@ impl DashboardService {
         tokio::fs::create_dir_all(source.join(SPLIT_DRAFT_DIRECTORY)).await?;
         let template = read_pr_template(source).await;
         let ticket = split_ticket(&preflight.identity.source_branch).unwrap_or_default();
+        // One catalog read for the whole stack: it feeds every layer's prompt
+        // and resolves every layer's choice back to a label the repository has.
+        let label_catalog = self
+            .fetch_repo_labels(source, Some(&preflight.identity.repository))
+            .await;
         let mut records = Vec::with_capacity(publication.pull_requests.len());
         let mut requests = Vec::new();
         for (index, pull_request) in publication.pull_requests.iter().enumerate() {
@@ -6530,10 +6575,18 @@ impl DashboardService {
                 draft: None,
                 final_title: None,
                 final_body: None,
+                final_labels: Vec::new(),
                 applied: false,
                 error: None,
             };
-            let prompt = build_split_open_prompt(responsibility, &ticket, &log, &diff, &template);
+            let prompt = build_split_open_prompt(
+                responsibility,
+                &ticket,
+                &log,
+                &diff,
+                &template,
+                &label_catalog,
+            );
             requests.push(SplitDraftRequest {
                 record,
                 prompt,
@@ -6610,6 +6663,8 @@ impl DashboardService {
                 &publication.pull_requests,
                 record.order,
             )?);
+            record.final_labels =
+                crate::services::pr_labels::resolve_labels(&draft.labels, &label_catalog);
             self.save_split_draft_record(preflight, record).await?;
         }
 
@@ -6830,7 +6885,7 @@ impl DashboardService {
         let body = record.final_body.as_deref().expect("validated final body");
         let view = run_command(
             &self.gh_binary,
-            &["pr", "view", &record.pr_url, "--json", "title,body"],
+            &["pr", "view", &record.pr_url, "--json", "title,body,labels"],
             Some(Path::new(&preflight.worktree_path)),
         )
         .await;
@@ -6839,31 +6894,52 @@ impl DashboardService {
                 .map_err(|error| format!("invalid current PR metadata: {error}"))
                 .map(|current| {
                     let preserved = preserve_media(&current.body, body);
-                    if current.title == title && current.body == preserved {
+                    // Only the labels GitHub does not already carry, so a
+                    // resumed run stays a no-op instead of re-editing the PR.
+                    let missing = record
+                        .final_labels
+                        .iter()
+                        .filter(|label| {
+                            !current
+                                .labels
+                                .iter()
+                                .any(|current| current.name.eq_ignore_ascii_case(label))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if current.title == title && current.body == preserved && missing.is_empty() {
                         None
                     } else {
-                        Some(preserved)
+                        Some((preserved, missing))
                     }
                 }),
             Err(error) => Err(error),
         };
         let result = match result {
             Ok(None) => Ok(()),
-            Ok(Some(preserved_body)) => run_command(
-                &self.gh_binary,
-                &[
-                    "pr",
-                    "edit",
-                    &record.pr_url,
-                    "--title",
-                    title,
-                    "--body",
-                    &preserved_body,
-                ],
-                Some(Path::new(&preflight.worktree_path)),
-            )
-            .await
-            .map(|_| ()),
+            Ok(Some((preserved_body, missing_labels))) => {
+                let mut args = vec![
+                    "pr".to_string(),
+                    "edit".to_string(),
+                    record.pr_url.clone(),
+                    "--title".to_string(),
+                    title.to_string(),
+                    "--body".to_string(),
+                    preserved_body,
+                ];
+                for label in missing_labels {
+                    args.push("--add-label".to_string());
+                    args.push(label);
+                }
+                let args_ref = args.iter().map(String::as_str).collect::<Vec<_>>();
+                run_command(
+                    &self.gh_binary,
+                    &args_ref,
+                    Some(Path::new(&preflight.worktree_path)),
+                )
+                .await
+                .map(|_| ())
+            }
             Err(error) => Err(error),
         };
         match result {
@@ -8577,6 +8653,8 @@ struct SplitCurrentMetadata {
     title: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    labels: Vec<GhLabelNode>,
 }
 
 fn split_ticket(branch: &str) -> Option<String> {
@@ -9741,6 +9819,7 @@ fn build_explain_prompt(
     git_log: &str,
     git_diff: &str,
     template: &str,
+    labels: &[String],
 ) -> String {
     const EXPLAINER_PROMPT: &str = include_str!("../../prompts/explainer.md");
     let diff = truncate_for_prompt(git_diff, EXPLAIN_DIFF_MAX_BYTES);
@@ -9748,6 +9827,10 @@ fn build_explain_prompt(
         .replace("BASE_REF", base_ref)
         .replace("CURRENT_BRANCH", branch)
         .replace("TICKET", ticket)
+        .replace(
+            "AVAILABLE_LABELS",
+            &crate::services::pr_labels::render_label_catalog(labels),
+        )
         .replace("PR_TEMPLATE", template)
         .replace("GIT_LOG", git_log)
         .replace("GIT_DIFF", &diff)
@@ -18958,20 +19041,60 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
             "### Add retry\n\nbody",
             "diff --git a/x b/x",
             "# Description ✍️",
+            &["bug 🐛".to_string()],
         );
         assert!(!prompt.contains("BASE_REF"));
         assert!(!prompt.contains("GIT_DIFF"));
         assert!(!prompt.contains("GIT_LOG"));
         assert!(!prompt.contains("PR_TEMPLATE"));
+        assert!(!prompt.contains("AVAILABLE_LABELS"));
         assert!(prompt.contains("upstream/main"));
         assert!(prompt.contains("DIGIT-3131"));
         assert!(prompt.contains("diff --git a/x b/x"));
     }
 
+    /// Only the repository's own labels reach the prompt: the fixed list the
+    /// explainer used to carry is what made the AI pick labels this repository
+    /// does not have, which failed `gh pr create`.
+    #[test]
+    fn build_explain_prompt_offers_only_the_fetched_labels() {
+        let prompt = build_explain_prompt(
+            "main",
+            "fix",
+            "",
+            "Fix",
+            "diff",
+            EXPLAIN_TEMPLATE_FALLBACK,
+            &["bug 🐛".to_string(), "spike 🕸️".to_string()],
+        );
+        assert!(prompt.contains("- bug 🐛"));
+        assert!(prompt.contains("- spike 🕸️"));
+        assert!(!prompt.contains("architecture 🏰"));
+        assert!(!prompt.contains("security 🛡️"));
+
+        let unknown = build_explain_prompt(
+            "main",
+            "fix",
+            "",
+            "Fix",
+            "diff",
+            EXPLAIN_TEMPLATE_FALLBACK,
+            &[],
+        );
+        assert!(unknown.contains("could not be read, so select no labels at all"));
+    }
+
     #[test]
     fn build_explain_prompt_includes_concise_writing_and_section_rules() {
-        let prompt =
-            build_explain_prompt("main", "fix", "", "Fix", "diff", EXPLAIN_TEMPLATE_FALLBACK);
+        let prompt = build_explain_prompt(
+            "main",
+            "fix",
+            "",
+            "Fix",
+            "diff",
+            EXPLAIN_TEMPLATE_FALLBACK,
+            &[],
+        );
         assert!(prompt.contains("Never use the em dash character (U+2014)"));
         assert!(prompt.contains("usually 2 to 4 sentences"));
         assert!(prompt.contains("Reserve `# Overview` exclusively for screenshots"));
