@@ -3164,7 +3164,7 @@ impl DashboardService {
         }
         let cwd = PathBuf::from(worktree_path);
 
-        // Sync the branch with its origin counterpart so fixes land on the
+        // Sync the branch with its configured remote so fixes land on the
         // latest PR state and the final push updates the branch reviewers see.
         if let Err(err) = sync_pr_branch(&self.git_binary, &cwd, FIX_SYNC_TIMEOUT).await {
             return Ok(FixPreparation::SyncFailed(err));
@@ -3656,7 +3656,7 @@ impl DashboardService {
         }
         let cwd = PathBuf::from(worktree_path);
 
-        // Sync the branch with its origin counterpart so the AI reads worktree
+        // Sync the branch with its configured remote so the AI reads worktree
         // files matching the PR head it is reviewing.
         if let Err(err) = sync_pr_branch(&self.git_binary, &cwd, REVIEW_SYNC_TIMEOUT).await {
             return Ok(ReviewPreparation::SyncFailed(err));
@@ -9602,27 +9602,57 @@ async fn current_branch_name(git_binary: &Path, cwd: &Path) -> Option<String> {
     .filter(|s| !s.is_empty() && s != "HEAD")
 }
 
-/// Fetch and merge exactly the checked-out PR branch from origin. Keeping the
-/// merge separate prevents duplicate or stale `branch.<name>.merge` values
-/// from making `git pull` select multiple merge heads.
+/// Fetch and merge the checked-out PR branch from its configured remote,
+/// including the fork URLs recorded by `gh pr checkout`. An untracked branch
+/// falls back to the same branch on origin. Keeping the merge separate prevents
+/// duplicate or stale `branch.<name>.merge` values from selecting multiple heads.
 async fn sync_pr_branch(
     git_binary: &Path,
     cwd: &Path,
     timeout: Duration,
 ) -> std::result::Result<(), String> {
-    let branch = current_branch_name(git_binary, cwd).await.ok_or_else(|| {
-        "could not resolve the checked-out branch for synchronization.".to_string()
-    })?;
-    let tracking_ref = format!("refs/remotes/origin/{branch}");
-    let refspec = format!("+refs/heads/{branch}:{tracking_ref}");
     time::timeout(timeout, async {
-        run_command(git_binary, &["fetch", "origin", &refspec], Some(cwd)).await?;
-        run_command(
+        let branch = current_branch_name(git_binary, cwd).await.ok_or_else(|| {
+            "could not resolve the checked-out branch for synchronization.".to_string()
+        })?;
+        let remote = run_command(
             git_binary,
-            &["merge", "--ff-only", &tracking_ref],
+            &["config", "--get", &format!("branch.{branch}.remote")],
             Some(cwd),
         )
-        .await?;
+        .await
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "origin".to_string());
+        let configured_refs = run_command(
+            git_binary,
+            &["config", "--get-all", &format!("branch.{branch}.merge")],
+            Some(cwd),
+        )
+        .await
+        .unwrap_or_default();
+        let mut merge_refs = configured_refs
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        merge_refs.sort_unstable();
+        merge_refs.dedup();
+        let own_ref = format!("refs/heads/{branch}");
+        let source_ref = match merge_refs.as_slice() {
+            [] => own_ref.as_str(),
+            [only] => only,
+            multiple if multiple.contains(&own_ref.as_str()) => own_ref.as_str(),
+            _ => {
+                return Err(
+                    "could not resolve a single PR branch from the configured merge targets."
+                        .to_string(),
+                )
+            }
+        };
+        // No destination ref: a URL remote need not have a tracking namespace,
+        // and fetching from a fork must never write into origin's namespace.
+        run_command(git_binary, &["fetch", remote.trim(), source_ref], Some(cwd)).await?;
+        run_command(git_binary, &["merge", "--ff-only", "FETCH_HEAD"], Some(cwd)).await?;
         Ok::<(), String>(())
     })
     .await
@@ -17356,6 +17386,159 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
                 .as_deref(),
             Some("upstream/main")
         );
+    }
+
+    #[tokio::test]
+    async fn sync_pr_branch_uses_checkout_remote_and_remote_branch() {
+        // `gh pr checkout` can record a fork URL directly in branch.remote,
+        // without adding a named remote or a remote-tracking ref.
+        for named_remote in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let origin = dir.path().join("origin.git");
+            let fork = dir.path().join("fork.git");
+            let author = dir.path().join("author");
+            let reviewer = dir.path().join("reviewer");
+            let worktree = dir.path().join("review-worktree");
+            git(
+                dir.path(),
+                &["init", "-q", "--bare", origin.to_str().unwrap()],
+            );
+            git(
+                dir.path(),
+                &["init", "-q", "--bare", fork.to_str().unwrap()],
+            );
+            git(dir.path(), &["init", "-q", author.to_str().unwrap()]);
+            std::fs::write(author.join("file.txt"), "initial\n").unwrap();
+            git(&author, &["add", "."]);
+            git(&author, &["commit", "-q", "-m", "initial"]);
+            git(&author, &["remote", "add", "fork", fork.to_str().unwrap()]);
+            git(
+                &author,
+                &["push", "-q", "fork", "HEAD:refs/heads/fix/feature"],
+            );
+            git(dir.path(), &["init", "-q", reviewer.to_str().unwrap()]);
+            git(
+                &reviewer,
+                &["remote", "add", "origin", origin.to_str().unwrap()],
+            );
+            git(
+                &reviewer,
+                &[
+                    "fetch",
+                    "-q",
+                    fork.to_str().unwrap(),
+                    "refs/heads/fix/feature",
+                ],
+            );
+            git(
+                &reviewer,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "review-local",
+                    worktree.to_str().unwrap(),
+                    "FETCH_HEAD",
+                ],
+            );
+            let remote = if named_remote {
+                git(
+                    &reviewer,
+                    &["remote", "add", "anderson", fork.to_str().unwrap()],
+                );
+                "anderson"
+            } else {
+                fork.to_str().unwrap()
+            };
+            git(&worktree, &["config", "branch.review-local.remote", remote]);
+            git(
+                &worktree,
+                &[
+                    "config",
+                    "branch.review-local.merge",
+                    "refs/heads/fix/feature",
+                ],
+            );
+            std::fs::write(author.join("file.txt"), "updated PR\n").unwrap();
+            git(&author, &["add", "."]);
+            git(&author, &["commit", "-q", "-m", "advance PR"]);
+            git(
+                &author,
+                &["push", "-q", "fork", "HEAD:refs/heads/fix/feature"],
+            );
+
+            sync_pr_branch(Path::new("git"), &worktree, Duration::from_secs(60))
+                .await
+                .expect("sync from the fork configured by checkout");
+            assert_eq!(
+                git(&worktree, &["rev-parse", "HEAD"]),
+                git(&author, &["rev-parse", "HEAD"])
+            );
+            assert_eq!(
+                git(&worktree, &["branch", "--show-current"]),
+                "review-local"
+            );
+            assert_eq!(
+                std::fs::read_to_string(worktree.join("file.txt")).unwrap(),
+                "updated PR\n"
+            );
+            assert!(
+                !ref_is_reachable(
+                    Path::new("git"),
+                    &worktree,
+                    "refs/remotes/origin/review-local"
+                )
+                .await
+            );
+
+            // Divergent local changes must survive a failed fast-forward.
+            std::fs::write(worktree.join("local.txt"), "local work\n").unwrap();
+            git(&worktree, &["add", "local.txt"]);
+            git(&worktree, &["commit", "-q", "-m", "local change"]);
+            let local_head = git(&worktree, &["rev-parse", "HEAD"]);
+            std::fs::write(author.join("file.txt"), "next PR update\n").unwrap();
+            git(&author, &["add", "."]);
+            git(&author, &["commit", "-q", "-m", "advance again"]);
+            git(
+                &author,
+                &["push", "-q", "fork", "HEAD:refs/heads/fix/feature"],
+            );
+            assert!(
+                sync_pr_branch(Path::new("git"), &worktree, Duration::from_secs(60))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), local_head);
+            assert_eq!(
+                std::fs::read_to_string(worktree.join("local.txt")).unwrap(),
+                "local work\n"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_pr_branch_falls_back_to_origin_without_tracking_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("origin.git");
+        let work = dir.path().join("work");
+        git(
+            dir.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        );
+        git(dir.path(), &["init", "-q", work.to_str().unwrap()]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/feature"]);
+        std::fs::write(work.join("file.txt"), "initial\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "initial"]);
+        git(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&work, &["push", "-q", "origin", "feature"]);
+        sync_pr_branch(Path::new("git"), &work, Duration::from_secs(60))
+            .await
+            .expect("untracked branch still syncs from origin");
     }
 
     // Hermetic git helper: never depend on the machine's global identity/config.
