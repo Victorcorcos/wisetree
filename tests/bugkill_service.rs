@@ -638,7 +638,7 @@ async fn bugkill_threads_original_and_feedback_images_without_leaking_feedback()
         fs::write(
             &judge_binary,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.214'; exit 0; fi\nprintf '%s\\n' \"$@\" > '{}'\necho '==== VERDICT ===='\necho 'RESULT: NOT_FIXED'\necho 'REASON: still broken'\necho '==== END ===='\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.214'; exit 0; fi\nprintf '%s\\n' \"$@\" > '{0}'\ncat >> '{0}'\necho '==== VERDICT ===='\necho 'RESULT: NOT_FIXED'\necho 'REASON: still broken'\necho '==== END ===='\n",
                 judge_args.display()
             ),
         )

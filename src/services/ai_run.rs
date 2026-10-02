@@ -1,9 +1,10 @@
 //! Provider-neutral AI command construction and captured execution.
 //!
-//! Prompts are always passed with `Command::arg`, never a shell, so content is
-//! preserved verbatim regardless of quotes, substitutions, backticks, or newlines.
+//! Captured prompts are delivered through stdin to avoid OS argument limits.
+//! Interactive prompts use `Command::arg`. Neither route evaluates shell syntax.
 
 use std::collections::VecDeque;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -83,6 +84,8 @@ pub struct AiCommand {
     pub binary: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    /// Complete captured prompt, kept out of the process argument list.
+    pub stdin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +166,7 @@ impl AiRunner {
                 args
             }
             (AiHarness::OpenCode, AiRunMode::Captured) => {
-                let mut args = vec!["run".into(), prompt.clone(), "-m".into(), model];
+                let mut args = vec!["run".into(), "-m".into(), model];
                 if request.permission == AiPermission::Plan {
                     args.extend(["--agent".into(), "plan".into()]);
                 }
@@ -204,7 +207,7 @@ impl AiRunner {
                     "--dangerously-bypass-approvals-and-sandbox".into(),
                     "--model".into(),
                     model,
-                    prompt.clone(),
+                    "-".into(),
                 ];
                 if !effort.is_empty() {
                     args.extend([
@@ -230,7 +233,6 @@ impl AiRunner {
                 let mut args = vec![
                     "-p".into(),
                     "--dangerously-skip-permissions".into(),
-                    prompt.clone(),
                     "--model".into(),
                     model,
                     "--output-format".into(),
@@ -247,13 +249,11 @@ impl AiRunner {
                 args.extend([flag.to_string(), attachment.to_string_lossy().to_string()]);
             }
         }
-        // Keep the prompt as the sole textual payload argument. The individual CLI
-        // syntaxes above intentionally place it directly after their prompt flag.
-        debug_assert!(args.iter().any(|arg| arg == &prompt));
         Ok(AiCommand {
             binary,
             args: std::mem::take(&mut args),
             cwd: request.cwd.clone(),
+            stdin: (request.mode == AiRunMode::Captured).then_some(prompt),
         })
     }
 
@@ -324,10 +324,30 @@ impl AiRunner {
         cancel: &mut oneshot::Receiver<()>,
     ) -> Result<AiCapturedRun> {
         let command = self.preflight(request).await?;
+        let stdin = if let Some(prompt) = &command.stdin {
+            // An anonymous temporary file delivers the full prompt and EOF
+            // without a pipe writer that could block timeout or cancellation.
+            let file = tempfile::tempfile()
+                .and_then(|mut file| {
+                    file.write_all(prompt.as_bytes())?;
+                    file.rewind()?;
+                    Ok(file)
+                })
+                .map_err(|error| {
+                    self.error(
+                        request,
+                        AiErrorCode::Failed,
+                        format!("could not prepare CLI prompt: {error}"),
+                    )
+                })?;
+            Stdio::from(file)
+        } else {
+            Stdio::null()
+        };
         let mut child = Command::new(&command.binary)
             .args(&command.args)
             .current_dir(&command.cwd)
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -461,8 +481,8 @@ fn attachment_delivery(harness: AiHarness, mode: AiRunMode) -> AttachmentDeliver
     }
 }
 
-/// Append the attachment paths as a readable trailer. The prompt stays a
-/// single literal argument and never carries image bytes.
+/// Append the attachment paths as a readable trailer. The prompt never
+/// carries image bytes.
 fn append_attachment_paths(prompt: &str, attachments: &[PathBuf], mention: &str) -> String {
     if attachments.is_empty() {
         return prompt.to_string();
@@ -801,6 +821,39 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captured_prompts_larger_than_argument_limits_reach_every_harness_verbatim() {
+        for harness in [AiHarness::OpenCode, AiHarness::Codex, AiHarness::ClaudeCode] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cli = fake_cli(
+                tmp.path(),
+                "printf '%s\\n' \"$@\" > arguments\ncat > received-prompt\necho reviewed\n",
+            );
+            let runner = AiRunner::default().with_binary(harness, cli);
+            let mut req = captured_request(harness, tmp.path());
+            // Exceeds macOS ARG_MAX and Linux's per-argument limit. Include
+            // Unicode, shell syntax and trailing newlines to catch rewrites.
+            req.prompt = "é \"$HOME\" `now` $(touch should-not-run)\n".repeat(50_000);
+            let (_cancel_tx, cancel) = oneshot::channel();
+            let run = runner.run_captured(&req, None, cancel).await.unwrap();
+
+            assert_eq!(run.transcript, "reviewed");
+            assert_eq!(
+                std::fs::read(tmp.path().join("received-prompt")).unwrap(),
+                req.prompt.as_bytes(),
+                "{harness:?} must receive the complete prompt through stdin"
+            );
+            assert!(
+                std::fs::metadata(tmp.path().join("arguments"))
+                    .unwrap()
+                    .len()
+                    < 1024
+            );
+            assert!(!tmp.path().join("should-not-run").exists());
+        }
+    }
+
     /// The observed failure: every captured scan hits a usage-limited CLI.
     /// Each harness must wait out its backoff and resume instead of
     /// returning a hard failure to the pipeline.
@@ -926,19 +979,16 @@ mod tests {
     }
 
     #[test]
-    fn each_harness_builds_a_single_literal_prompt_argument() {
+    fn each_harness_keeps_captured_prompts_out_of_arguments() {
         for harness in [AiHarness::OpenCode, AiHarness::Codex, AiHarness::ClaudeCode] {
             let runner = AiRunner::default().with_binary(harness, PathBuf::from("true"));
             let req = request(harness, AiRunMode::Captured);
             let command = runner.command(&req).unwrap();
-            assert_eq!(
-                command
-                    .args
-                    .iter()
-                    .filter(|arg| *arg == &req.prompt)
-                    .count(),
-                1
-            );
+            assert_eq!(command.stdin.as_deref(), Some(req.prompt.as_str()));
+            assert!(!command.args.iter().any(|arg| arg == &req.prompt));
+            if harness == AiHarness::Codex {
+                assert!(command.args.iter().any(|arg| arg == "-"));
+            }
         }
     }
 
@@ -960,11 +1010,11 @@ mod tests {
             let mut req = request(harness, mode);
             req.attachments = vec![PathBuf::from("/tmp/screenshot.png")];
             let command = runner.command(&req).unwrap();
-            let prompt_arg = command
-                .args
-                .iter()
-                .find(|arg| arg.starts_with(&req.prompt))
-                .expect("the prompt is always one argument");
+            let prompt = command
+                .stdin
+                .as_ref()
+                .or_else(|| command.args.iter().find(|arg| arg.starts_with(&req.prompt)))
+                .expect("the prompt is delivered through stdin or one argument");
 
             match flag {
                 Some(flag) => {
@@ -976,7 +1026,7 @@ mod tests {
                         "{harness:?}/{mode:?} should attach with {flag}"
                     );
                     // A native flag carries the image, so the prompt is untouched.
-                    assert_eq!(prompt_arg, &req.prompt);
+                    assert_eq!(prompt, &req.prompt);
                 }
                 None => {
                     assert!(
@@ -995,7 +1045,7 @@ mod tests {
                         "/tmp/screenshot.png"
                     };
                     assert!(
-                        prompt_arg.contains(expected),
+                        prompt.contains(expected),
                         "{harness:?}/{mode:?} must reference the image as {expected}"
                     );
                 }
@@ -1010,7 +1060,12 @@ mod tests {
                 let runner = AiRunner::default().with_binary(harness, PathBuf::from("true"));
                 let req = request(harness, mode);
                 let command = runner.command(&req).unwrap();
-                assert!(command.args.iter().any(|arg| arg == &req.prompt));
+                if mode == AiRunMode::Captured {
+                    assert_eq!(command.stdin.as_deref(), Some(req.prompt.as_str()));
+                } else {
+                    assert!(command.args.iter().any(|arg| arg == &req.prompt));
+                    assert!(command.stdin.is_none());
+                }
             }
         }
     }
@@ -1025,13 +1080,18 @@ mod tests {
                 let mut req = request(harness, mode);
                 req.attachments = vec![attachment.clone()];
                 let command = runner.command(&req).unwrap();
-                // Either the flag's value or the prompt trailer holds the path
-                // verbatim, and in both cases it is one argv entry — the `;`
-                // can never be seen by a shell.
-                assert!(command
-                    .args
-                    .iter()
-                    .any(|arg| arg == &path || arg.contains(&path)));
+                // The flag's value or prompt trailer holds the path verbatim;
+                // neither route evaluates the shell syntax in the filename.
+                assert!(
+                    command
+                        .args
+                        .iter()
+                        .any(|arg| arg == &path || arg.contains(&path))
+                        || command
+                            .stdin
+                            .as_ref()
+                            .is_some_and(|prompt| prompt.contains(&path))
+                );
             }
         }
     }

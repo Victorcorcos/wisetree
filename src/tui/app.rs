@@ -17885,6 +17885,7 @@ mod tests {
                     binary,
                     args: Vec::new(),
                     cwd: repo.clone(),
+                    stdin: None,
                 },
                 harness: AiHarness::OpenCode,
             };
@@ -17932,6 +17933,7 @@ mod tests {
                     binary,
                     args: Vec::new(),
                     cwd: repo.clone(),
+                    stdin: None,
                 },
                 harness: AiHarness::OpenCode,
             };
