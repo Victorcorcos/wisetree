@@ -5,7 +5,8 @@
 //! posts the approved ones as PR comments. State machine:
 //!
 //! - `Confirm`   : explanation panel + `ConfirmationModal` (Yes/No, **No**
-//!   default). Enter on Yes returns `ReviewAction::Confirmed`.
+//!   default) + the **Humane** voice toggle (Space). Enter on Yes returns
+//!   `ReviewAction::Confirmed`.
 //! - `Working`   : a quiet spinner + step toast for the captured/deterministic
 //!   phases the `App` drives (syncing + fetching the diff, posting a comment,
 //!   revising a finding, submitting the summary). The multi-pass scan instead
@@ -58,6 +59,7 @@ use crate::services::dashboard::{
     split_run_duplicate_findings, ReviewContext, ReviewFile, ReviewFileGroup, ReviewFinding,
     ReviewGroupProfile, ReviewScanMode, ReviewSeverity, ReviewSkippedFile, ReviewVerification,
 };
+use crate::services::review_humane::{ReviewVoice, HUMANIZE_BATCH_SIZE};
 use crate::services::review_telemetry::{review_telemetry_label, ReviewScanTelemetry};
 use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::{ImproveRequest, ReviewPullRequestRequest};
@@ -66,7 +68,7 @@ use crate::tui::widgets::spinner::spinner_frame;
 use crate::tui::widgets::{
     abort_run_modal, labeled_line, render_scrollable_summary_table, summary_row_counts, AiRoleRow,
     ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, InputOutcome, InputPrompt,
-    PrConfirmView, Status, StatusIndicator, SummaryRow,
+    OptionsGroup, OptionsGroupItem, PrConfirmView, Status, StatusIndicator, SummaryRow,
 };
 
 /// First synthetic `file_index` for coverage-group scans. Further groups use
@@ -328,6 +330,10 @@ pub struct ReviewPullRequestScreen {
     posted: Vec<ReviewFinding>,
     /// The deterministic summary markdown, built when the walkthrough ends.
     summary_body: String,
+    /// How comments and the summary are worded; toggled on Confirm.
+    voice: ReviewVoice,
+    /// Humanize batches still in flight before the walkthrough can show.
+    humanize_outstanding: usize,
     /// Markdown editor open on `EditSummary`.
     summary_input: Option<InputPrompt>,
     decision_button: DecisionButton,
@@ -424,6 +430,12 @@ impl ReviewPullRequestScreen {
             current: 0,
             posted: Vec::new(),
             summary_body: String::new(),
+            // Improve fixes findings locally; nothing it shows gets posted.
+            voice: match workflow {
+                ReviewWorkflow::Review => ReviewVoice::default(),
+                ReviewWorkflow::Improve => ReviewVoice::Robotic,
+            },
+            humanize_outstanding: 0,
             summary_input: None,
             decision_button: DecisionButton::Post,
             decision_button_rects: Cell::new([Rect::default(); 5]),
@@ -479,6 +491,9 @@ impl ReviewPullRequestScreen {
     }
     pub fn is_improve(&self) -> bool {
         self.workflow == ReviewWorkflow::Improve
+    }
+    pub fn voice(&self) -> ReviewVoice {
+        self.voice
     }
     pub fn findings_len(&self) -> usize {
         self.findings.len()
@@ -845,6 +860,11 @@ impl ReviewPullRequestScreen {
 
     pub fn record_scan_telemetry(&mut self, telemetry: ReviewScanTelemetry) {
         self.scan_telemetry.push(telemetry);
+    }
+
+    #[cfg(test)]
+    pub fn set_voice(&mut self, voice: ReviewVoice) {
+        self.voice = voice;
     }
 
     #[cfg(test)]
@@ -1272,6 +1292,51 @@ impl ReviewPullRequestScreen {
         self.scanning = false;
     }
 
+    // ── humane voice ────────────────────────────────────────────────────
+
+    /// Split every finding into humanize batches and hold on Working until
+    /// they all return. Each batch is `(finding indices, findings)`.
+    pub fn start_humanizing(&mut self) -> Vec<(Vec<usize>, Vec<ReviewFinding>)> {
+        let batches: Vec<(Vec<usize>, Vec<ReviewFinding>)> = self
+            .findings
+            .chunks(HUMANIZE_BATCH_SIZE)
+            .enumerate()
+            .map(|(batch, chunk)| {
+                let first = batch * HUMANIZE_BATCH_SIZE;
+                ((first..first + chunk.len()).collect(), chunk.to_vec())
+            })
+            .collect();
+        self.begin_humanizing(batches.len());
+        batches
+    }
+
+    fn begin_humanizing(&mut self, batches: usize) {
+        self.humanize_outstanding = batches;
+        self.step = ReviewStep::Working;
+        self.phase_message = "Rewriting the comments in a reviewer's voice...".to_string();
+        self.scanning = false;
+    }
+
+    /// Apply one humanize batch: each rewritten comment replaces its
+    /// finding's explanation; a missing one (or a failed batch, `None`)
+    /// keeps the original. Returns `true` once the last batch is in.
+    pub fn record_humanized(
+        &mut self,
+        indices: &[usize],
+        rewritten: Option<Vec<Option<String>>>,
+    ) -> bool {
+        if self.humanize_outstanding == 0 {
+            return false;
+        }
+        for (index, text) in indices.iter().zip(rewritten.unwrap_or_default()) {
+            if let (Some(finding), Some(text)) = (self.findings.get_mut(*index), text) {
+                finding.explanation = text;
+            }
+        }
+        self.humanize_outstanding -= 1;
+        self.humanize_outstanding == 0
+    }
+
     /// Open the markdown editor on the current summary body.
     fn show_summary_editor(&mut self) {
         self.summary_input = Some(
@@ -1415,6 +1480,12 @@ impl ReviewPullRequestScreen {
         }
         match self.step {
             ReviewStep::Confirm => {
+                // Space flips the voice toggle before the modal sees the key
+                // (the modal never reacts to Space).
+                if matches!(key.code, KeyCode::Char(' ')) && !self.is_improve() {
+                    self.voice = self.voice.toggled();
+                    return ReviewAction::Continue;
+                }
                 let Some(dialog) = self.confirm.as_mut() else {
                     return ReviewAction::Cancelled;
                 };
@@ -1933,10 +2004,24 @@ impl ReviewPullRequestScreen {
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
+        let humane = self.voice == ReviewVoice::Humane;
+        let (steps, description) = if humane {
+            (
+                &HUMANE_REVIEW_STEPS,
+                "comments and summary read like a teammate wrote them; off = structured format \
+                 with badges, table and charts.",
+            )
+        } else {
+            (
+                &REVIEW_STEPS,
+                "off: structured comments with category/severity badges and a summary table \
+                 with charts; on = written like a teammate.",
+            )
+        };
         PrConfirmView::new(format!("Review Pull Request #{}?", self.request.number))
             .title_color(colors::NAVY)
             .block(build_detail_lines(&self.request))
-            .steps(&REVIEW_STEPS)
+            .steps(steps)
             .ai_roles(vec![
                 AiRoleRow::from_config("strong", colors::DARK_NAVY, &self.ai.strong, "Read-only"),
                 AiRoleRow::from_config("balanced", colors::NAVY, &self.ai.balanced, "Read-only"),
@@ -1947,6 +2032,10 @@ impl ReviewPullRequestScreen {
                     "Read-only",
                 ),
             ])
+            .options(Some(
+                OptionsGroup::new(vec![OptionsGroupItem::new(humane, "Humane", description)])
+                    .with_hint("Toggle"),
+            ))
             .modal(self.confirm.as_ref())
             .render(frame, area);
     }
@@ -2372,7 +2461,7 @@ impl ReviewPullRequestScreen {
             )));
         let inner = block.inner(chunks[1]);
         let lines = match finding {
-            Some(finding) => build_comment_preview_lines(finding, inner.width as usize),
+            Some(finding) => build_comment_preview_lines(finding, self.voice, inner.width as usize),
             None => vec![Line::from(Span::styled(
                 "(no finding)".to_string(),
                 muted_dim(),
@@ -2519,6 +2608,7 @@ impl ReviewPullRequestScreen {
         frame.render_widget(
             Paragraph::new(build_comment_preview_lines(
                 &edit.draft,
+                self.voice,
                 inner.width as usize,
             ))
             .wrap(Wrap { trim: false }),
@@ -3105,29 +3195,47 @@ const REVIEW_STEPS: [&str; 7] = [
     "You choose Request changes / Comment / Edit / Skip for the summary",
 ];
 
-/// Build the body of the `Proposed comment` panel: the exact comment header,
-/// explanation, and — when present — the one-click suggestion rendered as
-/// full-width replacement bars. `width` is the panel's inner content width.
-fn build_comment_preview_lines(finding: &ReviewFinding, width: usize) -> Vec<Line<'static>> {
+/// Confirm-page steps for the humane voice.
+const HUMANE_REVIEW_STEPS: [&str; 7] = [
+    "Sync the branch + fetch the PR diff and its existing comments",
+    "Only binary or blank-only changes are skipped; risky text changes stay reviewable",
+    "AI scans files in parallel; one whole-diff pass alone judges test coverage",
+    "The findings are rewritten in a reviewer's own voice — no titles, no badges",
+    "You choose Post / Edit / Other / Skip per finding (Edit is AI-free)",
+    "AI writes a short human summary of the concerns that matter",
+    "You choose Request changes / Comment / Edit / Skip for the summary",
+];
+
+/// Build the body of the `Proposed comment` panel: the exact comment header
+/// (robotic voice only — humane comments carry none), explanation, and —
+/// when present — the one-click suggestion rendered as full-width
+/// replacement bars. `width` is the panel's inner content width.
+fn build_comment_preview_lines(
+    finding: &ReviewFinding,
+    voice: ReviewVoice,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            sanitize_row(&format!(
-                "[{}] [{}]: ",
-                finding.category,
-                finding.severity.label()
-            )),
-            Style::default()
-                .fg(severity_color(finding.severity))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            sanitize_row(&finding.title),
-            Style::default()
-                .fg(colors::WHITE)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    if voice == ReviewVoice::Robotic {
+        lines.push(Line::from(vec![
+            Span::styled(
+                sanitize_row(&format!(
+                    "[{}] [{}]: ",
+                    finding.category,
+                    finding.severity.label()
+                )),
+                Style::default()
+                    .fg(severity_color(finding.severity))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                sanitize_row(&finding.title),
+                Style::default()
+                    .fg(colors::WHITE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
     if finding.line.is_none() {
         lines.push(Line::from(Span::styled(
             sanitize_row(&format!("📄 {} (general PR comment)", finding.file)),
@@ -3135,7 +3243,9 @@ fn build_comment_preview_lines(finding: &ReviewFinding, width: usize) -> Vec<Lin
         )));
     }
     if !finding.explanation.trim().is_empty() {
-        lines.push(Line::from(""));
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         for raw in finding.explanation.lines() {
             lines.push(Line::from(Span::styled(
                 sanitize_row(raw),
@@ -4493,6 +4603,7 @@ mod tests {
             ReviewSeverity::Critical,
         )]);
         screen.finish_scanning();
+        screen.set_voice(ReviewVoice::Robotic);
         screen.enter_decision();
         let dump = render_dump(&mut screen, 110, 26);
         assert!(dump.contains("Finding #1 of 1"), "{dump}");
@@ -4785,6 +4896,96 @@ mod tests {
         );
         let dump = render_dump(&mut screen, 80, 6);
         assert!(dump.contains("Cannot review pull request"), "{dump}");
+    }
+
+    // ── humane voice ────────────────────────────────────────────────────
+
+    #[test]
+    fn confirm_defaults_to_humane_and_space_switches_to_robotic() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        assert_eq!(screen.voice(), ReviewVoice::Humane);
+        let dump = render_dump(&mut screen, 120, 44);
+        assert!(dump.contains("☒ Humane"), "{dump}");
+        assert!(dump.contains("read like a teammate"), "{dump}");
+
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char(' '))),
+            ReviewAction::Continue
+        );
+        assert_eq!(screen.voice(), ReviewVoice::Robotic);
+        assert_eq!(screen.step(), ReviewStep::Confirm);
+        assert!(render_dump(&mut screen, 120, 44).contains("☐ Humane"));
+    }
+
+    #[test]
+    fn humane_preview_shows_only_what_gets_posted() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.set_files(
+            vec![file("src/auth.rs")],
+            "o".into(),
+            "r".into(),
+            "s".into(),
+        );
+        screen.record_scan_result(vec![finding(
+            "src/auth.rs",
+            Some(2),
+            ReviewSeverity::Critical,
+        )]);
+        screen.finish_scanning();
+        screen.enter_decision();
+        let dump = render_dump(&mut screen, 110, 26);
+        // The header still tells the reviewer what kind of finding it is…
+        assert!(dump.contains("[Security] [Critical]"), "{dump}");
+        // …but the posted comment has no title line, just the prose.
+        assert!(!dump.contains("Hardcoded API key"), "{dump}");
+        assert!(dump.contains("Secrets in source"), "{dump}");
+        assert!(dump.contains("env::var"), "{dump}");
+    }
+
+    #[test]
+    fn humanize_batches_cover_every_finding_and_keep_missing_rewrites() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        let findings: Vec<ReviewFinding> = (1..=HUMANIZE_BATCH_SIZE as u64 + 2)
+            .map(|line| {
+                let mut finding = finding_with("a.rs", Some(line), ReviewSeverity::High, None);
+                finding.title = format!("Concern {line}");
+                finding
+            })
+            .collect();
+        screen.record_scan_result(findings);
+        screen.finish_scanning();
+
+        let batches = screen.start_humanizing();
+        assert_eq!(screen.step(), ReviewStep::Working);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].0, (0..HUMANIZE_BATCH_SIZE).collect::<Vec<_>>());
+        assert_eq!(
+            batches[1].0,
+            vec![HUMANIZE_BATCH_SIZE, HUMANIZE_BATCH_SIZE + 1]
+        );
+
+        // A failed batch keeps the scanner's wording; it still counts down.
+        assert!(!screen.record_humanized(&batches[0].0, None));
+        assert!(screen.record_humanized(
+            &batches[1].0,
+            Some(vec![Some("Rewritten by a human.".to_string()), None]),
+        ));
+        let findings = screen.findings();
+        assert_eq!(
+            findings[0].explanation,
+            "Secrets in source leak through the VCS history."
+        );
+        assert_eq!(
+            findings[HUMANIZE_BATCH_SIZE].explanation,
+            "Rewritten by a human."
+        );
+        assert_eq!(
+            findings[HUMANIZE_BATCH_SIZE + 1].explanation,
+            "Secrets in source leak through the VCS history."
+        );
+        // A late batch after everything settled is ignored.
+        assert!(!screen.record_humanized(&[0], Some(vec![Some("late".to_string())])));
+        assert_ne!(screen.findings()[0].explanation, "late");
     }
 
     #[test]

@@ -35,6 +35,7 @@ use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::dashboard::{review_feedback_needs_expanded_context, ReviewRevisionMode};
 use crate::services::presets::WisePresetDiscovery;
+use crate::services::review_humane::{deterministic_humane_overview, ReviewVoice};
 use crate::services::{
     build_review_summary, build_review_summary_with_overview, check_for_updates_all_sources,
     compute_attempt_changes, default_dashboard_warning, detect_shell_integration,
@@ -260,6 +261,12 @@ enum AppEvent {
     ReviewPrPosted {
         index: usize,
         result: Result<(), String>,
+    },
+    /// One humanize batch came back with rewritten comments for `indices`.
+    ReviewPrHumanized {
+        indices: Vec<usize>,
+        result: Result<Vec<Option<String>>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
     },
     /// The utility model generated (or failed to generate) the prose-only
     /// overview that precedes the deterministic summary data.
@@ -3455,6 +3462,8 @@ impl App {
             },
             feedback,
             attachments: Vec::new(),
+            // Improve applies findings locally; nothing it revises is posted.
+            voice: ReviewVoice::Robotic,
             index,
         };
         if let Some(improve) = self.improve_pr.as_mut() {
@@ -4014,6 +4023,7 @@ impl App {
                     },
                     feedback,
                     attachments,
+                    voice: screen.voice(),
                     index: screen.current_index(),
                 };
                 screen.start_revising();
@@ -4209,7 +4219,7 @@ impl App {
                 if screen.is_improve() {
                     self.begin_improve_finding_review(tx);
                 } else {
-                    screen.enter_decision();
+                    self.begin_review_walkthrough(tx);
                 }
                 return;
             }
@@ -4228,11 +4238,11 @@ impl App {
                     tx.clone(),
                 );
             }
-        } else {
+        } else if screen.is_improve() {
             screen.enter_done();
-            if screen.is_improve() {
-                self.begin_improve_finding_review(tx);
-            }
+            self.begin_improve_finding_review(tx);
+        } else {
+            self.close_review_walkthrough(tx);
         }
     }
 
@@ -4251,6 +4261,7 @@ impl App {
             number: screen.request().number,
             head_sha: screen.head_sha().to_string(),
             finding,
+            voice: screen.voice(),
             index: screen.current_index(),
         };
         screen.start_posting();
@@ -4286,21 +4297,79 @@ impl App {
             self.post_current_review_finding(tx);
             return;
         }
+        self.close_review_walkthrough(tx);
+    }
+
+    /// The walkthrough is over: write the summary from the posted comments,
+    /// or go straight to the report when there is nothing to submit.
+    fn close_review_walkthrough(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let Some(screen) = self.review_pr.as_mut() else {
             return;
         };
         if screen.posted_findings().is_empty() {
             screen.enter_done();
-        } else {
-            let worktree_path = screen.request().worktree_path.clone();
-            let posted = screen.posted_findings().to_vec();
-            screen.start_generating_summary();
-            kick_off_generate_review_summary(
+            return;
+        }
+        let request = ReviewSummaryRequest {
+            worktree_path: screen.request().worktree_path.clone(),
+            posted: screen.posted_findings().to_vec(),
+            voice: screen.voice(),
+            pr_title: screen.request().title.clone(),
+        };
+        screen.start_generating_summary();
+        kick_off_generate_review_summary(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            request,
+            tx.clone(),
+        );
+    }
+
+    /// Enter the per-finding walkthrough. The humane voice first rewrites
+    /// every finding the way a reviewer would type it, in parallel batches.
+    fn begin_review_walkthrough(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if screen.voice() != ReviewVoice::Humane || screen.findings_len() == 0 {
+            screen.enter_decision();
+            return;
+        }
+        let worktree_path = screen.request().worktree_path.clone();
+        let batches = screen.start_humanizing();
+        let config = self.current_dashboard_config();
+        for (indices, findings) in batches {
+            kick_off_humanize_review_findings(
                 self.git_root.clone(),
-                self.current_dashboard_config(),
-                worktree_path,
-                posted,
+                config.clone(),
+                worktree_path.clone(),
+                indices,
+                findings,
                 tx.clone(),
+            );
+        }
+    }
+
+    fn apply_review_pr_humanized(
+        &mut self,
+        indices: Vec<usize>,
+        result: Result<Vec<Option<String>>, String>,
+        telemetry: Option<ReviewScanTelemetry>,
+    ) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if let Some(telemetry) = telemetry {
+            screen.record_scan_telemetry(telemetry);
+        }
+        let failed = result.is_err();
+        if screen.record_humanized(&indices, result.ok()) {
+            screen.enter_decision();
+        }
+        if failed {
+            self.show_toast(
+                ToastVariant::Warning,
+                "Could not rewrite some comments; they keep the scanner's wording.".to_string(),
             );
         }
     }
@@ -4320,9 +4389,14 @@ impl App {
             screen.record_scan_telemetry(telemetry);
         }
         let posted = screen.posted_findings();
-        let body = match result {
-            Ok(overview) => build_review_summary_with_overview(posted, &overview),
-            Err(_) => build_review_summary(posted),
+        let body = match screen.voice() {
+            ReviewVoice::Humane => {
+                result.unwrap_or_else(|_| deterministic_humane_overview(posted.len()))
+            }
+            ReviewVoice::Robotic => match result {
+                Ok(overview) => build_review_summary_with_overview(posted, &overview),
+                Err(_) => build_review_summary(posted),
+            },
         };
         screen.enter_summary(body);
     }
@@ -4512,6 +4586,7 @@ impl App {
                             mode: ReviewRevisionMode::Expanded,
                             feedback,
                             attachments: Vec::new(),
+                            voice: review.voice(),
                             index,
                         })
                     });
@@ -4570,6 +4645,7 @@ impl App {
                             feedback: feedback.clone(),
                             attachments: attachments.clone(),
                             mode: ReviewRevisionMode::Expanded,
+                            voice: screen.voice(),
                             index,
                         })
                     });
@@ -4630,10 +4706,12 @@ impl App {
                     screen.enter_done();
                 }
             } else {
-                screen.enter_decision();
+                self.begin_review_walkthrough(tx);
             }
-        } else {
+        } else if screen.is_improve() {
             screen.enter_done();
+        } else {
+            self.close_review_walkthrough(tx);
         }
     }
 
@@ -8542,6 +8620,11 @@ impl App {
             AppEvent::ReviewPrPosted { index, result } => {
                 self.apply_review_pr_posted(index, result, tx)
             }
+            AppEvent::ReviewPrHumanized {
+                indices,
+                result,
+                telemetry,
+            } => self.apply_review_pr_humanized(indices, result, telemetry),
             AppEvent::ReviewPrSummaryGenerated { result, telemetry } => {
                 self.apply_review_pr_summary_generated(result, telemetry)
             }
@@ -11400,6 +11483,7 @@ struct ReviewReviseRequest {
     feedback: String,
     attachments: Vec<ImageAttachment>,
     mode: ReviewRevisionMode,
+    voice: ReviewVoice,
     index: usize,
 }
 
@@ -11430,14 +11514,22 @@ struct ReviewPostRequest {
     number: u64,
     head_sha: String,
     finding: ReviewFinding,
+    voice: ReviewVoice,
     index: usize,
+}
+
+/// Inputs for writing the review summary once the walkthrough ends.
+struct ReviewSummaryRequest {
+    worktree_path: String,
+    posted: Vec<ReviewFinding>,
+    voice: ReviewVoice,
+    pr_title: String,
 }
 
 fn kick_off_generate_review_summary(
     git_root: Option<String>,
     config: DashboardConfig,
-    worktree_path: String,
-    posted: Vec<ReviewFinding>,
+    request: ReviewSummaryRequest,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
@@ -11449,12 +11541,54 @@ fn kick_off_generate_review_summary(
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let attempt = service
-            .generate_review_summary_overview(&worktree_path, &posted)
-            .await;
+        let attempt = match request.voice {
+            ReviewVoice::Humane => {
+                service
+                    .generate_humane_review_summary_overview(
+                        &request.worktree_path,
+                        &request.posted,
+                        &request.pr_title,
+                    )
+                    .await
+            }
+            ReviewVoice::Robotic => {
+                service
+                    .generate_review_summary_overview(&request.worktree_path, &request.posted)
+                    .await
+            }
+        };
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
         let _ = tx.send(AppEvent::ReviewPrSummaryGenerated {
             result,
+            telemetry: Some(attempt.telemetry),
+        });
+    });
+}
+
+fn kick_off_humanize_review_findings(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    indices: Vec<usize>,
+    findings: Vec<ReviewFinding>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrHumanized {
+            indices,
+            result: Err("Could not resolve git root.".to_string()),
+            telemetry: None,
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let attempt = service
+            .humanize_review_findings(&worktree_path, &findings)
+            .await;
+        let _ = tx.send(AppEvent::ReviewPrHumanized {
+            indices,
+            result: attempt.result.map_err(|err| user_friendly_message(&err)),
             telemetry: Some(attempt.telemetry),
         });
     });
@@ -11792,6 +11926,7 @@ fn kick_off_revise_review_finding(
                 &req.feedback,
                 &req.attachments,
                 req.mode,
+                req.voice,
             )
             .await;
         let result = attempt.result.map_err(|err| user_friendly_message(&err));
@@ -11969,6 +12104,7 @@ fn kick_off_post_review_finding(
                 req.number,
                 &req.head_sha,
                 &req.finding,
+                req.voice,
             )
             .await
             .map_err(|err| user_friendly_message(&err));
@@ -14072,6 +14208,7 @@ mod tests {
     fn summary_generation_transitions_to_preview_and_falls_back_on_failure() {
         let mut app = review_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
         let screen = app.review_pr.as_mut().unwrap();
+        screen.set_voice(ReviewVoice::Robotic);
         screen.record_scan_result(vec![ReviewFinding {
             category: "Security".to_string(),
             severity: crate::services::ReviewSeverity::High,
@@ -14105,6 +14242,124 @@ mod tests {
         );
         assert!(screen.summary_body().contains("I found 1 issue"));
         assert_eq!(screen.scan_telemetry_len(), 1);
+    }
+
+    fn posted_humane_app() -> App {
+        let mut app = review_walkthrough_app(1);
+        app.review_pr
+            .as_mut()
+            .unwrap()
+            .record_outcome(ReviewRowOutcome::Posted);
+        app
+    }
+
+    #[test]
+    fn humane_revision_returns_straight_to_decision() {
+        // The revise prompt already writes in the human voice, so no second
+        // humanize call is made before the revised comment shows.
+        let mut app = review_walkthrough_app(1);
+        let tx = app_event_tx();
+        let revised = ReviewFinding {
+            explanation: "Small thing: this skips the role check.".to_string(),
+            ..app.review_pr.as_ref().unwrap().current_finding().unwrap()
+        };
+        app.apply_review_pr_revised(
+            0,
+            (
+                ReviewRevisionMode::Focused,
+                "softer".to_string(),
+                Vec::new(),
+            ),
+            Ok(vec![revised]),
+            None,
+            &tx,
+        );
+        let screen = app.review_pr.as_ref().unwrap();
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Decision
+        );
+        assert_eq!(
+            screen.current_finding().unwrap().explanation,
+            "Small thing: this skips the role check."
+        );
+    }
+
+    #[test]
+    fn humane_walkthrough_starts_after_the_comments_are_rewritten() {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let tx = app_event_tx();
+        let screen = app.review_pr.as_mut().unwrap();
+        screen.record_scan_result(vec![ReviewFinding {
+            category: "Security".to_string(),
+            severity: crate::services::ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: "Authorization is skipped".to_string(),
+            explanation: "The handler never checks the caller's role.".to_string(),
+            suggestion: None,
+        }]);
+        screen.finish_scanning();
+        app.begin_review_walkthrough(&tx);
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Working
+        );
+
+        app.apply_review_pr_humanized(
+            vec![0],
+            Ok(vec![Some(
+                "Anyone can call this, the role is never checked. Could we add `authorize!`?"
+                    .to_string(),
+            )]),
+            Some(review_test_telemetry("humanize")),
+        );
+        let screen = app.review_pr.as_ref().unwrap();
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Decision
+        );
+        let finding = screen.current_finding().unwrap();
+        assert_eq!(
+            finding.comment_body_for(screen.voice()),
+            "Anyone can call this, the role is never checked. Could we add `authorize!`?"
+        );
+        assert_eq!(screen.scan_telemetry_len(), 1);
+    }
+
+    #[test]
+    fn robotic_walkthrough_skips_the_rewrite() {
+        let mut app = review_scan_test_app(ReviewScanMode::Split, &["src/lib.rs"]);
+        let tx = app_event_tx();
+        let screen = app.review_pr.as_mut().unwrap();
+        screen.set_voice(ReviewVoice::Robotic);
+        screen.record_scan_result(vec![ReviewFinding {
+            category: "Security".to_string(),
+            severity: crate::services::ReviewSeverity::High,
+            file: "src/lib.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: "Authorization is skipped".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        }]);
+        screen.finish_scanning();
+        app.begin_review_walkthrough(&tx);
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Decision
+        );
+    }
+
+    #[test]
+    fn humane_summary_falls_back_to_a_short_human_opening() {
+        let mut app = posted_humane_app();
+        let tx = app_event_tx();
+        app.advance_review_finding(&tx);
+        app.apply_review_pr_summary_generated(Err("model unavailable".to_string()), None);
+        let screen = app.review_pr.as_ref().unwrap();
+        assert_eq!(screen.summary_body(), "Left one comment inline.");
     }
 
     #[test]

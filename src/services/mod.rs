@@ -14,6 +14,7 @@ pub mod opencode_models;
 pub mod opencode_turn;
 pub mod pr_labels;
 pub mod presets;
+pub mod review_humane;
 pub mod review_report;
 pub mod review_telemetry;
 pub(crate) mod reviewer_evidence;

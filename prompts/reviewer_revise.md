@@ -15,6 +15,8 @@ Bounded target files appear once as authoritative numbered current-file evidence
 - When the requested direct fix is deletion of the anchored line/range, include an intentionally empty `---SUGGESTION---` section. Do not emit an empty suggestion for prose-only or file-level findings.
 - Never introduce a second concern, re-scan the pull request, or emit `NO-FINDINGS`.
 
+VOICE_SECTION
+
 OUTPUT_CONTRACT
 
 ## Inputs (provided by the harness)

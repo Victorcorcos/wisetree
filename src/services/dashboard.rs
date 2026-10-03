@@ -38,6 +38,10 @@ use crate::services::improve_run::{
     archive_improve_run, clear_improve_run, load_improve_run, resolve_improve_state_path,
     save_improve_run, ImproveCheckpointIdentity, ImproveItemState, ImproveRun,
 };
+use crate::services::review_humane::{
+    build_humane_summary_prompt, build_humanize_prompt, parse_humanized_comments,
+    revision_voice_section, validate_humane_summary_overview, ReviewHumanizeAttempt, ReviewVoice,
+};
 use crate::services::review_telemetry::{
     opencode_usage_for_title, review_scan_title, ReviewScanTelemetry, ReviewTokenUsage,
 };
@@ -121,6 +125,8 @@ const REVIEW_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_SCAN_TIMEOUT: Duration = Duration::from_secs(240);
 const REVIEW_SUMMARY_TIMEOUT: Duration = Duration::from_secs(30);
+/// The humane summary is longer prose from the balanced profile.
+const REVIEW_HUMANE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
 const REVIEW_POST_TIMEOUT: Duration = Duration::from_secs(30);
 /// GitHub's API occasionally answers a healthy PR with a transient 5xx (a
 /// blip in their infra, not a real problem with the PR or its diff). Retried
@@ -4147,7 +4153,12 @@ impl DashboardService {
 
     /// Revise one existing finding with the dedicated focused prompt. This
     /// keeps the walkthrough's "Other" call independent of merged/split scan
-    /// routing and never asks the model to judge unrelated hunks again.
+    /// routing and never asks the model to judge unrelated hunks again. In
+    /// the humane `voice` the revision comes back already worded as the
+    /// posted comment.
+    // Each input shapes the one revision prompt; bundling them would only
+    // move the list into a struct used nowhere else.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn revise_review_finding(
         &self,
         worktree_path: &str,
@@ -4156,6 +4167,7 @@ impl DashboardService {
         feedback: &str,
         attachments: &[crate::tui::image_upload::ImageAttachment],
         mode: ReviewRevisionMode,
+        voice: ReviewVoice,
     ) -> ReviewScanAttempt {
         let started = Instant::now();
         let scan = format!("revision:{}", file.path);
@@ -4181,7 +4193,7 @@ impl DashboardService {
                 &selection,
             );
         }
-        let prompt = build_review_revision_prompt(file, finding, feedback, mode);
+        let prompt = build_review_revision_prompt(file, finding, feedback, mode, voice);
         let attachments = match Self::attached_image_paths(attachments) {
             Ok(attachments) => attachments,
             Err(error) => {
@@ -4405,6 +4417,28 @@ impl DashboardService {
             cancel_rx,
         )
         .await
+    }
+
+    /// A Review call that only transforms the text in its prompt (humanize,
+    /// the humane summary, report repair) and never reads the repository.
+    /// It runs from an empty temp dir, so the harness loads none of the
+    /// project's instruction files (`AGENTS.md`, `CLAUDE.md`, …), which
+    /// otherwise ride along in every call (~3k tokens on a typical repo).
+    /// `fallback_cwd` is used only if the temp dir cannot be created.
+    async fn run_text_only_review_prompt(
+        &self,
+        fallback_cwd: &Path,
+        selection: &ReviewModelSelection,
+        prompt: String,
+        timeout: Duration,
+    ) -> (Result<String>, Option<ReviewTokenUsage>) {
+        let empty = tempfile::Builder::new()
+            .prefix("wisetree-review-text-")
+            .tempdir()
+            .ok();
+        let cwd = empty.as_ref().map_or(fallback_cwd, |dir| dir.path());
+        self.run_review_prompt_with_timeout(cwd, selection, prompt, timeout)
+            .await
     }
 
     /// One captured Review AI call with the given `permission`; `cancel`
@@ -4798,9 +4832,115 @@ impl DashboardService {
         make_attempt(result, usage)
     }
 
+    /// Humane voice: rewrite one batch of findings' explanations the way a
+    /// teammate would type them. Facts, anchors, and suggestions are kept;
+    /// a slot the model leaves out (or mangles) keeps its original wording.
+    pub async fn humanize_review_findings(
+        &self,
+        worktree_path: &str,
+        findings: &[ReviewFinding],
+    ) -> ReviewHumanizeAttempt {
+        let started = Instant::now();
+        let prompt = build_humanize_prompt(findings);
+        let prompt_bytes = prompt.len();
+        let selection = self.review_model_selection(ReviewModelProfile::Balanced);
+        if selection.model.is_empty() {
+            return ReviewHumanizeAttempt {
+                result: Err(WisetreeError::other(
+                    "ai.review.balanced model is not configured.",
+                )),
+                telemetry: review_call_telemetry(
+                    "humanize",
+                    &selection,
+                    prompt_bytes,
+                    started,
+                    None,
+                    0,
+                ),
+            };
+        }
+        let (output, usage) = self
+            .run_text_only_review_prompt(
+                Path::new(worktree_path),
+                &selection,
+                prompt,
+                REVIEW_SCAN_TIMEOUT,
+            )
+            .await;
+        let result = output.and_then(|output| {
+            parse_humanized_comments(&output, findings.len()).ok_or_else(|| {
+                WisetreeError::other("could not parse the rewritten review comments.")
+            })
+        });
+        let rewritten = result
+            .as_ref()
+            .map_or(0, |slots| slots.iter().flatten().count());
+        ReviewHumanizeAttempt {
+            result,
+            telemetry: review_call_telemetry(
+                "humanize",
+                &selection,
+                prompt_bytes,
+                started,
+                usage,
+                rewritten,
+            ),
+        }
+    }
+
+    /// Humane voice: the review body, written from the posted findings.
+    pub async fn generate_humane_review_summary_overview(
+        &self,
+        worktree_path: &str,
+        posted: &[ReviewFinding],
+        pr_title: &str,
+    ) -> ReviewSummaryAttempt {
+        let started = Instant::now();
+        let prompt = build_humane_summary_prompt(posted, pr_title);
+        let prompt_bytes = prompt.len();
+        let selection = self.review_model_selection(ReviewModelProfile::Balanced);
+        let telemetry = |usage| {
+            review_call_telemetry(
+                "summary",
+                &selection,
+                prompt_bytes,
+                started,
+                usage,
+                posted.len(),
+            )
+        };
+        if selection.model.is_empty() {
+            return ReviewSummaryAttempt {
+                result: Err(WisetreeError::other(
+                    "ai.review.balanced model is not configured.",
+                )),
+                telemetry: telemetry(None),
+            };
+        }
+        let (output, usage) = self
+            .run_text_only_review_prompt(
+                Path::new(worktree_path),
+                &selection,
+                prompt,
+                REVIEW_HUMANE_SUMMARY_TIMEOUT,
+            )
+            .await;
+        let result = output.and_then(|output| {
+            validate_humane_summary_overview(&output)
+                .ok_or_else(|| WisetreeError::other("review summary was not usable markdown"))
+        });
+        ReviewSummaryAttempt {
+            result,
+            telemetry: telemetry(usage),
+        }
+    }
+
     /// Post one approved finding to the PR — inline when it carries a
     /// validated line anchor, as a general PR comment otherwise. All
     /// deterministic; the body was previewed verbatim to the user.
+    // The PR coordinates + finding + voice are each independent inputs of
+    // one `gh api` call; bundling them would only move the list elsewhere.
+    #[allow(clippy::too_many_arguments)]
     pub async fn post_review_finding(
         &self,
         worktree_path: &str,
@@ -4809,9 +4949,10 @@ impl DashboardService {
         number: u64,
         head_sha: &str,
         finding: &ReviewFinding,
+        voice: ReviewVoice,
     ) -> Result<()> {
         let cwd = PathBuf::from(worktree_path);
-        let body = finding.comment_body();
+        let body = finding.comment_body_for(voice);
         let result = match finding.line {
             Some(line) => {
                 let endpoint = format!("repos/{owner}/{repo}/pulls/{number}/comments");
@@ -11208,6 +11349,30 @@ async fn build_review_directory_inventory(
     rendered
 }
 
+/// Telemetry for a single Review AI call outside the scan pool.
+fn review_call_telemetry(
+    scan: &str,
+    selection: &ReviewModelSelection,
+    prompt_bytes: usize,
+    started: Instant,
+    usage: Option<ReviewTokenUsage>,
+    findings: usize,
+) -> ReviewScanTelemetry {
+    ReviewScanTelemetry {
+        scan: scan.to_string(),
+        scan_role: scan.to_string(),
+        retry_role: "initial".to_string(),
+        model_profile: selection.profile.label().to_string(),
+        model: selection.model.clone(),
+        thinking: selection.thinking.clone(),
+        harness: selection.harness.wire_name().to_string(),
+        prompt_bytes,
+        usage: usage.unwrap_or_default(),
+        duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        findings,
+    }
+}
+
 fn review_scan_attempt(
     scan: String,
     prompt_bytes: usize,
@@ -11660,6 +11825,7 @@ fn build_review_revision_prompt(
     finding: &ReviewFinding,
     feedback: &str,
     mode: ReviewRevisionMode,
+    voice: ReviewVoice,
 ) -> String {
     const REVISION_PROMPT: &str = include_str!("../../prompts/reviewer_revise.md");
     const SOURCE_PROMPT: &str = include_str!("../../prompts/reviewer_application.md");
@@ -11688,9 +11854,11 @@ fn build_review_revision_prompt(
         }
     };
     let previous_finding = finding.rendered_for_revision();
+    let voice_section = revision_voice_section(voice);
     substitute_review_prompt(
         REVISION_PROMPT,
         &[
+            ("VOICE_SECTION", &voice_section),
             ("OUTPUT_CONTRACT", contract),
             ("FILE_PATH", &file.path),
             ("FILE_CONTENT", full_content),
@@ -12705,7 +12873,7 @@ fn review_removed_line_evidence(annotated_diff: &str) -> String {
 
 /// Substitute template tokens in one pass so inserted user/repository text is
 /// never scanned again for a different token name.
-fn substitute_review_prompt(template: &str, substitutions: &[(&str, &str)]) -> String {
+pub(crate) fn substitute_review_prompt(template: &str, substitutions: &[(&str, &str)]) -> String {
     let mut rendered = String::with_capacity(template.len());
     let mut rest = template;
     while !rest.is_empty() {
@@ -15018,6 +15186,45 @@ copy to src/copied_again.rs
     }
 
     #[test]
+    fn humane_revision_prompt_carries_the_voice_and_robotic_does_not() {
+        let file = ReviewFile {
+            path: "src/lib.rs".to_string(),
+            annotated_diff: "@@ -1 +1 @@\n     1 +changed".to_string(),
+            full_content: None,
+            commentable_lines: BTreeSet::from([1]),
+            existing_comments: String::new(),
+            existing_keys: Vec::new(),
+        };
+        let finding = ReviewFinding {
+            category: "Security".to_string(),
+            severity: ReviewSeverity::High,
+            file: file.path.clone(),
+            start_line: None,
+            line: Some(1),
+            title: "Role is never checked".to_string(),
+            explanation: "Anyone can call this.".to_string(),
+            suggestion: None,
+        };
+        let revise = |voice| {
+            build_review_revision_prompt(
+                &file,
+                &finding,
+                "softer",
+                ReviewRevisionMode::Focused,
+                voice,
+            )
+        };
+        let humane = revise(ReviewVoice::Humane);
+        assert!(humane.contains("## Voice\n\nThe EXPLANATION is posted verbatim"));
+        assert!(humane.contains("## Words and habits that give a bot away"));
+        // The voice sits before the output contract it shapes.
+        assert!(humane.find("## Voice").unwrap() < humane.find("## Output contract").unwrap());
+        let robotic = revise(ReviewVoice::Robotic);
+        assert!(!robotic.contains("## Voice"));
+        assert!(!robotic.contains("VOICE_SECTION"));
+    }
+
+    #[test]
     fn build_review_revision_prompt_is_focused_and_contract_exact() {
         let first_hunk = (1..=70)
             .map(|line| format!("{line:>6} +value_{line}"))
@@ -15048,6 +15255,7 @@ copy to src/copied_again.rs
             &finding,
             "Soften this and keep FOCUSED_DIFF plus OUTPUT_CONTRACT literal",
             ReviewRevisionMode::Focused,
+            ReviewVoice::Robotic,
         );
 
         assert!(prompt.starts_with("You are revising ONE pull-request finding"));
@@ -15083,6 +15291,7 @@ copy to src/copied_again.rs
             &finding,
             "Use the broader context",
             ReviewRevisionMode::Expanded,
+            ReviewVoice::Robotic,
         );
         assert!(expanded.contains("Expanded: all retained hunks"));
         assert!(expanded.contains("    14 +value_14"));
@@ -15169,8 +15378,13 @@ copy to src/copied_again.rs
             explanation: "Needs context.".to_string(),
             suggestion: None,
         };
-        let prompt =
-            build_review_revision_prompt(&file, &finding, "clarify", ReviewRevisionMode::Focused);
+        let prompt = build_review_revision_prompt(
+            &file,
+            &finding,
+            "clarify",
+            ReviewRevisionMode::Focused,
+            ReviewVoice::Robotic,
+        );
         assert!(prompt.contains("Large or unavailable targets"));
         assert!(prompt.contains("file-level finding"));
     }
