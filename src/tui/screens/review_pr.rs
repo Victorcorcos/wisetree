@@ -26,8 +26,10 @@
 //! - `OtherInput`: freeform feedback box (the "Other" path); submitting
 //!   returns `ReviewAction::Revise(feedback)` so the `App` re-scans that one
 //!   finding.
-//! - `Summary`   : the deterministic review-summary markdown built from the
-//!   posted findings, with **Request changes / Comment / Skip** buttons.
+//! - `Summary`   : the review body built from the posted findings, with
+//!   **Request changes / Comment / Edit / Skip** buttons.
+//! - `EditSummary`: a markdown editor over that body; Enter saves it back,
+//!   Esc keeps the previous one.
 //! - `Done`      : a results table (one row per finding) mirroring the Fix
 //!   Done page.
 //!
@@ -110,9 +112,12 @@ pub enum ReviewStep {
     /// Deterministic edit form for the current finding — no AI, no tokens.
     EditFinding,
     OtherInput,
-    /// The review summary + Request changes / Comment / Skip. Its overview is
-    /// utility-generated when possible; rows and charts remain deterministic.
+    /// The review summary + Request changes / Comment / Edit / Skip. Its
+    /// overview is AI-written when possible; rows and charts remain
+    /// deterministic.
     Summary,
+    /// Free-form markdown editor over the summary body.
+    EditSummary,
     Done,
 }
 
@@ -203,11 +208,12 @@ impl EditState {
     }
 }
 
-/// The three summary buttons.
+/// The summary buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SummaryButton {
     RequestChanges,
     Comment,
+    Edit,
     Skip,
 }
 
@@ -322,6 +328,8 @@ pub struct ReviewPullRequestScreen {
     posted: Vec<ReviewFinding>,
     /// The deterministic summary markdown, built when the walkthrough ends.
     summary_body: String,
+    /// Markdown editor open on `EditSummary`.
+    summary_input: Option<InputPrompt>,
     decision_button: DecisionButton,
     decision_button_rects: Cell<[Rect; 5]>,
     /// Armed by the confirmed **Post all** button: every remaining finding is
@@ -337,7 +345,7 @@ pub struct ReviewPullRequestScreen {
     /// `EditFinding`.
     edit: Option<EditState>,
     summary_button: SummaryButton,
-    summary_button_rects: Cell<[Rect; 3]>,
+    summary_button_rects: Cell<[Rect; 4]>,
     /// Scroll offset for the (potentially long) comment preview / summary.
     decision_scroll: u16,
     /// Max scroll offset from the last render, so scrolling can't overshoot
@@ -416,6 +424,7 @@ impl ReviewPullRequestScreen {
             current: 0,
             posted: Vec::new(),
             summary_body: String::new(),
+            summary_input: None,
             decision_button: DecisionButton::Post,
             decision_button_rects: Cell::new([Rect::default(); 5]),
             post_all: false,
@@ -423,7 +432,7 @@ impl ReviewPullRequestScreen {
             abort_confirm: None,
             edit: None,
             summary_button: SummaryButton::Comment,
-            summary_button_rects: Cell::new([Rect::default(); 3]),
+            summary_button_rects: Cell::new([Rect::default(); 4]),
             decision_scroll: 0,
             decision_max_scroll: Cell::new(0),
             other_input: None,
@@ -522,6 +531,7 @@ impl ReviewPullRequestScreen {
                 | ReviewStep::EditFinding
                 | ReviewStep::OtherInput
                 | ReviewStep::Summary
+                | ReviewStep::EditSummary
         )
     }
 
@@ -1224,6 +1234,8 @@ impl ReviewPullRequestScreen {
             input.paste(text);
         } else if let Some(input) = self.other_input.as_mut() {
             input.paste(text);
+        } else if let Some(input) = self.summary_input.as_mut() {
+            input.paste(text);
         }
         ReviewAction::Continue
     }
@@ -1258,6 +1270,17 @@ impl ReviewPullRequestScreen {
         self.step = ReviewStep::Working;
         self.phase_message = "Writing the review summary overview...".to_string();
         self.scanning = false;
+    }
+
+    /// Open the markdown editor on the current summary body.
+    fn show_summary_editor(&mut self) {
+        self.summary_input = Some(
+            InputPrompt::new("Edit the review body (markdown):")
+                .multiline()
+                .expand_to_fill()
+                .with_default(self.summary_body.clone()),
+        );
+        self.step = ReviewStep::EditSummary;
     }
 
     /// Record a per-finding outcome as a colored summary-table row.
@@ -1301,7 +1324,7 @@ impl ReviewPullRequestScreen {
     }
 
     /// Walkthrough finished with posted comments: show the assembled summary
-    /// and the Request changes / Comment / Skip choice.
+    /// and the Request changes / Comment / Edit / Skip choice.
     pub fn enter_summary(&mut self, body: String) {
         self.summary_body = body;
         self.summary_button = SummaryButton::Comment;
@@ -1414,6 +1437,7 @@ impl ReviewPullRequestScreen {
             ReviewStep::EditFinding => self.handle_edit_key(key),
             ReviewStep::OtherInput => self.handle_other_key(key),
             ReviewStep::Summary => self.handle_summary_key(key),
+            ReviewStep::EditSummary => self.handle_summary_editor_key(key),
             ReviewStep::Done => self.handle_done_key(key),
         }
     }
@@ -1657,11 +1681,44 @@ impl ReviewPullRequestScreen {
                 SummaryButton::Comment => ReviewAction::SubmitSummary {
                     request_changes: false,
                 },
+                SummaryButton::Edit => {
+                    self.show_summary_editor();
+                    ReviewAction::Continue
+                }
                 SummaryButton::Skip => ReviewAction::SkipSummary,
             },
             KeyCode::Esc => ReviewAction::SkipSummary,
             _ => ReviewAction::Continue,
         }
+    }
+
+    /// The summary editor: Enter saves back into the body, Esc discards.
+    /// Either way the Summary buttons come back.
+    fn handle_summary_editor_key(&mut self, key: KeyEvent) -> ReviewAction {
+        let Some(input) = self.summary_input.as_mut() else {
+            self.step = ReviewStep::Summary;
+            return ReviewAction::Continue;
+        };
+        if input.wants_copy_all(&key) {
+            return ReviewAction::CopyToClipboard(input.value.clone());
+        }
+        match input.handle_key(key) {
+            InputOutcome::Submitted(text) => {
+                let text = text.replace('\u{fffc}', "").trim().to_string();
+                if !text.is_empty() {
+                    self.summary_body = text;
+                }
+                self.summary_input = None;
+                self.decision_scroll = 0;
+                self.step = ReviewStep::Summary;
+            }
+            InputOutcome::Cancelled => {
+                self.summary_input = None;
+                self.step = ReviewStep::Summary;
+            }
+            InputOutcome::Pending => {}
+        }
+        ReviewAction::Continue
     }
 
     /// Esc asked to abandon the run; only a deliberate Yes actually cancels.
@@ -1779,7 +1836,12 @@ impl ReviewPullRequestScreen {
                 ReviewAction::Continue
             }
             ReviewStep::Summary => {
-                let [request, comment, skip] = self.summary_button_rects.get();
+                let [request, comment, edit, skip] = self.summary_button_rects.get();
+                if contains_position(edit, position) {
+                    self.summary_button = SummaryButton::Edit;
+                    self.show_summary_editor();
+                    return ReviewAction::Continue;
+                }
                 if contains_position(request, position) {
                     self.summary_button = SummaryButton::RequestChanges;
                     return ReviewAction::SubmitSummary {
@@ -1798,9 +1860,10 @@ impl ReviewPullRequestScreen {
                 }
                 ReviewAction::Continue
             }
-            ReviewStep::Working | ReviewStep::OtherInput | ReviewStep::Done => {
-                ReviewAction::Continue
-            }
+            ReviewStep::Working
+            | ReviewStep::OtherInput
+            | ReviewStep::EditSummary
+            | ReviewStep::Done => ReviewAction::Continue,
         }
     }
 
@@ -1861,6 +1924,7 @@ impl ReviewPullRequestScreen {
             ReviewStep::EditFinding => self.render_edit(frame, area),
             ReviewStep::OtherInput => self.render_other(frame, area),
             ReviewStep::Summary => self.render_summary(frame, area),
+            ReviewStep::EditSummary => self.render_summary_editor(frame, area),
             ReviewStep::Done => self.render_done(frame, area),
         }
         if let Some(modal) = self.abort_confirm.as_ref() {
@@ -2584,6 +2648,29 @@ impl ReviewPullRequestScreen {
         render_shortcut_line(frame, chunks[3], "Skip summary");
     }
 
+    fn render_summary_editor(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // heading
+                Constraint::Length(1), // blank
+                Constraint::Min(3),    // input
+            ])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Edit the review summary".to_string(),
+                Style::default()
+                    .fg(colors::NAVY)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            chunks[0],
+        );
+        if let Some(input) = self.summary_input.as_ref() {
+            input.render(frame, chunks[2], self.tick);
+        }
+    }
+
     fn render_summary_buttons(&self, frame: &mut Frame, area: Rect) {
         let rects = render_button_row(
             frame,
@@ -2598,6 +2685,11 @@ impl ReviewPullRequestScreen {
                     "  Comment  ",
                     colors::INFO,
                     matches!(self.summary_button, SummaryButton::Comment),
+                ),
+                (
+                    "  Edit  ",
+                    colors::NAVY,
+                    matches!(self.summary_button, SummaryButton::Edit),
                 ),
                 (
                     "  Skip  ",
@@ -2814,7 +2906,8 @@ fn prev_decision_button(b: DecisionButton, post_all: bool) -> DecisionButton {
 fn next_summary_button(b: SummaryButton) -> SummaryButton {
     match b {
         SummaryButton::RequestChanges => SummaryButton::Comment,
-        SummaryButton::Comment => SummaryButton::Skip,
+        SummaryButton::Comment => SummaryButton::Edit,
+        SummaryButton::Edit => SummaryButton::Skip,
         SummaryButton::Skip => SummaryButton::RequestChanges,
     }
 }
@@ -2823,7 +2916,8 @@ fn prev_summary_button(b: SummaryButton) -> SummaryButton {
     match b {
         SummaryButton::RequestChanges => SummaryButton::Skip,
         SummaryButton::Comment => SummaryButton::RequestChanges,
-        SummaryButton::Skip => SummaryButton::Comment,
+        SummaryButton::Edit => SummaryButton::Comment,
+        SummaryButton::Skip => SummaryButton::Edit,
     }
 }
 
@@ -3008,7 +3102,7 @@ const REVIEW_STEPS: [&str; 7] = [
     "You choose Post / Edit / Other / Skip per finding (Edit is AI-free)",
     "Approved findings are posted as inline PR comments (with suggestions)",
     "A utility AI writes the summary overview; rows and charts stay deterministic",
-    "You choose Request changes / Comment / Skip for the summary",
+    "You choose Request changes / Comment / Edit / Skip for the summary",
 ];
 
 /// Build the body of the `Proposed comment` panel: the exact comment header,
@@ -4589,6 +4683,10 @@ mod tests {
             ReviewAction::Continue
         );
         assert_eq!(
+            screen.handle_key(key(KeyCode::Right)),
+            ReviewAction::Continue
+        );
+        assert_eq!(
             screen.handle_key(key(KeyCode::Enter)),
             ReviewAction::SkipSummary
         );
@@ -4687,5 +4785,39 @@ mod tests {
         );
         let dump = render_dump(&mut screen, 80, 6);
         assert!(dump.contains("Cannot review pull request"), "{dump}");
+    }
+
+    #[test]
+    fn summary_edit_saves_or_discards_the_markdown() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.enter_summary("Nice fix".to_string());
+        let dump = render_dump(&mut screen, 120, 24);
+        assert!(dump.contains("Edit"), "{dump}");
+
+        // Comment → Edit.
+        screen.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ReviewAction::Continue
+        );
+        assert_eq!(screen.step(), ReviewStep::EditSummary);
+        screen.handle_paste(" ![after](https://example.test/a.png)");
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            ReviewAction::Continue
+        );
+        assert_eq!(screen.step(), ReviewStep::Summary);
+        assert_eq!(
+            screen.summary_body(),
+            "Nice fix ![after](https://example.test/a.png)"
+        );
+
+        // Esc in the editor keeps the body as it was.
+        screen.handle_key(key(KeyCode::Enter));
+        assert_eq!(screen.step(), ReviewStep::EditSummary);
+        screen.handle_paste(" discarded");
+        screen.handle_key(key(KeyCode::Esc));
+        assert_eq!(screen.step(), ReviewStep::Summary);
+        assert!(!screen.summary_body().contains("discarded"));
     }
 }
