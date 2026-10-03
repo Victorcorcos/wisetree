@@ -51,6 +51,8 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
+use tokio::sync::oneshot;
+
 use crate::config::schema::AiReviewConfig;
 use crate::messages::colors;
 use crate::services::dashboard::{
@@ -59,7 +61,9 @@ use crate::services::dashboard::{
     split_run_duplicate_findings, ReviewContext, ReviewFile, ReviewFileGroup, ReviewFinding,
     ReviewGroupProfile, ReviewScanMode, ReviewSeverity, ReviewSkippedFile, ReviewVerification,
 };
-use crate::services::review_humane::{ReviewVoice, HUMANIZE_BATCH_SIZE};
+use crate::services::review_humane::{
+    ReviewSmokeTest, ReviewVoice, SmokeOutcome, HUMANIZE_BATCH_SIZE, SCREENSHOT_TODO_MARKER,
+};
 use crate::services::review_telemetry::{review_telemetry_label, ReviewScanTelemetry};
 use crate::tui::image_upload::ImageAttachment;
 use crate::tui::screens::dashboard::{ImproveRequest, ReviewPullRequestRequest};
@@ -118,7 +122,8 @@ pub enum ReviewStep {
     /// overview is AI-written when possible; rows and charts remain
     /// deterministic.
     Summary,
-    /// Free-form markdown editor over the summary body.
+    /// Free-form markdown editor over the summary body (e.g. to drop in a
+    /// screenshot the smoke test could not take).
     EditSummary,
     Done,
 }
@@ -217,6 +222,21 @@ enum SummaryButton {
     Comment,
     Edit,
     Skip,
+}
+
+/// The humane voice's background smoke test. Holding the sender keeps the
+/// run alive: dropping it (the review was abandoned) cancels the AI run.
+#[derive(Debug, Default)]
+enum SmokeTestState {
+    #[default]
+    NotStarted,
+    /// Never sent on; held only so dropping it cancels the run.
+    Running {
+        _cancel: oneshot::Sender<()>,
+    },
+    Finished(Result<ReviewSmokeTest, String>),
+    /// The diff has no runtime behavior to compare (tests/docs/CI only).
+    NotNeeded,
 }
 
 /// Outcome recorded for one finding, turned into a summary-table row.
@@ -332,6 +352,10 @@ pub struct ReviewPullRequestScreen {
     summary_body: String,
     /// How comments and the summary are worded; toggled on Confirm.
     voice: ReviewVoice,
+    smoke_test: SmokeTestState,
+    /// The walkthrough ended while the smoke test was still running; the
+    /// summary starts as soon as it finishes.
+    summary_waits_for_smoke_test: bool,
     /// Humanize batches still in flight before the walkthrough can show.
     humanize_outstanding: usize,
     /// Markdown editor open on `EditSummary`.
@@ -435,6 +459,8 @@ impl ReviewPullRequestScreen {
                 ReviewWorkflow::Review => ReviewVoice::default(),
                 ReviewWorkflow::Improve => ReviewVoice::Robotic,
             },
+            smoke_test: SmokeTestState::default(),
+            summary_waits_for_smoke_test: false,
             humanize_outstanding: 0,
             summary_input: None,
             decision_button: DecisionButton::Post,
@@ -494,6 +520,9 @@ impl ReviewPullRequestScreen {
     }
     pub fn voice(&self) -> ReviewVoice {
         self.voice
+    }
+    pub fn changed_paths(&self) -> Vec<String> {
+        self.files.iter().map(|file| file.path.clone()).collect()
     }
     pub fn findings_len(&self) -> usize {
         self.findings.len()
@@ -1294,6 +1323,99 @@ impl ReviewPullRequestScreen {
 
     // ── humane voice ────────────────────────────────────────────────────
 
+    /// Mark the smoke test as running. The returned receiver cancels the run
+    /// when this screen (and so the sender it keeps) is dropped.
+    pub fn start_smoke_test(&mut self) -> oneshot::Receiver<()> {
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        self.smoke_test = SmokeTestState::Running { _cancel: cancel_tx };
+        cancel_rx
+    }
+
+    /// The diff has nothing to smoke-test: record why, and never start one.
+    pub fn skip_smoke_test(&mut self, reason: &str) {
+        self.summary_rows.push(SummaryRow::with_note(
+            "smoke test (before/after)",
+            "Not needed",
+            colors::MUTED,
+            Some(reason.to_string()),
+        ));
+        self.smoke_test = SmokeTestState::NotNeeded;
+    }
+
+    /// Why the smoke test produced nothing to post, once it is over.
+    fn smoke_test_error(&self) -> Option<&str> {
+        match &self.smoke_test {
+            SmokeTestState::Finished(Err(err)) => Some(err),
+            _ => None,
+        }
+    }
+
+    pub fn smoke_test_running(&self) -> bool {
+        matches!(self.smoke_test, SmokeTestState::Running { .. })
+    }
+
+    /// The smoke test's result, when it ran and parsed.
+    pub fn smoke_test(&self) -> Option<&ReviewSmokeTest> {
+        match &self.smoke_test {
+            SmokeTestState::Finished(Ok(smoke)) => Some(smoke),
+            _ => None,
+        }
+    }
+
+    /// Store the smoke test's outcome as its own report row (`reused` when it
+    /// came from the cache). Returns `true` when the walkthrough already
+    /// ended and the summary was waiting on it.
+    pub fn finish_smoke_test(
+        &mut self,
+        result: Result<ReviewSmokeTest, String>,
+        reused: bool,
+    ) -> bool {
+        if !self.smoke_test_running() {
+            return false;
+        }
+        const COMMAND: &str = "smoke test (before/after)";
+        let row = match &result {
+            // Whatever it showed is a result: "unchanged" or "regression" is
+            // bad news about the PR, not a broken smoke test.
+            Ok(smoke) => {
+                let (label, color) = match smoke.outcome {
+                    Some(SmokeOutcome::AsDescribed) => ("As described", colors::SUCCESS),
+                    Some(SmokeOutcome::Unchanged) => ("Unchanged", colors::WARNING),
+                    Some(SmokeOutcome::Regression) => ("Regression", colors::ERROR),
+                    Some(SmokeOutcome::Inconclusive) => ("Inconclusive", colors::WARNING),
+                    None => ("Ran", colors::INFO),
+                };
+                let mut note = smoke.outcome_note.trim().to_string();
+                if reused {
+                    note = format!("reused from an earlier run on these commits. {note}");
+                }
+                let note = (!note.trim().is_empty()).then(|| note.trim().to_string());
+                SummaryRow::with_note(COMMAND, label, color, note)
+            }
+            // Only "the AI never produced a usable run" lands here. The
+            // review still completes; the Summary page flags the gap.
+            Err(err) => SummaryRow::with_warning(
+                COMMAND,
+                "Could not run",
+                colors::WARNING,
+                Some(err.clone()),
+            ),
+        };
+        self.summary_rows.push(row);
+        self.smoke_test = SmokeTestState::Finished(result);
+        std::mem::take(&mut self.summary_waits_for_smoke_test)
+    }
+
+    /// The walkthrough is over but the smoke test is not: hold on Working
+    /// until it lands.
+    pub fn wait_for_smoke_test(&mut self) {
+        self.step = ReviewStep::Working;
+        self.phase_message =
+            "Finishing the smoke test on the base branch and this PR...".to_string();
+        self.scanning = false;
+        self.summary_waits_for_smoke_test = true;
+    }
+
     /// Split every finding into humanize batches and hold on Working until
     /// they all return. Each batch is `(finding indices, findings)`.
     pub fn start_humanizing(&mut self) -> Vec<(Vec<usize>, Vec<ReviewFinding>)> {
@@ -2005,17 +2127,20 @@ impl ReviewPullRequestScreen {
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {
         let humane = self.voice == ReviewVoice::Humane;
-        let (steps, description) = if humane {
+        let (steps, balanced_access, description) = if humane {
             (
                 &HUMANE_REVIEW_STEPS,
-                "comments and summary read like a teammate wrote them; off = structured format \
+                "Read-only · runs smoke test",
+                "comments and summary read like a teammate wrote them, with a real before/after \
+                 smoke test (runs the PR's code in a smoke_test_{branch} worktree); off = structured format \
                  with badges, table and charts.",
             )
         } else {
             (
                 &REVIEW_STEPS,
+                "Read-only",
                 "off: structured comments with category/severity badges and a summary table \
-                 with charts; on = written like a teammate.",
+                 with charts; on = written like a teammate, with a real smoke test.",
             )
         };
         PrConfirmView::new(format!("Review Pull Request #{}?", self.request.number))
@@ -2024,7 +2149,12 @@ impl ReviewPullRequestScreen {
             .steps(steps)
             .ai_roles(vec![
                 AiRoleRow::from_config("strong", colors::DARK_NAVY, &self.ai.strong, "Read-only"),
-                AiRoleRow::from_config("balanced", colors::NAVY, &self.ai.balanced, "Read-only"),
+                AiRoleRow::from_config(
+                    "balanced",
+                    colors::NAVY,
+                    &self.ai.balanced,
+                    balanced_access,
+                ),
                 AiRoleRow::from_config(
                     "utility",
                     colors::LIGHT_NAVY,
@@ -2685,22 +2815,42 @@ impl ReviewPullRequestScreen {
             ])
             .split(area);
 
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!("Review summary for Pull Request #{}", self.request.number),
-                    Style::default()
-                        .fg(colors::NAVY)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  ·  ".to_string(), muted_dim()),
-                Span::styled(
-                    format!("{} comment(s) posted", self.posted.len()),
-                    Style::default().fg(colors::EMPHASIS),
-                ),
-            ])),
-            chunks[0],
-        );
+        let mut header = vec![
+            Span::styled(
+                format!("Review summary for Pull Request #{}", self.request.number),
+                Style::default()
+                    .fg(colors::NAVY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ·  ".to_string(), muted_dim()),
+            Span::styled(
+                format!("{} comment(s) posted", self.posted.len()),
+                Style::default().fg(colors::EMPHASIS),
+            ),
+        ];
+        // A smoke test that never produced a report leaves the body without
+        // its section; say so while there is still time to add one.
+        if self.smoke_test_error().is_some() {
+            header.push(Span::styled("  ·  ".to_string(), muted_dim()));
+            header.push(Span::styled(
+                "⚠ smoke test could not run (see Done) · add one via Edit".to_string(),
+                Style::default()
+                    .fg(colors::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        // The smoke test leaves this placeholder where it could not take a
+        // screenshot; posting it as-is would look unfinished.
+        if self.summary_body.contains(SCREENSHOT_TODO_MARKER) {
+            header.push(Span::styled("  ·  ".to_string(), muted_dim()));
+            header.push(Span::styled(
+                format!("⚠ replace {SCREENSHOT_TODO_MARKER} via Edit"),
+                Style::default()
+                    .fg(colors::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -3197,12 +3347,12 @@ const REVIEW_STEPS: [&str; 7] = [
 
 /// Confirm-page steps for the humane voice.
 const HUMANE_REVIEW_STEPS: [&str; 7] = [
-    "Sync the branch + fetch the PR diff and its existing comments",
+    "Sync + fetch the diff; a smoke_test_{branch} worktree runs base vs PR in the background",
     "Only binary or blank-only changes are skipped; risky text changes stay reviewable",
     "AI scans files in parallel; one whole-diff pass alone judges test coverage",
     "The findings are rewritten in a reviewer's own voice — no titles, no badges",
     "You choose Post / Edit / Other / Skip per finding (Edit is AI-free)",
-    "AI writes a short human summary of the concerns that matter",
+    "AI writes a short human summary + the Smoke Test (Steps / Before / After)",
     "You choose Request changes / Comment / Edit / Skip for the summary",
 ];
 
@@ -4900,13 +5050,23 @@ mod tests {
 
     // ── humane voice ────────────────────────────────────────────────────
 
+    fn smoke() -> ReviewSmokeTest {
+        ReviewSmokeTest {
+            outcome: Some(crate::services::review_humane::SmokeOutcome::AsDescribed),
+            outcome_note: "The crash is gone.".to_string(),
+            steps: "1. Run `node smoke.mjs`".to_string(),
+            before: "It crashes.".to_string(),
+            after: "It works.".to_string(),
+        }
+    }
+
     #[test]
     fn confirm_defaults_to_humane_and_space_switches_to_robotic() {
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
         assert_eq!(screen.voice(), ReviewVoice::Humane);
         let dump = render_dump(&mut screen, 120, 44);
         assert!(dump.contains("☒ Humane"), "{dump}");
-        assert!(dump.contains("read like a teammate"), "{dump}");
+        assert!(dump.contains("smoke test"), "{dump}");
 
         assert_eq!(
             screen.handle_key(key(KeyCode::Char(' '))),
@@ -4989,10 +5149,101 @@ mod tests {
     }
 
     #[test]
+    fn smoke_test_reports_whether_the_summary_was_waiting_for_it() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        assert!(
+            !screen.finish_smoke_test(Ok(smoke()), false),
+            "never started"
+        );
+
+        let _cancel = screen.start_smoke_test();
+        assert!(screen.smoke_test_running());
+        assert!(!screen.finish_smoke_test(Ok(smoke()), false));
+        assert_eq!(screen.smoke_test(), Some(&smoke()));
+
+        let _cancel = screen.start_smoke_test();
+        screen.wait_for_smoke_test();
+        assert_eq!(screen.step(), ReviewStep::Working);
+        assert!(screen.finish_smoke_test(Err("npm install failed".to_string()), false));
+        assert_eq!(screen.smoke_test(), None);
+        // Only a run that produced nothing usable lands here: a recovered
+        // warning, and the Summary page says the section is missing.
+        let failed = screen.summary_rows.last().unwrap();
+        assert_eq!(failed.status.as_ref().unwrap().label, "Could not run");
+        assert!(failed.warning);
+        assert_eq!(failed.failure.as_deref(), Some("npm install failed"));
+        screen.enter_summary("Left one comment inline.".to_string());
+        let dump = render_dump(&mut screen, 140, 20);
+        assert!(dump.contains("smoke test could not run"), "{dump}");
+    }
+
+    #[test]
+    fn a_smoke_test_that_disproves_the_pr_is_a_result_not_a_failure() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        for (outcome, label, color) in [
+            (SmokeOutcome::AsDescribed, "As described", colors::SUCCESS),
+            (SmokeOutcome::Unchanged, "Unchanged", colors::WARNING),
+            (SmokeOutcome::Regression, "Regression", colors::ERROR),
+        ] {
+            let _cancel = screen.start_smoke_test();
+            let smoke = ReviewSmokeTest {
+                outcome: Some(outcome),
+                outcome_note: "Same crash on both sides.".to_string(),
+                ..smoke()
+            };
+            screen.finish_smoke_test(Ok(smoke.clone()), false);
+            // Its Before/After still goes into the summary…
+            assert_eq!(screen.smoke_test(), Some(&smoke));
+            // …and the report names the outcome without counting a failure.
+            let row = screen.summary_rows.last().unwrap();
+            let status = row.status.as_ref().unwrap();
+            assert_eq!((status.label.as_str(), status.color), (label, color));
+            assert!(row.success);
+            assert_eq!(row.failure.as_deref(), Some("Same crash on both sides."));
+        }
+    }
+
+    #[test]
+    fn reused_and_skipped_smoke_tests_say_so_on_the_report() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        let _cancel = screen.start_smoke_test();
+        screen.finish_smoke_test(Ok(smoke()), true);
+        let reused = screen.summary_rows.last().unwrap();
+        assert_eq!(reused.status.as_ref().unwrap().label, "As described");
+        assert_eq!(
+            reused.failure.as_deref(),
+            Some("reused from an earlier run on these commits. The crash is gone.")
+        );
+        assert_eq!(screen.smoke_test(), Some(&smoke()));
+
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.skip_smoke_test("only tests, docs, or CI configuration changed");
+        let skipped = screen.summary_rows.last().unwrap();
+        assert_eq!(skipped.status.as_ref().unwrap().label, "Not needed");
+        assert!(skipped.success);
+        assert!(!screen.smoke_test_running());
+        assert_eq!(screen.smoke_test(), None);
+        assert!(
+            !screen.finish_smoke_test(Ok(smoke()), false),
+            "never started"
+        );
+    }
+
+    #[test]
+    fn dropping_the_screen_cancels_the_smoke_test() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        let mut cancel = screen.start_smoke_test();
+        assert_eq!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        drop(screen);
+        assert_eq!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+    }
+
+    #[test]
     fn summary_edit_saves_or_discards_the_markdown() {
         let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
-        screen.enter_summary("Nice fix".to_string());
+        screen.enter_summary("Nice fix\n\nTODO(screenshot): the header".to_string());
         let dump = render_dump(&mut screen, 120, 24);
+        assert!(dump.contains("replace TODO(screenshot) via Edit"), "{dump}");
         assert!(dump.contains("Edit"), "{dump}");
 
         // Comment → Edit.
@@ -5010,7 +5261,7 @@ mod tests {
         assert_eq!(screen.step(), ReviewStep::Summary);
         assert_eq!(
             screen.summary_body(),
-            "Nice fix ![after](https://example.test/a.png)"
+            "Nice fix\n\nTODO(screenshot): the header ![after](https://example.test/a.png)"
         );
 
         // Esc in the editor keeps the body as it was.

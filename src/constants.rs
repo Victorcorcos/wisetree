@@ -54,6 +54,10 @@ pub const REVIEW_DIR_NAME: &str = ".wisetree/review";
 /// for the table stays diagnosable after the screen closes.
 pub const REVIEW_REPORT_FILE_NAME: &str = "report.json";
 
+/// Review's smoke-test cache, keyed by the (before, after) commit pair, in the
+/// review state dir next to `report.json`.
+pub const SMOKE_TEST_CACHE_FILE_NAME: &str = "smoke_tests.json";
+
 /// Commit message title written when the "Update Pull Request" flow
 /// committed the result of an AI-assisted conflict resolution. Kept as a
 /// constant so downstream tooling (release notes, blame heuristics) can

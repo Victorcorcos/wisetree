@@ -19,8 +19,8 @@ use tokio::time::{self, MissedTickBehavior};
 use crate::config::schema::{
     normalize_dashboard_columns, AiHarness, AiModelConfig, DashboardConfig,
 };
-use crate::constants::dashboard_pr_cache_file;
-use crate::errors::{handle_git_error, Result, WisetreeError};
+use crate::constants::{dashboard_pr_cache_file, review_artifact_file, SMOKE_TEST_CACHE_FILE_NAME};
+use crate::errors::{handle_git_error, user_friendly_message, Result, WisetreeError};
 use crate::files::{strip_ansi, ActivityKind};
 use crate::git::exec::execute_git_command;
 use crate::git::lock::{git_lock_path, retry_on_git_lock};
@@ -39,8 +39,12 @@ use crate::services::improve_run::{
     save_improve_run, ImproveCheckpointIdentity, ImproveItemState, ImproveRun,
 };
 use crate::services::review_humane::{
-    build_humane_summary_prompt, build_humanize_prompt, parse_humanized_comments,
-    revision_voice_section, validate_humane_summary_overview, ReviewHumanizeAttempt, ReviewVoice,
+    build_humane_summary_prompt, build_humanize_prompt, build_smoke_reformat_prompt,
+    build_smoke_test_facts, build_smoke_test_prompt, load_cached_smoke_test,
+    parse_humanized_comments, parse_smoke_test, revision_voice_section, smoke_test_setup_report,
+    smoke_test_worktree_name, store_smoke_test, validate_humane_summary_overview,
+    ReviewHumanizeAttempt, ReviewSmokeTest, ReviewSmokeTestAttempt, ReviewSmokeTestRequest,
+    ReviewVoice, SMOKE_TEST_MANIFESTS,
 };
 use crate::services::review_telemetry::{
     opencode_usage_for_title, review_scan_title, ReviewScanTelemetry, ReviewTokenUsage,
@@ -127,6 +131,14 @@ const REVIEW_SCAN_TIMEOUT: Duration = Duration::from_secs(240);
 const REVIEW_SUMMARY_TIMEOUT: Duration = Duration::from_secs(30);
 /// The humane summary is longer prose from the balanced profile.
 const REVIEW_HUMANE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
+/// The smoke test installs, builds, and runs the PR twice.
+const REVIEW_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// A smoke-test run that broke gets one more try in the same worktree.
+const REVIEW_SMOKE_TEST_ATTEMPTS: usize = 2;
+/// Each git step that resolves the smoke test's commits.
+const REVIEW_SMOKE_CHECKOUT_TIMEOUT: Duration = Duration::from_secs(120);
+/// One `<runtime> --version` probe for the smoke test's repository facts.
+const REVIEW_SMOKE_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const REVIEW_POST_TIMEOUT: Duration = Duration::from_secs(30);
 /// GitHub's API occasionally answers a healthy PR with a transient 5xx (a
 /// blip in their infra, not a real problem with the PR or its diff). Retried
@@ -1031,6 +1043,9 @@ pub enum ReviewPreparation {
         repo: String,
         /// PR head commit sha — required by the inline-comment API.
         head_sha: String,
+        /// GitHub's base branch name — where the humane smoke test's
+        /// "before" run starts from.
+        base_ref_name: String,
     },
     /// The PR diff contains no reviewable text changes.
     NoChanges,
@@ -3763,6 +3778,7 @@ impl DashboardService {
             owner,
             repo,
             head_sha,
+            base_ref_name,
         })
     }
 
@@ -4441,8 +4457,10 @@ impl DashboardService {
             .await
     }
 
-    /// One captured Review AI call with the given `permission`; `cancel`
-    /// stops it when its sender fires or is dropped.
+    /// One captured Review AI call. Only the smoke test runs with
+    /// `Implement` (it executes the PR's code in its `smoke_test_*`
+    /// worktree) and passes a live `cancel` so abandoning the review stops
+    /// it; every other call is read-only.
     async fn run_review_ai(
         &self,
         cwd: &Path,
@@ -4888,15 +4906,18 @@ impl DashboardService {
         }
     }
 
-    /// Humane voice: the review body, written from the posted findings.
+    /// Humane voice: the opening of the review body, written from the posted
+    /// findings and the smoke-test outcome. The smoke-test section itself is
+    /// appended deterministically by [`build_humane_review_summary`].
     pub async fn generate_humane_review_summary_overview(
         &self,
         worktree_path: &str,
         posted: &[ReviewFinding],
+        smoke_test: Option<&ReviewSmokeTest>,
         pr_title: &str,
     ) -> ReviewSummaryAttempt {
         let started = Instant::now();
-        let prompt = build_humane_summary_prompt(posted, pr_title);
+        let prompt = build_humane_summary_prompt(posted, smoke_test, pr_title);
         let prompt_bytes = prompt.len();
         let selection = self.review_model_selection(ReviewModelProfile::Balanced);
         let telemetry = |usage| {
@@ -4933,6 +4954,353 @@ impl DashboardService {
             result,
             telemetry: telemetry(usage),
         }
+    }
+
+    /// Humane voice: smoke-test the PR for real. A wisetree worktree
+    /// `smoke_test_{BRANCH}` is created off the PR branch exactly like one
+    /// the user creates (copy/link patterns and post-create commands, but no
+    /// terminal), so the project is ready to run; the balanced model then
+    /// runs the same scenario on the merge-base and on the PR head inside it
+    /// and reports the real output plus an outcome. A run whose report missed
+    /// the format is repaired by the utility model instead of re-run; a run
+    /// that broke is retried once in the same, already-prepared worktree.
+    /// The worktree and its branch are removed afterwards, also on failure
+    /// or cancel (dropping `cancel`'s sender).
+    ///
+    /// Before any of that, the two commits are resolved from the PR branch
+    /// and looked up in the smoke-test cache: when this exact pair was
+    /// already smoke-tested, its result is reused at no cost.
+    pub async fn run_review_smoke_test(
+        &self,
+        worktree_path: &str,
+        request: &ReviewSmokeTestRequest,
+        mut cancel: oneshot::Receiver<()>,
+    ) -> ReviewSmokeTestAttempt {
+        let failed = |err: WisetreeError| ReviewSmokeTestAttempt {
+            result: Err(err),
+            telemetry: Vec::new(),
+            cleanup_error: None,
+            reused: false,
+        };
+        let selection = self.review_model_selection(ReviewModelProfile::Balanced);
+        if selection.model.is_empty() {
+            return failed(WisetreeError::other(
+                "ai.review.balanced model is not configured.",
+            ));
+        }
+        let cwd = PathBuf::from(worktree_path);
+        // The PR's head as GitHub has it (the diff under review), which the
+        // branch sync fetched. The local branch can sit on top of it, e.g. a
+        // local merge of the base; it is used only if the head is missing.
+        let head = format!("{}^{{commit}}", request.head_sha);
+        let after = if !request.head_sha.is_empty()
+            && self
+                .smoke_git(&cwd, &["cat-file", "-e", &head])
+                .await
+                .is_ok()
+        {
+            request.head_sha.as_str()
+        } else {
+            request.branch.as_str()
+        };
+        let (before_sha, after_sha) = match self
+            .resolve_smoke_test_commits(&cwd, after, &request.base_ref_name)
+            .await
+        {
+            Ok(commits) => commits,
+            Err(err) => return failed(err),
+        };
+        let cache_file = review_artifact_file(&cwd, SMOKE_TEST_CACHE_FILE_NAME);
+        if let Some(smoke) = load_cached_smoke_test(&cache_file, &before_sha, &after_sha) {
+            return ReviewSmokeTestAttempt {
+                result: Ok(smoke),
+                telemetry: Vec::new(),
+                cleanup_error: None,
+                reused: true,
+            };
+        }
+        let worktree = match self
+            .create_smoke_test_worktree(&cwd, request, before_sha, after_sha)
+            .await
+        {
+            Ok(worktree) => worktree,
+            Err(err) => {
+                return failed(WisetreeError::other(format!(
+                    "could not create the smoke-test worktree: {}",
+                    user_friendly_message(&err)
+                )))
+            }
+        };
+        let repo_facts = self.gather_smoke_test_facts(&worktree).await;
+        let prompt = build_smoke_test_prompt(
+            request,
+            &worktree.branch,
+            &worktree.before_sha,
+            &worktree.after_sha,
+            &worktree.setup_report,
+            &repo_facts,
+        );
+        let mut telemetry = Vec::new();
+        let mut result = Err(WisetreeError::other("the smoke test did not run"));
+        for attempt in 0..REVIEW_SMOKE_TEST_ATTEMPTS {
+            let attempt_prompt = match (attempt, &result) {
+                (0, _) => prompt.clone(),
+                (_, Err(err)) => format!(
+                    "{prompt}\n\n## Previous attempt\n\nAn earlier attempt in this same worktree \
+                     ended without a usable report ({}). Whatever it installed or built is still \
+                     here. Finish the smoke test and emit the block.",
+                    user_friendly_message(err)
+                ),
+                (_, Ok(_)) => break,
+            };
+            let started = Instant::now();
+            let prompt_bytes = attempt_prompt.len();
+            // A fresh receiver per attempt; the review's own `cancel` wins the
+            // race below, and dropping the run future kills the AI process.
+            let (_attempt_cancel_tx, attempt_cancel) = oneshot::channel();
+            let run = self.run_review_ai(
+                &worktree.path,
+                &selection,
+                attempt_prompt,
+                REVIEW_SMOKE_TEST_TIMEOUT,
+                AiPermission::Implement,
+                attempt_cancel,
+            );
+            let (output, usage) = tokio::select! {
+                ran = run => ran,
+                _ = &mut cancel => {
+                    result = Err(WisetreeError::other("the review was abandoned"));
+                    break;
+                }
+            };
+            telemetry.push(review_call_telemetry(
+                "smoke-test",
+                &selection,
+                prompt_bytes,
+                started,
+                usage,
+                usize::from(
+                    output
+                        .as_ref()
+                        .is_ok_and(|out| parse_smoke_test(out).is_some()),
+                ),
+            ));
+            result = match output {
+                Ok(output) => match parse_smoke_test(&output) {
+                    Some(smoke) => Ok(smoke),
+                    None => {
+                        let (repaired, repair_telemetry) =
+                            self.repair_smoke_test_report(&worktree.path, &output).await;
+                        telemetry.push(repair_telemetry);
+                        repaired
+                    }
+                },
+                Err(err) => Err(err),
+            };
+            // Another full run cannot beat a timeout.
+            if matches!(&result, Err(err) if user_friendly_message(err).contains("timed out")) {
+                break;
+            }
+        }
+        let cleanup_error = self.remove_smoke_test_worktree(&worktree).await;
+        if let Ok(smoke) = &result {
+            // A cache that cannot be written only costs a re-run next time.
+            let _ = store_smoke_test(
+                &cache_file,
+                &worktree.before_sha,
+                &worktree.after_sha,
+                smoke,
+            );
+        }
+        ReviewSmokeTestAttempt {
+            result,
+            telemetry,
+            cleanup_error,
+            reused: false,
+        }
+    }
+
+    /// Re-emit a smoke-test report that ran but missed the contract, with the
+    /// utility model and without re-running anything.
+    async fn repair_smoke_test_report(
+        &self,
+        cwd: &Path,
+        previous_output: &str,
+    ) -> (Result<ReviewSmokeTest>, ReviewScanTelemetry) {
+        let started = Instant::now();
+        let prompt = build_smoke_reformat_prompt(previous_output);
+        let prompt_bytes = prompt.len();
+        let selection = self.review_model_selection(ReviewModelProfile::Utility);
+        let (output, usage) = if selection.model.is_empty() {
+            (
+                Err(WisetreeError::other(
+                    "ai.review.utility model is not configured.",
+                )),
+                None,
+            )
+        } else {
+            self.run_text_only_review_prompt(cwd, &selection, prompt, REVIEW_SCAN_TIMEOUT)
+                .await
+        };
+        let result = output.and_then(|output| {
+            parse_smoke_test(&output)
+                .ok_or_else(|| WisetreeError::other("could not parse the smoke test report"))
+        });
+        let telemetry = review_call_telemetry(
+            "smoke-test-reformat",
+            &selection,
+            prompt_bytes,
+            started,
+            usage,
+            usize::from(result.is_ok()),
+        );
+        (result, telemetry)
+    }
+
+    /// Create the `smoke_test_{BRANCH}` worktree at `after_sha` (the PR head)
+    /// through wisetree's own create flow. A leftover from a run that never
+    /// finished is removed first. The new worktree must sit on `after_sha`,
+    /// the commit the cache entry and the prompt are keyed on.
+    async fn create_smoke_test_worktree(
+        &self,
+        cwd: &Path,
+        request: &ReviewSmokeTestRequest,
+        before_sha: String,
+        after_sha: String,
+    ) -> Result<SmokeTestWorktree> {
+        let name = smoke_test_worktree_name(&request.branch);
+        let mut service = WorktreeService::new(Some(cwd.to_path_buf()));
+        service.initialize().await?;
+        remove_smoke_test_leftovers(&service, &name).await?;
+        let options = WorktreeCreateOptions {
+            name: name.clone(),
+            source_branch: after_sha.clone(),
+            new_branch: name.clone(),
+            base_path: String::new(),
+        };
+        let outcome = service.create_smoke_test_worktree(&options).await?;
+        let worktree = SmokeTestWorktree {
+            service,
+            path: outcome.worktree_path.clone(),
+            branch: name,
+            before_sha,
+            after_sha,
+            setup_report: smoke_test_setup_report(&outcome),
+        };
+        match self.smoke_git(&worktree.path, &["rev-parse", "HEAD"]).await {
+            Ok(head) if head == worktree.after_sha => Ok(worktree),
+            other => {
+                let _ = self.remove_smoke_test_worktree(&worktree).await;
+                Err(other.err().unwrap_or_else(|| {
+                    WisetreeError::other(format!(
+                        "the branch '{}' moved while the smoke test was starting",
+                        request.branch
+                    ))
+                }))
+            }
+        }
+    }
+
+    /// `(before, after)`: `commitish` resolved to a sha, and its merge-base
+    /// with the PR's (refreshed) base branch.
+    async fn resolve_smoke_test_commits(
+        &self,
+        cwd: &Path,
+        commitish: &str,
+        base_ref_name: &str,
+    ) -> Result<(String, String)> {
+        let commit = format!("{commitish}^{{commit}}");
+        let after_sha = self
+            .smoke_git(cwd, &["rev-parse", "--verify", &commit])
+            .await?;
+        let base_ref = self
+            .resolve_refreshed_base_ref(cwd, base_ref_name)
+            .await
+            .ok_or_else(|| {
+                WisetreeError::other(format!(
+                    "could not resolve a local ref for the base branch '{base_ref_name}'"
+                ))
+            })?;
+        let before_sha = self
+            .smoke_git(cwd, &["merge-base", &base_ref, &after_sha])
+            .await?;
+        Ok((before_sha, after_sha))
+    }
+
+    /// The discovery facts the smoke-test AI would otherwise collect in its
+    /// first turns: diff stat, diff, submodules, runtimes, root manifests.
+    /// Anything that cannot be read is simply left out.
+    async fn gather_smoke_test_facts(&self, worktree: &SmokeTestWorktree) -> String {
+        let path = worktree.path.as_path();
+        let (before, after) = (worktree.before_sha.as_str(), worktree.after_sha.as_str());
+        let diff_stat = self
+            .smoke_git(path, &["diff", "--stat", before, after])
+            .await
+            .unwrap_or_default();
+        let diff = self
+            .smoke_git(path, &["diff", "--no-color", before, after])
+            .await
+            .unwrap_or_default();
+        let submodules = self
+            .smoke_git(path, &["submodule", "status"])
+            .await
+            .unwrap_or_default();
+        let mut manifests = Vec::new();
+        let mut runtimes: Vec<(String, String)> = Vec::new();
+        for (manifest, tools) in SMOKE_TEST_MANIFESTS {
+            let Ok(content) = tokio::fs::read_to_string(path.join(manifest)).await else {
+                continue;
+            };
+            manifests.push((manifest.to_string(), content));
+            for (tool, version_arg) in *tools {
+                if runtimes.iter().any(|(known, _)| known == tool) {
+                    continue;
+                }
+                let version = time::timeout(
+                    REVIEW_SMOKE_RUNTIME_PROBE_TIMEOUT,
+                    run_command(Path::new(tool), &[version_arg], Some(path)),
+                )
+                .await
+                .ok()
+                .and_then(|out| out.ok())
+                .and_then(|out| out.lines().next().map(|line| line.trim().to_string()))
+                .unwrap_or_else(|| "not installed".to_string());
+                runtimes.push((tool.to_string(), version));
+            }
+        }
+        build_smoke_test_facts(&diff_stat, &diff, &submodules, &runtimes, &manifests)
+    }
+
+    /// `git <args>` for the smoke test's bookkeeping, trimmed stdout.
+    async fn smoke_git(&self, dir: &Path, args: &[&str]) -> Result<String> {
+        time::timeout(
+            REVIEW_SMOKE_CHECKOUT_TIMEOUT,
+            run_command(&self.git_binary, args, Some(dir)),
+        )
+        .await
+        .unwrap_or_else(|_| Err(format!("git {} timed out", args.join(" "))))
+        .map(|out| out.trim().to_string())
+        .map_err(WisetreeError::other)
+    }
+
+    /// Delete the smoke worktree and its branch. The branch goes even when
+    /// `deleteBranchWithWorktree` is off: it only ever existed for this run.
+    async fn remove_smoke_test_worktree(&self, worktree: &SmokeTestWorktree) -> Option<String> {
+        let path = worktree.path.to_string_lossy().into_owned();
+        if let Err(err) = worktree.service.delete_worktree(&path, true).await {
+            return Some(format!("{path}: {}", user_friendly_message(&err)));
+        }
+        let git = worktree.service.git_service();
+        if git.branch_exists(&worktree.branch).await {
+            if let Err(err) = git.delete_branch(&worktree.branch, true).await {
+                return Some(format!(
+                    "branch {}: {}",
+                    worktree.branch,
+                    user_friendly_message(&err)
+                ));
+            }
+        }
+        None
     }
 
     /// Post one approved finding to the PR — inline when it carries a
@@ -11347,6 +11715,34 @@ async fn build_review_directory_inventory(
     }
     rendered.truncate(rendered.trim_end().len());
     rendered
+}
+
+/// The `smoke_test_{BRANCH}` worktree of one smoke test, with the service
+/// that created it (and will delete it).
+struct SmokeTestWorktree {
+    service: WorktreeService,
+    path: PathBuf,
+    branch: String,
+    before_sha: String,
+    after_sha: String,
+    setup_report: String,
+}
+
+/// Remove a `smoke_test_{BRANCH}` worktree and branch left behind by a run
+/// that never finished (e.g. wisetree quit mid-test), so creation starts
+/// clean.
+async fn remove_smoke_test_leftovers(service: &WorktreeService, name: &str) -> Result<()> {
+    let git = service.git_service();
+    for worktree in git.list_worktrees().await? {
+        let named = Path::new(&worktree.path).file_name() == Some(std::ffi::OsStr::new(name));
+        if !worktree.is_main && (worktree.branch == name || named) {
+            service.delete_worktree(&worktree.path, true).await?;
+        }
+    }
+    if git.branch_exists(name).await {
+        git.delete_branch(name, true).await?;
+    }
+    Ok(())
 }
 
 /// Telemetry for a single Review AI call outside the scan pool.
@@ -18044,6 +18440,185 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
         assert_eq!(files[0].path, "a.txt");
         assert!(files[0].commentable_lines.contains(&2)); // the changed "TWO"
         assert!(files[0].commentable_lines.contains(&4)); // the added "four"
+    }
+
+    #[tokio::test]
+    async fn smoke_test_worktree_is_a_wisetree_worktree_named_after_the_branch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let mother = tmp.path().join("app");
+        let review = tmp.path().join("review");
+        std::fs::create_dir_all(&work).unwrap();
+        let remote_str = remote.to_str().unwrap();
+        git(tmp.path(), &["init", "-q", "--bare", remote_str]);
+        git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&work, &["init", "-q"]);
+        git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(work.join("a.txt"), "base\n").unwrap();
+        std::fs::write(work.join("package.json"), "{\"name\": \"app\"}\n").unwrap();
+        std::fs::write(work.join(".gitignore"), ".env\n.wisetree/\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", remote_str]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // The mother checkout carries the project's wisetree setup: an env
+        // file to copy, a post-create command, and a terminal command that
+        // must NOT run for a background smoke test.
+        git(
+            tmp.path(),
+            &["clone", "-q", remote_str, mother.to_str().unwrap()],
+        );
+        std::fs::write(mother.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::create_dir_all(mother.join(".wisetree")).unwrap();
+        std::fs::write(
+            mother.join(".wisetree/config.json"),
+            r#"{"worktreeCopyPatterns": [".env"], "postCreateCmd": ["echo ready > post_create_ran"], "terminalCommand": "touch terminal_opened"}"#,
+        )
+        .unwrap();
+
+        // The reviewed PR lives in its own linked worktree.
+        git(
+            &mother,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/x",
+                review.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(review.join("a.txt"), "feature\n").unwrap();
+        git(&review, &["commit", "-q", "-am", "feature"]);
+        let head_sha = git(&review, &["rev-parse", "HEAD"]);
+        let base_sha = git(&review, &["rev-parse", "origin/main"]);
+        // The reviewer's branch sits on top of the PR head (e.g. a local
+        // merge): the smoke test must still run the PR as GitHub has it.
+        std::fs::write(review.join("local_only.txt"), "not in the PR\n").unwrap();
+        git(&review, &["add", "local_only.txt"]);
+        git(&review, &["commit", "-q", "-m", "local only"]);
+        let local_tip = git(&review, &["rev-parse", "HEAD"]);
+        // `main` moves on after the PR branched off: "before" must still be
+        // the commit the PR started from.
+        std::fs::write(work.join("a.txt"), "main moved on\n").unwrap();
+        git(&work, &["commit", "-q", "-am", "later"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        // A run that never finished left its branch behind.
+        git(&mother, &["branch", "smoke_test_feature-x", "main"]);
+
+        let service = DashboardService::new(review.clone(), DashboardConfig::default());
+        let request = ReviewSmokeTestRequest {
+            number: 7,
+            title: "Feature".to_string(),
+            branch: "feature/x".to_string(),
+            base_ref_name: "main".to_string(),
+            head_sha: head_sha.clone(),
+            changed_files: vec!["a.txt".to_string()],
+        };
+        // Both commits resolve before any worktree exists.
+        let (before_sha, after_sha) = service
+            .resolve_smoke_test_commits(&review, &head_sha, "main")
+            .await
+            .expect("the commits resolve");
+        assert_eq!(
+            (before_sha.as_str(), after_sha.as_str()),
+            (base_sha.as_str(), head_sha.as_str())
+        );
+        let worktree = service
+            .create_smoke_test_worktree(&review, &request, before_sha.clone(), after_sha.clone())
+            .await
+            .expect("the smoke worktree is created");
+        let path = worktree.path.clone();
+        assert_eq!(path.file_name().unwrap(), "smoke_test_feature-x");
+        assert_eq!(worktree.branch, "smoke_test_feature-x");
+        assert_eq!(
+            git(&path, &["branch", "--show-current"]),
+            "smoke_test_feature-x"
+        );
+        assert_eq!(worktree.after_sha, head_sha);
+        assert_eq!(worktree.before_sha, base_sha);
+        assert_eq!(
+            std::fs::read_to_string(path.join("a.txt")).unwrap(),
+            "feature\n"
+        );
+        assert!(!path.join("local_only.txt").exists());
+        // Created through wisetree: env copied, post-create command ran…
+        assert_eq!(
+            std::fs::read_to_string(path.join(".env")).unwrap(),
+            "SECRET=1\n"
+        );
+        assert!(path.join("post_create_ran").exists());
+        assert!(
+            worktree.setup_report.contains("`.env`"),
+            "{}",
+            worktree.setup_report
+        );
+        assert!(
+            worktree
+                .setup_report
+                .contains("Post-create command `echo ready > post_create_ran`: succeeded"),
+            "{}",
+            worktree.setup_report
+        );
+        // …and it is a real worktree the dashboard lists.
+        assert!(git(&mother, &["worktree", "list"]).contains("smoke_test_feature-x"));
+        // …but no terminal was opened for it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!path.join("terminal_opened").exists());
+
+        // The facts the AI no longer has to collect itself.
+        let facts = service.gather_smoke_test_facts(&worktree).await;
+        assert!(facts.contains("a.txt | 2 +-"), "{facts}");
+        assert!(facts.contains("-base\n+feature"), "{facts}");
+        assert!(facts.contains("#### Submodules\n\nnone"), "{facts}");
+        assert!(facts.contains("- `node`: "), "{facts}");
+        assert!(facts.contains("- `npm`: "), "{facts}");
+        assert!(
+            facts.contains("#### `package.json`\n\n~~~\n{\"name\": \"app\"}"),
+            "{facts}"
+        );
+
+        assert_eq!(service.remove_smoke_test_worktree(&worktree).await, None);
+        assert!(!path.exists());
+        assert_eq!(
+            git(&mother, &["branch", "--list", "smoke_test_feature-x"]),
+            ""
+        );
+        assert!(!git(&mother, &["worktree", "list"]).contains("smoke_test"));
+        // The reviewed worktree is untouched.
+        assert_eq!(git(&review, &["status", "--porcelain"]), "");
+        assert_eq!(git(&review, &["rev-parse", "HEAD"]), local_tip);
+
+        // A smoke test already run on these two commits is reused: no
+        // worktree, no post-create commands, no AI call. The key is the PR
+        // head, not the reviewer's local tip on top of it.
+        let cached = ReviewSmokeTest {
+            outcome: Some(crate::services::review_humane::SmokeOutcome::Unchanged),
+            outcome_note: "Same output on both sides.".to_string(),
+            steps: "1. Run it.".to_string(),
+            before: "x".to_string(),
+            after: "x".to_string(),
+        };
+        let cache_file = review_artifact_file(&review, SMOKE_TEST_CACHE_FILE_NAME);
+        // Next to Review's other state, in the mother checkout.
+        assert!(
+            cache_file.starts_with(mother.canonicalize().unwrap()),
+            "{cache_file:?}"
+        );
+        store_smoke_test(&cache_file, &before_sha, &after_sha, &cached).unwrap();
+        let mut config = DashboardConfig::default();
+        config.ai.review.balanced.model = "opencode/review-test".to_string();
+        let service = DashboardService::new(review.clone(), config);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let attempt = service
+            .run_review_smoke_test(review.to_str().unwrap(), &request, cancel_rx)
+            .await;
+        assert!(attempt.reused);
+        assert_eq!(attempt.result.unwrap(), cached);
+        assert!(attempt.telemetry.is_empty());
+        assert!(!git(&mother, &["worktree", "list"]).contains("smoke_test"));
     }
 
     #[tokio::test]

@@ -35,7 +35,10 @@ use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::dashboard::{review_feedback_needs_expanded_context, ReviewRevisionMode};
 use crate::services::presets::WisePresetDiscovery;
-use crate::services::review_humane::{deterministic_humane_overview, ReviewVoice};
+use crate::services::review_humane::{
+    build_humane_review_summary, deterministic_humane_overview, smoke_test_skip_reason,
+    ReviewSmokeTest, ReviewSmokeTestRequest, ReviewVoice,
+};
 use crate::services::{
     build_review_summary, build_review_summary_with_overview, check_for_updates_all_sources,
     compute_attempt_changes, default_dashboard_warning, detect_shell_integration,
@@ -267,6 +270,15 @@ enum AppEvent {
         indices: Vec<usize>,
         result: Result<Vec<Option<String>>, String>,
         telemetry: Option<ReviewScanTelemetry>,
+    },
+    /// The humane voice's background smoke test finished. `cleanup_error`
+    /// says its `smoke_test_*` worktree could not be removed; `reused` that
+    /// the result came from the cache for the same two commits.
+    ReviewPrSmokeTested {
+        result: Result<ReviewSmokeTest, String>,
+        telemetry: Vec<ReviewScanTelemetry>,
+        cleanup_error: Option<String>,
+        reused: bool,
     },
     /// The utility model generated (or failed to generate) the prose-only
     /// overview that precedes the deterministic summary data.
@@ -4301,19 +4313,31 @@ impl App {
     }
 
     /// The walkthrough is over: write the summary from the posted comments,
-    /// or go straight to the report when there is nothing to submit.
+    /// or go straight to the report when there is nothing to submit. The
+    /// humane voice first waits for its smoke test, and still offers a
+    /// summary with no posted comments when the smoke test has something
+    /// to show.
     fn close_review_walkthrough(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
         let Some(screen) = self.review_pr.as_mut() else {
             return;
         };
-        if screen.posted_findings().is_empty() {
+        let voice = screen.voice();
+        if voice == ReviewVoice::Humane && screen.smoke_test_running() {
+            screen.wait_for_smoke_test();
+            return;
+        }
+        let smoke_test = screen.smoke_test().cloned();
+        if screen.posted_findings().is_empty()
+            && (voice == ReviewVoice::Robotic || smoke_test.is_none())
+        {
             screen.enter_done();
             return;
         }
         let request = ReviewSummaryRequest {
             worktree_path: screen.request().worktree_path.clone(),
             posted: screen.posted_findings().to_vec(),
-            voice: screen.voice(),
+            voice,
+            smoke_test,
             pr_title: screen.request().title.clone(),
         };
         screen.start_generating_summary();
@@ -4350,6 +4374,47 @@ impl App {
         }
     }
 
+    /// Humane voice only: smoke-test the PR in the background while the
+    /// scans run. The screen keeps the cancel handle, so abandoning the
+    /// review stops the run.
+    fn start_review_smoke_test(
+        &mut self,
+        base_ref_name: String,
+        head_sha: String,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        if screen.voice() != ReviewVoice::Humane || screen.is_improve() {
+            return;
+        }
+        let mut changed_paths = screen.changed_paths();
+        changed_paths.extend(screen.skipped_files().iter().map(|file| file.path.clone()));
+        if let Some(reason) = smoke_test_skip_reason(&changed_paths) {
+            screen.skip_smoke_test(reason);
+            return;
+        }
+        let worktree_path = screen.request().worktree_path.clone();
+        let request = ReviewSmokeTestRequest {
+            number: screen.request().number,
+            title: screen.request().title.clone(),
+            branch: screen.request().branch.clone(),
+            base_ref_name,
+            head_sha,
+            changed_files: screen.changed_paths(),
+        };
+        let cancel = screen.start_smoke_test();
+        kick_off_review_smoke_test(
+            self.git_root.clone(),
+            self.current_dashboard_config(),
+            worktree_path,
+            request,
+            cancel,
+            tx.clone(),
+        );
+    }
+
     fn apply_review_pr_humanized(
         &mut self,
         indices: Vec<usize>,
@@ -4374,6 +4439,45 @@ impl App {
         }
     }
 
+    fn apply_review_pr_smoke_tested(
+        &mut self,
+        outcome: ReviewSmokeTestOutcome,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        let ReviewSmokeTestOutcome {
+            result,
+            telemetry,
+            cleanup_error,
+            reused,
+        } = outcome;
+        let Some(screen) = self.review_pr.as_mut() else {
+            return;
+        };
+        for telemetry in telemetry {
+            screen.record_scan_telemetry(telemetry);
+        }
+        let failure = result.as_ref().err().map(|err| truncate_error(err));
+        let summary_was_waiting = screen.finish_smoke_test(result, reused);
+        if let Some(err) = failure {
+            self.show_toast(
+                ToastVariant::Warning,
+                format!("The smoke test could not run ({err}); add one with Edit on the summary."),
+            );
+        }
+        if let Some(err) = cleanup_error {
+            self.show_toast(
+                ToastVariant::Warning,
+                format!(
+                    "Could not remove the smoke-test worktree ({}); delete it from the dashboard.",
+                    truncate_error(&err)
+                ),
+            );
+        }
+        if summary_was_waiting {
+            self.close_review_walkthrough(tx);
+        }
+    }
+
     fn apply_review_pr_summary_generated(
         &mut self,
         result: Result<String, String>,
@@ -4391,7 +4495,9 @@ impl App {
         let posted = screen.posted_findings();
         let body = match screen.voice() {
             ReviewVoice::Humane => {
-                result.unwrap_or_else(|_| deterministic_humane_overview(posted.len()))
+                let overview =
+                    result.unwrap_or_else(|_| deterministic_humane_overview(posted.len()));
+                build_humane_review_summary(&overview, screen.smoke_test())
             }
             ReviewVoice::Robotic => match result {
                 Ok(overview) => build_review_summary_with_overview(posted, &overview),
@@ -4430,13 +4536,15 @@ impl App {
                     owner,
                     repo,
                     head_sha,
+                    base_ref_name,
                 } => {
                     if let Some(screen) = self.review_pr.as_mut() {
                         screen.set_scan_mode(scan_mode);
                         screen.set_review_context(*context);
-                        screen.set_files(files, owner, repo, head_sha);
+                        screen.set_files(files, owner, repo, head_sha.clone());
                         screen.record_skipped_files(&skipped);
                     }
+                    self.start_review_smoke_test(base_ref_name, head_sha, tx);
                     // With every changed file filtered out (e.g. a
                     // lockfile-only PR) this goes straight to the Done
                     // report, which lists each skip and its reason.
@@ -8625,6 +8733,20 @@ impl App {
                 result,
                 telemetry,
             } => self.apply_review_pr_humanized(indices, result, telemetry),
+            AppEvent::ReviewPrSmokeTested {
+                result,
+                telemetry,
+                cleanup_error,
+                reused,
+            } => self.apply_review_pr_smoke_tested(
+                ReviewSmokeTestOutcome {
+                    result,
+                    telemetry,
+                    cleanup_error,
+                    reused,
+                },
+                tx,
+            ),
             AppEvent::ReviewPrSummaryGenerated { result, telemetry } => {
                 self.apply_review_pr_summary_generated(result, telemetry)
             }
@@ -11518,11 +11640,21 @@ struct ReviewPostRequest {
     index: usize,
 }
 
+/// A finished smoke test as the `App` receives it (the fields of
+/// `AppEvent::ReviewPrSmokeTested`).
+struct ReviewSmokeTestOutcome {
+    result: Result<ReviewSmokeTest, String>,
+    telemetry: Vec<ReviewScanTelemetry>,
+    cleanup_error: Option<String>,
+    reused: bool,
+}
+
 /// Inputs for writing the review summary once the walkthrough ends.
 struct ReviewSummaryRequest {
     worktree_path: String,
     posted: Vec<ReviewFinding>,
     voice: ReviewVoice,
+    smoke_test: Option<ReviewSmokeTest>,
     pr_title: String,
 }
 
@@ -11547,6 +11679,7 @@ fn kick_off_generate_review_summary(
                     .generate_humane_review_summary_overview(
                         &request.worktree_path,
                         &request.posted,
+                        request.smoke_test.as_ref(),
                         &request.pr_title,
                     )
                     .await
@@ -11590,6 +11723,37 @@ fn kick_off_humanize_review_findings(
             indices,
             result: attempt.result.map_err(|err| user_friendly_message(&err)),
             telemetry: Some(attempt.telemetry),
+        });
+    });
+}
+
+fn kick_off_review_smoke_test(
+    git_root: Option<String>,
+    config: DashboardConfig,
+    worktree_path: String,
+    request: ReviewSmokeTestRequest,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let Some(root) = git_root.map(PathBuf::from) else {
+        let _ = tx.send(AppEvent::ReviewPrSmokeTested {
+            result: Err("Could not resolve git root.".to_string()),
+            telemetry: Vec::new(),
+            cleanup_error: None,
+            reused: false,
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let service = DashboardService::new(root, config);
+        let attempt = service
+            .run_review_smoke_test(&worktree_path, &request, cancel)
+            .await;
+        let _ = tx.send(AppEvent::ReviewPrSmokeTested {
+            result: attempt.result.map_err(|err| user_friendly_message(&err)),
+            telemetry: attempt.telemetry,
+            cleanup_error: attempt.cleanup_error,
+            reused: attempt.reused,
         });
     });
 }
@@ -14253,6 +14417,48 @@ mod tests {
         app
     }
 
+    fn smoke_result() -> ReviewSmokeTest {
+        ReviewSmokeTest {
+            outcome: Some(crate::services::review_humane::SmokeOutcome::AsDescribed),
+            outcome_note: "The crash is gone.".to_string(),
+            steps: "1. Run `node smoke.mjs`".to_string(),
+            before: "It crashes.".to_string(),
+            after: "It works.".to_string(),
+        }
+    }
+
+    #[test]
+    fn humane_smoke_test_is_not_started_when_only_tests_changed() {
+        let mut app = review_scan_test_app(
+            ReviewScanMode::Split,
+            &["tests/parser_test.rs", "docs/usage.md"],
+        );
+        let tx = app_event_tx();
+        app.start_review_smoke_test("main".to_string(), "sha".to_string(), &tx);
+        let screen = app.review_pr.as_mut().unwrap();
+        assert!(!screen.smoke_test_running());
+        assert_eq!(screen.smoke_test(), None);
+        // Nothing posted and nothing smoke-tested: no summary to write.
+        screen.record_scan_result(vec![ReviewFinding {
+            category: "Test".to_string(),
+            severity: crate::services::ReviewSeverity::Low,
+            file: "tests/parser_test.rs".to_string(),
+            start_line: None,
+            line: Some(1),
+            title: "Weak assertion".to_string(),
+            explanation: String::new(),
+            suggestion: None,
+        }]);
+        screen.finish_scanning();
+        screen.enter_decision();
+        screen.record_outcome(ReviewRowOutcome::Skipped);
+        app.advance_review_finding(&tx);
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
+    }
+
     #[test]
     fn humane_revision_returns_straight_to_decision() {
         // The revise prompt already writes in the human voice, so no second
@@ -14353,6 +14559,45 @@ mod tests {
     }
 
     #[test]
+    fn humane_summary_waits_for_the_smoke_test_then_appends_it() {
+        let mut app = posted_humane_app();
+        let tx = app_event_tx();
+        let _cancel = app.review_pr.as_mut().unwrap().start_smoke_test();
+        app.advance_review_finding(&tx);
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Working
+        );
+
+        // The smoke test landing is what starts the summary.
+        app.apply_review_pr_smoke_tested(
+            ReviewSmokeTestOutcome {
+                result: Ok(smoke_result()),
+                telemetry: vec![review_test_telemetry("smoke-test")],
+                cleanup_error: None,
+                reused: false,
+            },
+            &tx,
+        );
+        app.apply_review_pr_summary_generated(
+            Ok("Nice catch, and a nicely minimal fix 👏".to_string()),
+            None,
+        );
+        let screen = app.review_pr.as_ref().unwrap();
+        assert_eq!(
+            screen.step(),
+            crate::tui::screens::review_pr::ReviewStep::Summary
+        );
+        assert!(screen.summary_body().starts_with(
+            "Nice catch, and a nicely minimal fix 👏\n\n# Smoke Test\n\n## Steps\n\n1. Run"
+        ));
+        assert!(screen
+            .summary_body()
+            .ends_with("### Before\n\nIt crashes.\n\n### After\n\nIt works."));
+        assert!(!screen.summary_body().contains("Review Summary"));
+    }
+
+    #[test]
     fn humane_summary_falls_back_to_a_short_human_opening() {
         let mut app = posted_humane_app();
         let tx = app_event_tx();
@@ -14360,6 +14605,48 @@ mod tests {
         app.apply_review_pr_summary_generated(Err("model unavailable".to_string()), None);
         let screen = app.review_pr.as_ref().unwrap();
         assert_eq!(screen.summary_body(), "Left one comment inline.");
+    }
+
+    #[test]
+    fn humane_review_without_comments_still_offers_a_smoke_test_summary() {
+        let mut app = review_walkthrough_app(1);
+        let tx = app_event_tx();
+        let screen = app.review_pr.as_mut().unwrap();
+        let _cancel = screen.start_smoke_test();
+        screen.finish_smoke_test(Ok(smoke_result()), false);
+        screen.record_outcome(ReviewRowOutcome::Skipped);
+        app.advance_review_finding(&tx);
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Working
+        );
+        app.apply_review_pr_summary_generated(Err("model unavailable".to_string()), None);
+        assert!(app
+            .review_pr
+            .as_ref()
+            .unwrap()
+            .summary_body()
+            .starts_with("Looks good to me 👍\n\n# Smoke Test"));
+
+        // Without a smoke test there is nothing to submit.
+        let mut app = review_walkthrough_app(1);
+        let screen = app.review_pr.as_mut().unwrap();
+        let _cancel = screen.start_smoke_test();
+        screen.record_outcome(ReviewRowOutcome::Skipped);
+        app.advance_review_finding(&tx);
+        app.apply_review_pr_smoke_tested(
+            ReviewSmokeTestOutcome {
+                result: Err("no node".to_string()),
+                telemetry: Vec::new(),
+                cleanup_error: None,
+                reused: false,
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.review_pr.as_ref().unwrap().step(),
+            crate::tui::screens::review_pr::ReviewStep::Done
+        );
     }
 
     #[test]
