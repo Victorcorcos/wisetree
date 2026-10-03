@@ -33,7 +33,9 @@ use crate::git::exec::get_git_root;
 use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
-use crate::services::dashboard::{review_feedback_needs_expanded_context, ReviewRevisionMode};
+use crate::services::dashboard::{
+    review_feedback_needs_expanded_context, ReviewRevisionMode, ReviewSummarySubmission,
+};
 use crate::services::presets::WisePresetDiscovery;
 use crate::services::review_humane::{
     build_humane_review_summary, deterministic_humane_overview, smoke_test_skip_reason,
@@ -289,7 +291,7 @@ enum AppEvent {
     /// The review summary submission finished.
     ReviewPrSummarySubmitted {
         request_changes: bool,
-        result: Result<(), String>,
+        result: Result<ReviewSummarySubmission, String>,
     },
     /// A fix apply finished: either committed + replied, or no change was
     /// needed and the reviewer was told it's already addressed.
@@ -4868,7 +4870,7 @@ impl App {
     fn apply_review_pr_summary_submitted(
         &mut self,
         request_changes: bool,
-        result: Result<(), String>,
+        result: Result<ReviewSummarySubmission, String>,
     ) {
         if let Some(screen) = self.review_pr.as_mut() {
             screen.record_summary_outcome(request_changes, result.map_err(|e| truncate_error(&e)));

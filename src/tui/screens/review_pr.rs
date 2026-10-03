@@ -59,7 +59,8 @@ use crate::services::dashboard::{
     review_coverage_groups, review_file_groups, review_relationship_summary_has_endpoint,
     review_suggestion_is_deterministically_valid, split_duplicate_findings,
     split_run_duplicate_findings, ReviewContext, ReviewFile, ReviewFileGroup, ReviewFinding,
-    ReviewGroupProfile, ReviewScanMode, ReviewSeverity, ReviewSkippedFile, ReviewVerification,
+    ReviewGroupProfile, ReviewScanMode, ReviewSeverity, ReviewSkippedFile, ReviewSummarySubmission,
+    ReviewVerification,
 };
 use crate::services::review_humane::{
     ReviewSmokeTest, ReviewVoice, SmokeOutcome, HUMANIZE_BATCH_SIZE, SCREENSHOT_TODO_MARKER,
@@ -1520,14 +1521,29 @@ impl ReviewPullRequestScreen {
     }
 
     /// Record how the summary submission went as its own table row.
-    pub fn record_summary_outcome(&mut self, request_changes: bool, result: Result<(), String>) {
+    pub fn record_summary_outcome(
+        &mut self,
+        request_changes: bool,
+        result: Result<ReviewSummarySubmission, String>,
+    ) {
         let command = if request_changes {
             "review summary (request changes)"
         } else {
             "review summary (comment)"
         };
         let row = match result {
-            Ok(()) => SummaryRow::with_status(command, "Submitted", colors::INFO, None),
+            Ok(ReviewSummarySubmission::AsRequested) => {
+                SummaryRow::with_status(command, "Submitted", colors::INFO, None)
+            }
+            Ok(ReviewSummarySubmission::CommentOnOwnPullRequest) => SummaryRow::with_note(
+                command,
+                "Submitted as comment",
+                colors::INFO,
+                Some(
+                    "GitHub does not allow requesting changes on your own pull request."
+                        .to_string(),
+                ),
+            ),
             Err(err) => SummaryRow::with_status(command, "Failed", colors::ERROR, Some(err)),
         };
         self.summary_rows.push(row);
@@ -4981,12 +4997,31 @@ mod tests {
         screen.record_scan_result(vec![finding("a.rs", Some(2), ReviewSeverity::High)]);
         screen.finish_scanning();
         screen.record_outcome(ReviewRowOutcome::Posted);
-        screen.record_summary_outcome(false, Ok(()));
+        screen.record_summary_outcome(false, Ok(ReviewSummarySubmission::AsRequested));
         screen.enter_done();
         let dump = render_dump(&mut screen, 100, 16);
         assert!(dump.contains("Posted 1 review comment"), "{dump}");
         assert!(dump.contains("Submitted"), "{dump}");
         assert!(dump.contains("Press any key"), "{dump}");
+    }
+
+    #[test]
+    fn request_changes_on_own_pull_request_is_reported_as_a_submitted_comment() {
+        let mut screen = ReviewPullRequestScreen::new(request(), test_ai());
+        screen.record_summary_outcome(true, Ok(ReviewSummarySubmission::CommentOnOwnPullRequest));
+
+        let row = screen.summary_rows.last().expect("summary row");
+        assert_eq!(row.command, "review summary (request changes)");
+        assert!(
+            row.success,
+            "the summary was posted, so this is not a failure"
+        );
+        assert_eq!(row.status.as_ref().unwrap().label, "Submitted as comment");
+        assert!(row
+            .failure
+            .as_deref()
+            .unwrap()
+            .contains("your own pull request"));
     }
 
     #[test]

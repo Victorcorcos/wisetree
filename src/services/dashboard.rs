@@ -128,6 +128,11 @@ const FIX_CODE_MAX_BYTES: usize = 24_000;
 const REVIEW_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const REVIEW_SCAN_TIMEOUT: Duration = Duration::from_secs(240);
+/// A coverage owner (split coverage group or merged scan) judges a whole group
+/// of files at once and may read large application files to settle coverage
+/// questions; on a large PR it outran [`REVIEW_SCAN_TIMEOUT`]. Timeouts are
+/// never rescanned, so it needs the longer leash up front.
+const REVIEW_COVERAGE_SCAN_TIMEOUT: Duration = Duration::from_secs(480);
 const REVIEW_SUMMARY_TIMEOUT: Duration = Duration::from_secs(30);
 /// The humane summary is longer prose from the balanced profile.
 const REVIEW_HUMANE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -4528,7 +4533,9 @@ impl DashboardService {
         }
         let prompt = build_review_coverage_prompt(files, context, tester_findings);
         let prompt_bytes = prompt.len();
-        let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
+        let (output, usage) = self
+            .run_review_prompt_with_timeout(&cwd, &selection, prompt, REVIEW_COVERAGE_SCAN_TIMEOUT)
+            .await;
         let (result, raw_output) = match output {
             Err(err) => (Err(err), None),
             Ok(output) => match parse_coverage_findings(&output, files) {
@@ -4577,7 +4584,9 @@ impl DashboardService {
         }
         let prompt = build_review_merged_prompt(files, context, tester_findings, REVIEW_TABLES);
         let prompt_bytes = prompt.len();
-        let (output, usage) = self.run_review_prompt(&cwd, &selection, prompt).await;
+        let (output, usage) = self
+            .run_review_prompt_with_timeout(&cwd, &selection, prompt, REVIEW_COVERAGE_SCAN_TIMEOUT)
+            .await;
         let (result, raw_output) = match output {
             Err(err) => (Err(err), None),
             Ok(output) => match parse_merged_findings(&output, files) {
@@ -5371,32 +5380,47 @@ impl DashboardService {
 
     /// Submit the review summary built from the posted findings, either as a
     /// blocking `--request-changes` review or a non-blocking `--comment` one.
+    /// GitHub refuses to let anyone request changes on their own pull request,
+    /// so that refusal falls back to a comment review with the same body.
     pub async fn submit_review_summary(
         &self,
         worktree_path: &str,
         number: u64,
         body: &str,
         request_changes: bool,
-    ) -> Result<()> {
+    ) -> Result<ReviewSummarySubmission> {
         let cwd = PathBuf::from(worktree_path);
         let number_arg = number.to_string();
-        let mode = if request_changes {
-            "--request-changes"
-        } else {
-            "--comment"
+        let review = |mode: &'static str| {
+            let cwd = cwd.clone();
+            let number_arg = number_arg.clone();
+            async move {
+                time::timeout(
+                    REVIEW_POST_TIMEOUT,
+                    run_command(
+                        &self.gh_binary,
+                        &["pr", "review", &number_arg, mode, "--body", body],
+                        Some(&cwd),
+                    ),
+                )
+                .await
+                .map_err(|_| WisetreeError::other("gh pr review timed out"))?
+                .map(|_| ())
+                .map_err(WisetreeError::other)
+            }
         };
-        time::timeout(
-            REVIEW_POST_TIMEOUT,
-            run_command(
-                &self.gh_binary,
-                &["pr", "review", &number_arg, mode, "--body", body],
-                Some(&cwd),
-            ),
-        )
-        .await
-        .map_err(|_| WisetreeError::other("gh pr review timed out"))?
-        .map_err(WisetreeError::other)?;
-        Ok(())
+        if !request_changes {
+            review("--comment").await?;
+            return Ok(ReviewSummarySubmission::AsRequested);
+        }
+        match review("--request-changes").await {
+            Ok(()) => Ok(ReviewSummarySubmission::AsRequested),
+            Err(err) if is_own_pull_request_refusal(&user_friendly_message(&err)) => {
+                review("--comment").await?;
+                Ok(ReviewSummarySubmission::CommentOnOwnPullRequest)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     // ── "Bugkill" pipeline ─────────────────────────────────────────────
@@ -14118,6 +14142,24 @@ pub fn resolve_dashboard_columns(
     (resolved, warnings)
 }
 
+/// How GitHub accepted a review summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewSummarySubmission {
+    /// Submitted in the mode the user picked.
+    AsRequested,
+    /// The user asked to request changes on their own pull request, which
+    /// GitHub forbids, so the summary went out as a comment review instead.
+    CommentOnOwnPullRequest,
+}
+
+/// `true` for GitHub's refusal to let the author request changes on their own
+/// pull request (`Review Can not request changes on your own pull request`).
+fn is_own_pull_request_refusal(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("request changes on your own pull request")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18284,6 +18326,66 @@ printf '%s' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{
         assert!(
             message.contains("invalid gh pr view output"),
             "unexpected error message: {message}"
+        );
+    }
+
+    /// Fake `gh` that logs every call and rejects `pr review --request-changes`
+    /// with `refusal` on stderr; every other call succeeds.
+    fn review_summary_gh(dir: &Path, refusal: &str) -> (PathBuf, PathBuf) {
+        let log_path = dir.join("gh.log");
+        let gh_path = dir.join("fake-gh.sh");
+        std::fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\nif [ \"$4\" = \"--request-changes\" ]; then\n  printf '%s\\n' '{refusal}' >&2\n  exit 1\nfi\nexit 0\n",
+                log = log_path.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&gh_path);
+        (gh_path, log_path)
+    }
+
+    #[tokio::test]
+    async fn requesting_changes_on_your_own_pull_request_submits_a_comment_review() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (gh_path, log_path) = review_summary_gh(
+            dir.path(),
+            "failed to create review: GraphQL: Review Can not request changes on your own pull request (addPullRequestReview)",
+        );
+        let service = DashboardService::new(dir.path().to_path_buf(), DashboardConfig::default())
+            .with_gh_binary(gh_path);
+
+        let submission = service
+            .submit_review_summary(dir.path().to_str().unwrap(), 109, "Summary", true)
+            .await
+            .expect("falls back to a comment review");
+
+        assert_eq!(submission, ReviewSummarySubmission::CommentOnOwnPullRequest);
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(
+            log,
+            "--version\npr review 109 --request-changes --body Summary\npr review 109 --comment --body Summary\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_request_changes_failures_are_reported_without_a_comment_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (gh_path, log_path) = review_summary_gh(dir.path(), "HTTP 502: Bad Gateway");
+        let service = DashboardService::new(dir.path().to_path_buf(), DashboardConfig::default())
+            .with_gh_binary(gh_path);
+
+        let err = service
+            .submit_review_summary(dir.path().to_str().unwrap(), 109, "Summary", true)
+            .await
+            .expect_err("a real failure stays a failure");
+
+        assert!(user_friendly_message(&err).contains("Bad Gateway"));
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(
+            log,
+            "--version\npr review 109 --request-changes --body Summary\n"
         );
     }
 
