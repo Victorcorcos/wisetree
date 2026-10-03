@@ -41,6 +41,18 @@ pub struct DeleteOutcome {
     pub branch_delete_error: Option<String>,
 }
 
+/// Which user-configured actions a create runs after copy/link setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserActions {
+    /// Post-create commands and the terminal launch (the Create flow).
+    All,
+    /// Post-create commands only: a worktree that must be ready to use but
+    /// is driven in the background, so no terminal window opens.
+    CommandsOnly,
+    /// Neither (Split layers, created inside a transaction).
+    None,
+}
+
 pub struct WorktreeService {
     git_service: GitService,
     config_service: ConfigService,
@@ -131,7 +143,18 @@ impl WorktreeService {
         progress: Option<ProgressCallback<'_>>,
         activity: Option<ActivityCallback<'_>>,
     ) -> Result<CreateOutcome> {
-        self.create_worktree_inner(options, progress, activity, true)
+        self.create_worktree_inner(options, progress, activity, UserActions::All)
+            .await
+    }
+
+    /// Create a worktree for Review's background smoke test: the normal
+    /// copy/link setup plus post-create commands, so it is as ready to run
+    /// as one the user creates, but without opening a terminal.
+    pub async fn create_smoke_test_worktree(
+        &self,
+        options: &WorktreeCreateOptions,
+    ) -> Result<CreateOutcome> {
+        self.create_worktree_inner(options, None, None, UserActions::CommandsOnly)
             .await
     }
 
@@ -141,7 +164,8 @@ impl WorktreeService {
         &self,
         options: &WorktreeCreateOptions,
     ) -> Result<CreateOutcome> {
-        self.create_worktree_inner(options, None, None, false).await
+        self.create_worktree_inner(options, None, None, UserActions::None)
+            .await
     }
 
     async fn create_worktree_inner(
@@ -149,7 +173,7 @@ impl WorktreeService {
         options: &WorktreeCreateOptions,
         progress: Option<ProgressCallback<'_>>,
         mut activity: Option<ActivityCallback<'_>>,
-        run_user_actions: bool,
+        user_actions: UserActions,
     ) -> Result<CreateOutcome> {
         let config = self.config_service.config().clone();
         let git_root = self.main_worktree_root().await?;
@@ -257,7 +281,7 @@ impl WorktreeService {
             source_branch: options.source_branch.clone(),
         };
 
-        if run_user_actions && !config.post_create_cmd.is_empty() {
+        if user_actions != UserActions::None && !config.post_create_cmd.is_empty() {
             let runs = execute_post_create_commands(
                 &config.post_create_cmd,
                 &variables,
@@ -268,7 +292,7 @@ impl WorktreeService {
             outcome.command_runs = runs;
         }
 
-        if run_user_actions && !config.terminal_command.trim().is_empty() {
+        if user_actions == UserActions::All && !config.terminal_command.trim().is_empty() {
             let launch = open_terminal(&config.terminal_command, &variables);
             outcome.terminal_launch = Some(launch);
         }
