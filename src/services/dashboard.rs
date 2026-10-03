@@ -4002,9 +4002,8 @@ impl DashboardService {
         cwd: &Path,
         base_ref_name: &str,
     ) -> std::result::Result<String, String> {
-        // Map GitHub's base branch onto a local remote-tracking ref (falls
-        // back to the branch's own base when the name is unknown).
-        let base_ref = resolve_base_ref_with_binary(&self.git_binary, cwd, Some(base_ref_name))
+        let base_ref = self
+            .resolve_refreshed_base_ref(cwd, base_ref_name)
             .await
             .ok_or_else(|| {
                 format!(
@@ -4012,8 +4011,22 @@ impl DashboardService {
                      '{base_ref_name}'"
                 )
             })?;
-        // Refresh the base so its merge-base with HEAD matches GitHub's
-        // current base tip, and thus the exact set of changed lines.
+        let range = format!("{base_ref}...HEAD");
+        time::timeout(
+            REVIEW_FETCH_TIMEOUT,
+            run_command(&self.git_binary, &["diff", "--no-color", &range], Some(cwd)),
+        )
+        .await
+        .map_err(|_| "git diff for the local PR-diff fallback timed out".to_string())?
+    }
+
+    /// Map GitHub's base branch onto a local remote-tracking ref (falls back
+    /// to the branch's own base when the name is unknown), then refresh it so
+    /// its merge-base with HEAD matches GitHub's current base tip, and thus
+    /// the exact set of changed lines.
+    async fn resolve_refreshed_base_ref(&self, cwd: &Path, base_ref_name: &str) -> Option<String> {
+        let base_ref =
+            resolve_base_ref_with_binary(&self.git_binary, cwd, Some(base_ref_name)).await?;
         if let Some((remote, branch)) = base_ref.split_once('/') {
             let refspec = format!("+{branch}:refs/remotes/{remote}/{branch}");
             let _ = time::timeout(
@@ -4022,13 +4035,7 @@ impl DashboardService {
             )
             .await;
         }
-        let range = format!("{base_ref}...HEAD");
-        time::timeout(
-            REVIEW_FETCH_TIMEOUT,
-            run_command(&self.git_binary, &["diff", "--no-color", &range], Some(cwd)),
-        )
-        .await
-        .map_err(|_| "git diff for the local PR-diff fallback timed out".to_string())?
+        Some(base_ref)
     }
 
     /// Scan one changed file with a single captured (non-interactive)
@@ -4388,6 +4395,29 @@ impl DashboardService {
         prompt: String,
         timeout: Duration,
     ) -> (Result<String>, Option<ReviewTokenUsage>) {
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        self.run_review_ai(
+            cwd,
+            selection,
+            prompt,
+            timeout,
+            AiPermission::Plan,
+            cancel_rx,
+        )
+        .await
+    }
+
+    /// One captured Review AI call with the given `permission`; `cancel`
+    /// stops it when its sender fires or is dropped.
+    async fn run_review_ai(
+        &self,
+        cwd: &Path,
+        selection: &ReviewModelSelection,
+        prompt: String,
+        timeout: Duration,
+        permission: AiPermission,
+        cancel: oneshot::Receiver<()>,
+    ) -> (Result<String>, Option<ReviewTokenUsage>) {
         let title = (selection.harness == AiHarness::OpenCode).then(review_scan_title);
         let request = AiRunRequest {
             slot: format!("dashboard.ai.review.{}", selection.profile.label()),
@@ -4399,16 +4429,15 @@ impl DashboardService {
             prompt,
             cwd: cwd.to_path_buf(),
             mode: AiRunMode::Captured,
-            permission: AiPermission::Plan,
+            permission,
             timeout,
             activity_limit: crate::services::ai_run::DEFAULT_ACTIVITY_LIMIT,
             session_title: title.clone(),
             attachments: Vec::new(),
         };
-        let (_cancel_tx, cancel_rx) = oneshot::channel();
         let result = self
             .ai_runner()
-            .run_captured(&request, None, cancel_rx)
+            .run_captured(&request, None, cancel)
             .await
             .map(|run| run.transcript);
         let usage = match title {
