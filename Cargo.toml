@@ -1,0 +1,53 @@
+[package]
+name = "wisetree"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.78"
+description = "Interactive CLI for creating and managing Git worktrees"
+license = "MIT"
+repository = "https://github.com/victorcorcos/wisetree"
+homepage = "https://github.com/victorcorcos/wisetree"
+keywords = ["git", "worktree", "cli", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+default-run = "wisetree"
+
+[[bin]]
+name = "wisetree"
+path = "src/main.rs"
+
+[[bin]]
+name = "generate-schema"
+path = "src/bin/generate_schema.rs"
+
+[dependencies]
+anyhow = "1.0"
+blake3 = "1.5"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+dirs = "5.0"
+dunce = "1.0"
+globset = "0.4"
+libc = "0.2"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, used to size
+# scrollable panels by their wrapped height (not logical line count).
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+schemars = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "process", "sync", "time", "io-util", "fs", "signal", "test-util"] }
+walkdir = "2.5"
+
+[dev-dependencies]
+once_cell = "1.20"
+tempfile = "3.14"
+assert_cmd = "2.0"
+insta = "1.41"
+predicates = "3.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"

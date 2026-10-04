@@ -1,0 +1,72 @@
+//! `wisetree create` non-interactive handler. Mirrors
+//! `branchlet/src/cli/commands/create.ts`.
+
+use crate::cli::args::CliArgs;
+use crate::errors::{Result, WisetreeError};
+use crate::git::types::WorktreeCreateOptions;
+use crate::utils::validation::{
+    normalize_branch_name, validate_branch_name, validate_directory_name, validate_source_ref,
+};
+use crate::worktree::WorktreeService;
+
+pub async fn run(args: CliArgs, service: &WorktreeService) -> Result<()> {
+    let name = args
+        .name
+        .as_deref()
+        .ok_or_else(|| WisetreeError::other("Missing required argument: --name (-n)"))?;
+    let source = args
+        .source
+        .as_deref()
+        .ok_or_else(|| WisetreeError::other("Missing required argument: --source (-s)"))?;
+
+    if let Some(err) = validate_directory_name(name) {
+        return Err(WisetreeError::other(format!(
+            "Invalid directory name: {err}"
+        )));
+    }
+
+    if let Some(b) = args.branch.as_deref() {
+        if b.trim().is_empty() {
+            return Err(WisetreeError::other("Branch name cannot be empty"));
+        }
+        let normalized = normalize_branch_name(b);
+        if let Some(err) = validate_branch_name(&normalized) {
+            return Err(WisetreeError::other(format!("Invalid branch name: {err}")));
+        }
+    }
+
+    if let Some(err) = validate_source_ref(source) {
+        return Err(WisetreeError::other(format!(
+            "Invalid source branch: {err}"
+        )));
+    }
+
+    let git_service = service.git_service();
+    let branches = git_service.list_branches().await?;
+    if !branches.iter().any(|b| b.name == source) {
+        return Err(WisetreeError::other(format!(
+            "Source branch '{source}' does not exist"
+        )));
+    }
+
+    // When --branch is omitted, default to the worktree directory name so a
+    // fresh branch is always created (matches branchlet).
+    let new_branch_raw = args.branch.clone().unwrap_or_else(|| name.to_string());
+    let new_branch = normalize_branch_name(&new_branch_raw);
+    if let Some(err) = validate_branch_name(&new_branch) {
+        return Err(WisetreeError::other(format!("Invalid branch name: {err}")));
+    }
+    let opts = WorktreeCreateOptions {
+        name: name.to_string(),
+        source_branch: source.to_string(),
+        new_branch: new_branch.clone(),
+        base_path: String::new(),
+    };
+    let outcome = service.create_worktree(&opts, None, None).await?;
+    let worktree_path_str = outcome.worktree_path.to_string_lossy().into_owned();
+
+    println!("{worktree_path_str}");
+    println!("  source: {source}");
+    println!("  branch: {new_branch}");
+    Ok(())
+}

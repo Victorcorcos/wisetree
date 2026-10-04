@@ -1,0 +1,49 @@
+//! Reusable TUI primitives. Stateful widgets (input/select/confirm) own
+//! their state and expose a `handle_key` method returning an outcome enum;
+//! purely presentational widgets (spinner / status / command-list) are
+//! drawn directly from the caller's state.
+
+pub mod border;
+pub mod bulk_confirm_dialog;
+pub mod command_list_progress;
+pub mod command_progress;
+pub mod confirmation_modal;
+pub mod input_prompt;
+pub mod options_group;
+pub mod pr_confirm;
+pub mod scrollbar;
+pub mod select_prompt;
+pub mod spinner;
+pub mod status_indicator;
+pub mod summary_table;
+pub mod toast;
+pub mod welcome_header;
+
+pub use border::BorderState;
+pub use bulk_confirm_dialog::{
+    BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome, ConfirmVariant,
+};
+pub use command_list_progress::CommandListProgress;
+pub use command_progress::CommandProgress;
+pub use confirmation_modal::{
+    abort_run_modal, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
+};
+pub use input_prompt::{InputOutcome, InputPrompt};
+pub use options_group::{OptionsGroup, OptionsGroupItem};
+pub use pr_confirm::{
+    code_lines, code_span, code_spans, code_style, labeled_line, labeled_spans, will_run_lines,
+    PrConfirmView,
+};
+pub use scrollbar::render_vertical_scrollbar;
+pub use select_prompt::{
+    branded_line, branded_spans, fuzzy_matches, SelectOption, SelectOutcome, SelectPrompt,
+    SelectStyle, SELECT_CURSOR,
+};
+pub use spinner::{spinner_frame, Spinner, SPINNER_FRAMES};
+pub use status_indicator::{Status, StatusIndicator};
+pub use summary_table::{
+    render_scrollable_summary_table, render_summary_table, summary_row_counts, RowStatus,
+    SummaryRow,
+};
+pub use toast::{render_toast, ToastSnapshot, ToastState, ToastVariant};
+pub use welcome_header::WelcomeHeader;
