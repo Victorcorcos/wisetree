@@ -1,5 +1,9 @@
 # Wisetree
 
+<div align="center">
+  <img src="https://i.imgur.com/vO0AOis.gif" alt="Wisetree" width="50%" />
+</div>
+
 A terminal Git worktree manager built with Rust and Ratatui.
 
 - **Create**: choose a source branch and create a worktree.
