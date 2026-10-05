@@ -42,7 +42,7 @@ The menu offers optional shell integration for navigating your current shell int
 
 Wisetree reads `.wisetree/config.json` in the project, then `~/.wisetree/config.json`, and uses built-in defaults when necessary. In a linked worktree, the main worktree's project configuration takes precedence. Keep `.wisetree/` out of Git.
 
-Settings edits the active configuration. Dashboard preferences are `refreshIntervalMs` (5000–60000), `showPullRequests`, and `columns` (`branch`, `status`, `ahead_behind`, `diff`, `last_commit`, `pull_request`). Unknown legacy fields are ignored when loading and omitted when saving.
+Settings edits the active configuration. Dashboard preferences are `refreshIntervalMs` (5000–60000), `showPullRequests`, and `columns` (`branch`, `status`, `ahead_behind`, `diff`, `last_commit`, `pull_request`). Unknown legacy fields and unsupported column names are ignored when loading and omitted when saving.
 
 The only other configuration keys are `worktreeCopyPatterns`, `worktreeCopyIgnores`, `worktreePathTemplate`, `postCreateCmd`, `worktreeLinkPatterns`, `worktreeLinkStrategy`, `worktreeLinkCacheDir`, `terminalCommand`, and `deleteBranchWithWorktree`. They control file copying, optional shared links, worktree paths, setup commands, editor launch, and branch deletion. See [schema.json](schema.json) for defaults and types. Commands can use `$BASE_PATH`, `$WORKTREE_PATH`, `$BRANCH_NAME`, and `$SOURCE_BRANCH`.
 

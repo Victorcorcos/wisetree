@@ -351,6 +351,7 @@ fn saving_legacy_config_keeps_only_basic_fields_in_both_scopes() {
             };
             assert_eq!(fs::read_to_string(target).unwrap(), raw);
             assert_eq!(config.dashboard.columns, vec!["branch", "status"]);
+            assert!(service.warnings().is_empty());
             config.dashboard.refresh_interval_ms = 8000;
             service.save(&config, None).unwrap();
             let saved: serde_json::Value =

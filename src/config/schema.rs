@@ -68,7 +68,7 @@ pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<Stri
         );
 
         if !known {
-            warnings.push(format!("Unknown dashboard column '{column}' ignored."));
+            // Ignore legacy columns just like unknown configuration fields.
             continue;
         }
 
