@@ -7,14 +7,13 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use super::confirmation_modal::ConfirmationModal;
-use super::options_group::OptionsGroup;
 
 use crate::messages::colors;
 
 const MODAL_HEIGHT: u16 = 12;
 
 /// Fixed column width every detail label is padded to. Keeps values aligned
-/// across commands. Labels must stay shorter than this so a space always
+/// across detail rows. Labels must stay shorter than this so a space always
 /// separates the label from its value — a label of exactly `LABEL_WIDTH`
 /// chars would butt straight up against the value (which is why the Merge
 /// page splits the 12-char "Ahead/Behind" into short "Ahead"/"Behind" rows).
@@ -23,7 +22,7 @@ const LABEL_WIDTH: usize = 12;
 /// The canonical detail row shared by every PR confirm panel: a `label`
 /// padded to [`LABEL_WIDTH`] in muted/dim, followed by the styled `value` and
 /// an optional dim `trailing` note. The fixed width keeps labels aligned
-/// across commands ("Base ref", "Worktree", "Last commit", …).
+/// across detail rows ("Worktree", "Last commit", …).
 pub fn labeled_line(
     label: &str,
     value: Span<'static>,
@@ -57,14 +56,6 @@ pub fn labeled_spans(label: &str, values: Vec<Span<'static>>) -> Line<'static> {
 /// background, distinct from the app's brown-tinted panel colors.
 pub fn code_style() -> Style {
     Style::default().fg(colors::ACCENT).bg(colors::CODE_BG)
-}
-
-/// A single value rendered as an inline code chip (orange on gray, padded
-/// with a leading/trailing space), matching the backtick-delimited spans in
-/// [`will_run_lines`]. Use for standalone values like a ref or branch name
-/// that deserve the same "code" treatment outside of a `Will run:` step.
-pub fn code_span(text: impl Into<String>) -> Span<'static> {
-    Span::styled(format!(" {} ", text.into()), code_style())
 }
 
 /// Split text by backtick-delimited code spans and return styled spans.
@@ -157,7 +148,6 @@ pub struct PrConfirmView<'a> {
     /// dropped so they take up no space.
     blocks: Vec<Vec<Line<'static>>>,
 
-    options: Option<OptionsGroup>,
     modal: Option<&'a ConfirmationModal>,
 }
 
@@ -168,7 +158,6 @@ impl<'a> PrConfirmView<'a> {
             title_color: colors::BRAND,
             blocks: Vec::new(),
 
-            options: None,
             modal: None,
         }
     }
@@ -197,11 +186,6 @@ impl<'a> PrConfirmView<'a> {
         self.block(will_run_lines(steps))
     }
 
-    pub fn options(mut self, options: Option<OptionsGroup>) -> Self {
-        self.options = options;
-        self
-    }
-
     /// Attach the confirmation modal rendered at the bottom of the panel.
     pub fn modal(mut self, modal: Option<&'a ConfirmationModal>) -> Self {
         self.modal = modal;
@@ -216,9 +200,7 @@ impl<'a> PrConfirmView<'a> {
             height = height.saturating_add(1); // blank separator
             height = height.saturating_add(block.len() as u16);
         }
-        if let Some(options) = self.options.as_ref() {
-            height = height.saturating_add(1 + options.content_height());
-        }
+
         if self.modal.is_some() {
             height = height.saturating_add(1 + MODAL_HEIGHT);
         }
@@ -233,10 +215,7 @@ impl<'a> PrConfirmView<'a> {
             constraints.push(Constraint::Length(1)); // blank
             constraints.push(Constraint::Length(block.len() as u16));
         }
-        if let Some(options) = self.options.as_ref() {
-            constraints.push(Constraint::Length(1)); // blank
-            constraints.push(Constraint::Length(options.content_height()));
-        }
+
         if self.modal.is_some() {
             constraints.push(Constraint::Length(1)); // blank
             constraints.push(Constraint::Length(MODAL_HEIGHT));
@@ -247,14 +226,6 @@ impl<'a> PrConfirmView<'a> {
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(area)
-    }
-
-    pub fn options_area(&self, area: Rect) -> Option<Rect> {
-        self.options.as_ref()?;
-        let chunks = self.section_areas(area);
-
-        let idx = 1 + self.blocks.len() * 2;
-        chunks.get(idx + 1).copied()
     }
 
     /// Draw the full confirm panel into `area`.
@@ -278,10 +249,7 @@ impl<'a> PrConfirmView<'a> {
             frame.render_widget(Paragraph::new(block.clone()), chunks[idx + 1]);
             idx += 2;
         }
-        if let Some(options) = self.options.as_ref() {
-            options.render(frame, chunks[idx + 1]);
-            idx += 2;
-        }
+
         if let Some(modal) = self.modal {
             modal.render(frame, chunks[idx + 1]);
         }

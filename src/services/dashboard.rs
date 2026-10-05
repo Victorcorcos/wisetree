@@ -30,16 +30,14 @@ const GH_GRAPHQL_TIMEOUT: Duration = Duration::from_secs(8);
 /// merge processing, so it deserves a longer leash than the read paths.
 const PR_MERGE_TIMEOUT: Duration = Duration::from_secs(60);
 
-const UPDATE_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
+const PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bound on the background single-branch base fetch that keeps the base's
 /// remote-tracking ref fresh for the behind-count. A scoped fetch normally
 /// completes in ~1s; the cap stops a slow network from stalling the on-cycle
 /// tick.
 const BASE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Priority list for the base ref the "Update Pull Request" flow merges
-/// in. Kept in one place so the dashboard's behind probe and the update
-/// pipeline never drift apart.
+/// Base refs used to calculate the Dashboard ahead/behind counts.
 pub const BASE_REF_PRIORITY: [&str; 6] = [
     "upstream/main",
     "upstream/master",
@@ -451,8 +449,8 @@ impl DashboardService {
 
                 // On the 30s PR beat, refresh the base branch's remote-tracking
                 // ref so the behind-count reflects commits another developer
-                // pushed to the base — the signal the "Update" command is gated
-                // on. Runs *after* the paint above so it never blocks the first
+                // pushed to the base. Runs after the paint above so it never
+                // blocks the first
                 // render; when it actually advances the ref, loop again right
                 // away to re-render the refined behind-count. Best-effort: a
                 // failed or no-op fetch just falls through to the normal wait.
@@ -568,7 +566,7 @@ impl DashboardService {
         let cwd = PathBuf::from(worktree_path);
         with_timeout(
             "git push",
-            UPDATE_PUSH_TIMEOUT,
+            PUSH_TIMEOUT,
             run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
         )
         .await?

@@ -44,7 +44,7 @@ Wisetree reads `.wisetree/config.json` in the project, then `~/.wisetree/config.
 
 Settings edits the active configuration. Dashboard preferences are `refreshIntervalMs` (5000–60000), `showPullRequests`, and `columns` (`branch`, `status`, `ahead_behind`, `diff`, `last_commit`, `pull_request`). Unknown legacy fields are ignored when loading and omitted when saving.
 
-Other options control file copying, optional shared links, path templates, post-create commands, editor launch commands, and branch deletion. See [schema.json](schema.json) for the complete configuration. Commands can use `$BASE_PATH`, `$WORKTREE_PATH`, `$BRANCH_NAME`, and `$SOURCE_BRANCH`.
+The only other configuration keys are `worktreeCopyPatterns`, `worktreeCopyIgnores`, `worktreePathTemplate`, `postCreateCmd`, `worktreeLinkPatterns`, `worktreeLinkStrategy`, `worktreeLinkCacheDir`, `terminalCommand`, and `deleteBranchWithWorktree`. They control file copying, optional shared links, worktree paths, setup commands, editor launch, and branch deletion. See [schema.json](schema.json) for defaults and types. Commands can use `$BASE_PATH`, `$WORKTREE_PATH`, `$BRANCH_NAME`, and `$SOURCE_BRANCH`.
 
 ## Development
 

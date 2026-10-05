@@ -6,6 +6,36 @@ use tempfile::TempDir;
 use wisetree::config::schema::{clamp_dashboard_refresh_interval, LinkStrategy};
 use wisetree::config::{ConfigService, WorktreeConfig};
 
+const BASIC_CONFIG_KEYS: &[&str] = &[
+    "dashboard",
+    "deleteBranchWithWorktree",
+    "postCreateCmd",
+    "terminalCommand",
+    "worktreeCopyIgnores",
+    "worktreeCopyPatterns",
+    "worktreeLinkCacheDir",
+    "worktreeLinkPatterns",
+    "worktreeLinkStrategy",
+    "worktreePathTemplate",
+];
+const BASIC_DASHBOARD_KEYS: &[&str] = &["columns", "refreshIntervalMs", "showPullRequests"];
+
+fn assert_keys(value: &serde_json::Value, expected: &[&str]) {
+    let mut actual: Vec<_> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+}
+
+fn assert_basic_config_keys(value: &serde_json::Value) {
+    assert_keys(value, BASIC_CONFIG_KEYS);
+    assert_keys(&value["dashboard"], BASIC_DASHBOARD_KEYS);
+}
+
 /// Serialises tests that mutate `$HOME` so the global-config path resolution
 /// is deterministic.
 static HOME_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -193,6 +223,12 @@ fn ensure_global_config_creates_dir_and_file() {
         let parsed: WorktreeConfig =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).expect("valid json");
         assert_eq!(parsed, WorktreeConfig::default());
+        let json = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_basic_config_keys(&json);
+        let mut svc = ConfigService::new();
+        let recreated = svc.create_global_config().unwrap();
+        let json = serde_json::from_str(&fs::read_to_string(recreated).unwrap()).unwrap();
+        assert_basic_config_keys(&json);
     });
 }
 
@@ -216,6 +252,8 @@ fn save_writes_two_space_indent() {
             "expected 2-space indent: {raw}"
         );
         assert!(raw.contains("\"terminalCommand\": \"code $WORKTREE_PATH\""));
+        let json = serde_json::from_str(&raw).unwrap();
+        assert_basic_config_keys(&json);
         let _ = home;
     });
 }
@@ -317,6 +355,7 @@ fn saving_legacy_config_keeps_only_basic_fields_in_both_scopes() {
             service.save(&config, None).unwrap();
             let saved: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(target).unwrap()).unwrap();
+            assert_basic_config_keys(&saved);
             assert!(saved.get("legacyOption").is_none());
             assert!(saved["dashboard"].get("legacyOption").is_none());
             assert_eq!(saved["terminalCommand"], "code $WORKTREE_PATH");
@@ -325,4 +364,14 @@ fn saving_legacy_config_keeps_only_basic_fields_in_both_scopes() {
             assert_eq!(saved["dashboard"]["showPullRequests"], true);
         }
     });
+}
+
+#[test]
+fn published_schema_contains_only_basic_config_keys() {
+    let schema: serde_json::Value = serde_json::from_str(include_str!("../schema.json")).unwrap();
+    assert_keys(&schema["properties"], BASIC_CONFIG_KEYS);
+    assert_keys(
+        &schema["definitions"]["DashboardConfig"]["properties"],
+        BASIC_DASHBOARD_KEYS,
+    );
 }

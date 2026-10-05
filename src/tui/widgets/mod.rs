@@ -9,7 +9,6 @@ pub mod command_list_progress;
 pub mod command_progress;
 pub mod confirmation_modal;
 pub mod input_prompt;
-pub mod options_group;
 pub mod pr_confirm;
 pub mod scrollbar;
 pub mod select_prompt;
@@ -25,14 +24,10 @@ pub use bulk_confirm_dialog::{
 };
 pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
-pub use confirmation_modal::{
-    abort_run_modal, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
-};
+pub use confirmation_modal::{ConfirmationChoice, ConfirmationModal, ConfirmationOutcome};
 pub use input_prompt::{InputOutcome, InputPrompt};
-pub use options_group::{OptionsGroup, OptionsGroupItem};
 pub use pr_confirm::{
-    code_lines, code_span, code_spans, code_style, labeled_line, labeled_spans, will_run_lines,
-    PrConfirmView,
+    code_lines, code_spans, code_style, labeled_line, labeled_spans, will_run_lines, PrConfirmView,
 };
 pub use scrollbar::render_vertical_scrollbar;
 pub use select_prompt::{
@@ -41,9 +36,6 @@ pub use select_prompt::{
 };
 pub use spinner::{spinner_frame, Spinner, SPINNER_FRAMES};
 pub use status_indicator::{Status, StatusIndicator};
-pub use summary_table::{
-    render_scrollable_summary_table, render_summary_table, summary_row_counts, RowStatus,
-    SummaryRow,
-};
+pub use summary_table::{render_summary_table, SummaryRow};
 pub use toast::{render_toast, ToastSnapshot, ToastState, ToastVariant};
 pub use welcome_header::WelcomeHeader;
