@@ -4,7 +4,10 @@ use std::process::Command;
 
 use tempfile::TempDir;
 use wisetree::config::schema::DashboardConfig;
-use wisetree::services::{resolve_base_ref, DashboardNoticeLevel, DashboardService};
+use wisetree::services::{
+    pr_repository, resolve_base_ref, resolve_push_remote, DashboardNoticeLevel, DashboardService,
+    PrState,
+};
 
 /// Tests that exercise the PR-fetching path need `show_pull_requests`
 /// enabled — otherwise the service short-circuits before calling gh.
@@ -149,6 +152,180 @@ async fn resolves_pr_repo_via_upstream_when_origin_is_a_fork() {
         !log.contains("example"),
         "graphql call should NOT target origin `example/repo` when upstream exists, got log {log:?}"
     );
+}
+
+/// Fake `gh` whose GraphQL reply carries one open PR (`b0`) only when the
+/// query targets a repository owned by `owner`; every other repository has
+/// no PRs.
+fn fake_gh_with_pr_owned_by(log_path: &Path, owner: &str, number: u64) -> String {
+    format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  case "$*" in
+    *'owner: "{owner}"'*) printf '%s' '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":{number},"state":"OPEN","url":"u","title":"t","isDraft":false}}]}}}}}}}}' ;;
+    *) printf '%s' '{{"data":{{"repository":{{}}}}}}' ;;
+  esac
+  exit 0
+fi
+printf '[]'
+"#,
+        log = log_path.display()
+    )
+}
+
+/// The reported bug: a worktree cut from a third remote (`kaefer/main`) and
+/// pushed with `-u` to a fork must still show its PR — which lives in the
+/// `kaefer` remote's repository, not `upstream`'s — and its ahead/behind/diff
+/// against `kaefer/main`.
+#[tokio::test]
+async fn snapshot_compares_and_finds_pr_on_the_third_remote_a_branch_was_cut_from() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-kaefer");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    for (remote, url) in [
+        ("upstream", "git@github.com:canonical/repo.git"),
+        ("kaefer", "git@github.com:kaefer/repo.git"),
+        ("kaefer-fork", "git@github.com:me/kaefer-repo.git"),
+    ] {
+        git(&repo, &["remote", "add", remote, url]);
+    }
+    git(&repo, &["update-ref", "refs/remotes/kaefer/main", "HEAD"]);
+    let upstream_only = Command::new("git")
+        .args([
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-m",
+            "upstream only",
+        ])
+        .current_dir(&repo)
+        .output()
+        .expect("commit-tree");
+    let upstream_only = String::from_utf8_lossy(&upstream_only.stdout)
+        .trim()
+        .to_string();
+    git(
+        &repo,
+        &["update-ref", "refs/remotes/upstream/main", &upstream_only],
+    );
+
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "kaefer-feature",
+            worktree.to_str().unwrap(),
+            "kaefer/main",
+        ],
+    );
+    fs::write(worktree.join("feature.txt"), "one\ntwo\n").unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "feature"]);
+    git(
+        &worktree,
+        &[
+            "update-ref",
+            "refs/remotes/kaefer-fork/kaefer-feature",
+            "HEAD",
+        ],
+    );
+    git(
+        &worktree,
+        &["branch", "-q", "-u", "kaefer-fork/kaefer-feature"],
+    );
+
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_with_pr_owned_by(&log_path, "kaefer", 402)).unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+
+    let rows = service.snapshot().await.expect("snapshot");
+
+    let row = rows
+        .iter()
+        .find(|row| row.worktree.branch == "kaefer-feature")
+        .expect("kaefer-feature row");
+    let status = row
+        .worktree
+        .branch_status
+        .as_ref()
+        .expect("branch status against the base");
+    assert_eq!(status.upstream_branch.as_deref(), Some("kaefer/main"));
+    assert_eq!((status.ahead, status.behind), (1, 0));
+    assert_eq!((status.insertions, status.deletions), (Some(2), Some(0)));
+    let pr = row
+        .pull_request
+        .as_ref()
+        .expect("PR found in the kaefer remote's repository");
+    assert_eq!(pr.number, 402);
+    assert_eq!(pr.state, PrState::Open);
+}
+
+/// A branch behind its base shows only its own changes in the Diff column —
+/// not the inverse of the commits the base gained after the branch was cut.
+#[tokio::test]
+async fn snapshot_diff_counts_only_the_branch_changes_when_behind_its_base() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-feature");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    git(&repo, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().unwrap(),
+            "upstream/main",
+        ],
+    );
+    fs::write(worktree.join("feature.txt"), "one\ntwo\n").unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "feature"]);
+    fs::write(repo.join("upstream.txt"), "a\nb\nc\nd\ne\n").unwrap();
+    git(&repo, &["add", "upstream.txt"]);
+    git(&repo, &["commit", "-q", "-m", "upstream moves on"]);
+    git(&repo, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+    let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+
+    let rows = service.snapshot().await.expect("snapshot");
+
+    let status = rows
+        .iter()
+        .find(|row| row.worktree.branch == "feature")
+        .and_then(|row| row.worktree.branch_status.as_ref())
+        .expect("feature row with a branch status");
+    assert_eq!(status.upstream_branch.as_deref(), Some("upstream/main"));
+    assert_eq!((status.ahead, status.behind), (1, 1));
+    assert_eq!((status.insertions, status.deletions), (Some(2), Some(0)));
 }
 
 #[tokio::test]
@@ -312,6 +489,249 @@ async fn watch_emits_initial_snapshot() {
         .expect("watch timeout")
         .expect("watch rows");
     assert_eq!(update.rows().len(), 2);
+}
+
+/// On its PR beat the watch loop refreshes the base of every worktree, so a
+/// worktree cut from a third remote (`kaefer/main`) shows the commit a
+/// teammate pushed there as `behind` — not only the mother's `upstream/main`.
+#[tokio::test]
+async fn watch_refreshes_the_third_remote_base_a_worktree_was_cut_from() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let upstream = parent.path().join("upstream.git");
+    let kaefer = parent.path().join("kaefer.git");
+    let teammate = parent.path().join("teammate");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-kaefer");
+    for bare in [&upstream, &kaefer] {
+        git(
+            parent.path(),
+            &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+    }
+    fs::create_dir_all(&teammate).unwrap();
+    init_repo_with_main(&teammate);
+    git(&teammate, &["config", "user.email", "test@example.com"]);
+    git(&teammate, &["config", "user.name", "Test"]);
+    fs::write(teammate.join("README.md"), "# repo\n").unwrap();
+    git(&teammate, &["add", "README.md"]);
+    git(&teammate, &["commit", "-q", "-m", "init"]);
+    for bare in [&upstream, &kaefer] {
+        git(&teammate, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    }
+    git(
+        parent.path(),
+        &[
+            "clone",
+            "-q",
+            "-o",
+            "upstream",
+            upstream.to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ],
+    );
+    git(
+        &repo,
+        &["remote", "add", "kaefer", kaefer.to_str().unwrap()],
+    );
+    git(&repo, &["fetch", "-q", "kaefer"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "kaefer-feature",
+            worktree.to_str().unwrap(),
+            "kaefer/main",
+        ],
+    );
+    fs::write(teammate.join("kaefer.txt"), "kaefer only\n").unwrap();
+    git(&teammate, &["add", "kaefer.txt"]);
+    git(&teammate, &["commit", "-q", "-m", "kaefer moves on"]);
+    git(&teammate, &["push", "-q", kaefer.to_str().unwrap(), "main"]);
+
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_script(&log_path)).unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+    let mut watch = service.watch();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let update = tokio::time::timeout_at(deadline, watch.rx.recv())
+            .await
+            .expect("the kaefer base was never refreshed")
+            .expect("watch rows");
+        let behind = update
+            .rows()
+            .iter()
+            .find(|row| row.worktree.branch == "kaefer-feature")
+            .and_then(|row| row.worktree.branch_status.as_ref())
+            .map(|status| (status.upstream_branch.clone(), status.behind));
+        if behind == Some((Some("kaefer/main".to_string()), 1)) {
+            break;
+        }
+    }
+}
+
+/// Stdout of `git <args>` in `cwd`, trimmed.
+fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git invocation");
+    assert!(out.status.success(), "git {args:?} failed in {cwd:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A branch pushed with `-u` to a fork remote that is not `origin` (the PR's
+/// head lives there) is pushed back to that fork by the Merge flow's
+/// push-first step, never to `origin`.
+#[tokio::test]
+async fn push_head_sends_a_branch_to_the_fork_remote_it_tracks() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let origin = parent.path().join("origin.git");
+    let fork = parent.path().join("fork.git");
+    let work = parent.path().join("work");
+    for bare in [&origin, &fork] {
+        git(
+            parent.path(),
+            &["init", "-q", "--bare", bare.to_str().unwrap()],
+        );
+    }
+    fs::create_dir_all(&work).unwrap();
+    init_repo_with_main(&work);
+    git(&work, &["config", "user.email", "test@example.com"]);
+    git(&work, &["config", "user.name", "Test"]);
+    git(&work, &["switch", "-q", "-c", "feat"]);
+    fs::write(work.join("a.txt"), "1\n").unwrap();
+    git(&work, &["add", "a.txt"]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    git(
+        &work,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(
+        &work,
+        &["remote", "add", "kaefer-fork", fork.to_str().unwrap()],
+    );
+    git(&work, &["push", "-q", "-u", "kaefer-fork", "feat"]);
+    fs::write(work.join("b.txt"), "2\n").unwrap();
+    git(&work, &["add", "b.txt"]);
+    git(&work, &["commit", "-q", "-m", "second"]);
+    let head = git_stdout(&work, &["rev-parse", "HEAD"]);
+    let service = DashboardService::new(work.clone(), DashboardConfig::default())
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+
+    service
+        .push_head(work.to_str().unwrap())
+        .await
+        .expect("push HEAD");
+
+    assert_eq!(git_stdout(&fork, &["rev-parse", "refs/heads/feat"]), head);
+    assert_eq!(
+        git_stdout(&origin, &["for-each-ref", "refs/heads"]),
+        "",
+        "origin must not receive the fork's branch"
+    );
+}
+
+/// A branch cut from `kaefer/main` and pushed with `git push kaefer-fork HEAD`
+/// (no `-u`) still tracks its base, so git has no push destination for it.
+/// The Merge flow's push-first step follows the copy it left on the fork,
+/// while a teammate's same-named branch on another remote, which HEAD does
+/// not contain, is ignored.
+#[tokio::test]
+async fn push_head_follows_a_branch_pushed_to_its_fork_without_upstream() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let kaefer = parent.path().join("kaefer.git");
+    let origin = parent.path().join("origin.git");
+    let fork = parent.path().join("fork.git");
+    let work = parent.path().join("work");
+    for bare in [&kaefer, &origin, &fork] {
+        git(
+            parent.path(),
+            &["init", "-q", "--bare", bare.to_str().unwrap()],
+        );
+    }
+    fs::create_dir_all(&work).unwrap();
+    init_repo_with_main(&work);
+    git(&work, &["config", "user.email", "test@example.com"]);
+    git(&work, &["config", "user.name", "Test"]);
+    fs::write(work.join("a.txt"), "1\n").unwrap();
+    git(&work, &["add", "a.txt"]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    for (remote, path) in [
+        ("kaefer", &kaefer),
+        ("origin", &origin),
+        ("kaefer-fork", &fork),
+    ] {
+        git(&work, &["remote", "add", remote, path.to_str().unwrap()]);
+    }
+    git(
+        &work,
+        &["remote", "add", "upstream", "https://example.invalid/u.git"],
+    );
+    git(&work, &["push", "-q", "kaefer", "main"]);
+    git(&work, &["fetch", "-q", "kaefer"]);
+    git(
+        &work,
+        &["switch", "-q", "-c", "feat", "--track", "kaefer/main"],
+    );
+    fs::write(work.join("b.txt"), "2\n").unwrap();
+    git(&work, &["add", "b.txt"]);
+    git(&work, &["commit", "-q", "-m", "feature"]);
+    git(&work, &["push", "-q", "kaefer-fork", "HEAD"]);
+    let unrelated = git_stdout(&work, &["commit-tree", "HEAD^{tree}", "-m", "teammate"]);
+    git(
+        &work,
+        &["update-ref", "refs/remotes/upstream/feat", &unrelated],
+    );
+    fs::write(work.join("c.txt"), "3\n").unwrap();
+    git(&work, &["add", "c.txt"]);
+    git(&work, &["commit", "-q", "-m", "more"]);
+    let head = git_stdout(&work, &["rev-parse", "HEAD"]);
+    let service = DashboardService::new(work.clone(), DashboardConfig::default())
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+
+    service
+        .push_head(work.to_str().unwrap())
+        .await
+        .expect("push HEAD");
+
+    assert_eq!(git_stdout(&fork, &["rev-parse", "refs/heads/feat"]), head);
+    assert_eq!(git_stdout(&origin, &["for-each-ref", "refs/heads"]), "");
+}
+
+/// When git's push destination for the branch is a differently named branch
+/// (here the base it tracks, under `push.default=upstream`), the push remote
+/// falls back to `origin` so HEAD never lands on the base.
+#[tokio::test]
+async fn resolve_push_remote_never_targets_the_base_a_branch_tracks() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    git(
+        &repo,
+        &["remote", "add", "upstream", "https://example.invalid/u.git"],
+    );
+    git(&repo, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+    git(
+        &repo,
+        &["switch", "-q", "-c", "feat", "--track", "upstream/main"],
+    );
+    git(&repo, &["config", "push.default", "upstream"]);
+
+    assert_eq!(resolve_push_remote(&repo).await, "origin");
 }
 
 #[tokio::test]
@@ -622,6 +1042,449 @@ fn fake_gh_pr_script(log_path: &Path, pr_view_json: &str, merge_exit_code: i32) 
     )
 }
 
+/// Fake `gh` that resolves a PR the way the real one does: without `--repo`
+/// it falls back to its default repository (`canonical/repo`, like a
+/// `gh repo set-default` on `upstream`), where the same number is an
+/// unrelated PR; `--repo <owner/repo>` selects the PR in that repository.
+/// Every call is logged, and `pr view` answers with the selected repository.
+fn fake_gh_with_default_repository(log_path: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "--version" ]; then exit 0; fi
+repo=canonical/repo
+previous=
+for arg in "$@"; do
+  if [ "$previous" = "--repo" ]; then repo="$arg"; fi
+  previous="$arg"
+done
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '{{"title":"%s title","body":"%s body"}}' "$repo" "$repo"
+  exit 0
+fi
+printf 'ok %s\n' "$repo"
+"#,
+        log = log_path.display()
+    )
+}
+
+fn service_with_default_repository_gh(parent: &Path) -> (DashboardService, PathBuf) {
+    let repo = parent.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    let log_path = parent.join("gh.log");
+    let gh_path = parent.join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_with_default_repository(&log_path)).unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo, DashboardConfig::default())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.join("dashboard_pr_cache.json")));
+    (service, log_path)
+}
+
+#[test]
+fn pr_repository_reads_owner_and_repo_off_the_pr_url() {
+    assert_eq!(
+        pr_repository("https://github.com/kaefer-cit/dpms-api-norway/pull/402").as_deref(),
+        Some("kaefer-cit/dpms-api-norway")
+    );
+    assert_eq!(pr_repository("not a github url"), None);
+}
+
+/// Merge on a PR opened on a third remote's repository (`kaefer/repo`) reads
+/// and squash-merges that PR — never the unrelated PR with the same number
+/// in `gh`'s default repository.
+#[tokio::test]
+async fn merge_reads_and_merges_the_pr_in_its_own_repository() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let (service, log_path) = service_with_default_repository_gh(parent.path());
+    let repository = pr_repository("https://github.com/kaefer/repo/pull/402");
+
+    let details = service
+        .fetch_pr_details(402, repository.as_deref())
+        .await
+        .expect("details");
+    service
+        .merge_pull_request(402, &details.title, &details.body, repository.as_deref())
+        .await
+        .expect("merge");
+
+    assert_eq!(details.title, "kaefer/repo title");
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("pr merge 402 --squash"), "{log}");
+    assert!(
+        log.lines()
+            .filter(|line| line.starts_with("pr merge"))
+            .all(|line| line.ends_with("--repo kaefer/repo")),
+        "{log}"
+    );
+}
+
+/// Close acts on the PR in its own repository.
+#[tokio::test]
+async fn close_targets_the_pr_in_its_own_repository() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let (service, log_path) = service_with_default_repository_gh(parent.path());
+
+    service
+        .close_pull_request(402, Some("kaefer/repo"))
+        .await
+        .expect("close");
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("pr close 402 --repo kaefer/repo"), "{log}");
+}
+
+/// A worktree whose `feature` branch is pushed with `-u` to the `me/repo`
+/// fork, plus the head commit of that branch and of an unrelated branch a
+/// teammate named `feature` in their own fork.
+struct SameNamedBranchFixture {
+    parent: TempDir,
+    repo: PathBuf,
+    our_head: String,
+    teammate_head: String,
+}
+
+fn same_named_branch_fixture() -> SameNamedBranchFixture {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-feature");
+    let fork = parent.path().join("fork.git");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    git(
+        parent.path(),
+        &["init", "-q", "--bare", fork.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:canonical/repo.git",
+        ],
+    );
+    git(
+        &repo,
+        &["remote", "add", "fork", "git@github.com:me/repo.git"],
+    );
+    git(
+        &repo,
+        &["config", "remote.fork.pushurl", fork.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    fs::write(worktree.join("feature.txt"), "ours\n").unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "our feature"]);
+    git(&worktree, &["push", "-q", "-u", "fork", "feature"]);
+    let our_head = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    let teammate_head = git_stdout(
+        &repo,
+        &["commit-tree", "HEAD^{tree}", "-m", "their feature"],
+    );
+    SameNamedBranchFixture {
+        parent,
+        repo,
+        our_head,
+        teammate_head,
+    }
+}
+
+/// Fake `gh` answering every branch of the PR lookup with `nodes`.
+fn fake_gh_with_pr_candidates(log_path: &Path, nodes: &str) -> String {
+    let branch = format!(r#"{{"nodes":[{nodes}]}}"#);
+    format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  printf '%s' '{{\"data\":{{\"repository\":{{\"b0\":{branch},\"b1\":{branch}}}}}}}'\n  exit 0\nfi\nprintf '[]'\n",
+        log = log_path.display()
+    )
+}
+
+fn pr_node(number: u64, head_repository: &str, head: &str) -> String {
+    format!(
+        r#"{{"number":{number},"state":"OPEN","url":"https://github.com/canonical/repo/pull/{number}","title":"PR {number}","isDraft":false,"headRefOid":"{head}","headRepository":{{"nameWithOwner":"{head_repository}"}}}}"#
+    )
+}
+
+async fn feature_row_pr(fixture: &SameNamedBranchFixture, nodes: &str) -> Option<u64> {
+    let log_path = fixture.parent.path().join("gh.log");
+    let gh_path = fixture.parent.path().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_with_pr_candidates(&log_path, nodes)).unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(fixture.repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(fixture.parent.path().join("dashboard_pr_cache.json")));
+    let rows = service.snapshot().await.expect("snapshot");
+    rows.into_iter()
+        .find(|row| row.worktree.branch == "feature")
+        .expect("feature row")
+        .pull_request
+        .map(|pr| pr.number)
+}
+
+/// GitHub matches PRs to a branch by name, so a teammate's newer PR from a
+/// same-named branch in their fork comes back first. The row keeps its own
+/// PR — the one whose head lives where the branch is pushed — so no command
+/// ever acts on the teammate's.
+#[tokio::test]
+async fn row_keeps_its_own_pr_over_a_newer_same_named_pr_from_another_fork() {
+    let fixture = same_named_branch_fixture();
+    let nodes = format!(
+        "{},{}",
+        pr_node(20, "teammate/repo", &fixture.teammate_head),
+        pr_node(10, "me/repo", &fixture.our_head)
+    );
+
+    assert_eq!(feature_row_pr(&fixture, &nodes).await, Some(10));
+}
+
+/// When the only PR for the branch name is another fork's, the row has none.
+#[tokio::test]
+async fn row_has_no_pr_when_only_another_fork_has_a_same_named_one() {
+    let fixture = same_named_branch_fixture();
+    let nodes = pr_node(20, "teammate/repo", &fixture.teammate_head);
+
+    assert_eq!(feature_row_pr(&fixture, &nodes).await, None);
+}
+
+/// A worktree cut from the fork's `origin/main` whose PR targets
+/// `upstream/main` is measured against the PR's base once the dashboard knows
+/// the PR, not against the stale fork branch it was cut from.
+#[tokio::test]
+async fn row_is_measured_against_its_prs_base_once_the_pr_is_known() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-feature");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:canonical/repo.git",
+        ],
+    );
+    git(
+        &repo,
+        &["remote", "add", "origin", "git@github.com:me/repo.git"],
+    );
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let upstream_ahead = git_stdout(
+        &repo,
+        &[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-m",
+            "upstream moves on",
+        ],
+    );
+    git(
+        &repo,
+        &["update-ref", "refs/remotes/upstream/main", &upstream_ahead],
+    );
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    fs::write(worktree.join("feature.txt"), "one\n").unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "feature"]);
+    let head = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    let pr = format!(
+        r#"{{"number":7,"state":"OPEN","url":"https://github.com/canonical/repo/pull/7","title":"t","isDraft":false,"baseRefName":"main","baseRepository":{{"nameWithOwner":"canonical/repo"}},"headRefOid":"{head}","headRepository":{{"nameWithOwner":"me/repo"}}}}"#
+    );
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_with_pr_candidates(&log_path, &pr)).unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+    let feature_status = |rows: Vec<wisetree::services::DashboardRow>| {
+        rows.into_iter()
+            .find(|row| row.worktree.branch == "feature")
+            .and_then(|row| row.worktree.branch_status)
+            .map(|status| (status.upstream_branch, status.ahead, status.behind))
+    };
+
+    let before_pr_known = feature_status(service.snapshot().await.expect("first snapshot"));
+    let after_pr_known = feature_status(service.snapshot().await.expect("second snapshot"));
+
+    assert_eq!(
+        before_pr_known,
+        Some((Some("origin/main".to_string()), 1, 0))
+    );
+    assert_eq!(
+        after_pr_known,
+        Some((Some("upstream/main".to_string()), 1, 1))
+    );
+}
+
+/// A `feature` worktree that tracks its copy on `origin` (`me/repo`) while its
+/// PR #7 was opened from the same commit on `kaefer-fork` (`me/kaefer-repo`) —
+/// e.g. after a push to the wrong fork. `service` already knows the PR.
+struct PrHeadOnForkFixture {
+    _parent: TempDir,
+    worktree: PathBuf,
+    origin: PathBuf,
+    fork: PathBuf,
+    pushed: String,
+    service: DashboardService,
+}
+
+async fn pr_head_on_fork_fixture() -> PrHeadOnForkFixture {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-feature");
+    let origin = parent.path().join("origin.git");
+    let fork = parent.path().join("fork.git");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    for bare in [&origin, &fork] {
+        git(
+            parent.path(),
+            &["init", "-q", "--bare", bare.to_str().unwrap()],
+        );
+    }
+    for (remote, url, push_url) in [
+        ("upstream", "git@github.com:canonical/repo.git", None),
+        ("origin", "git@github.com:me/repo.git", Some(&origin)),
+        (
+            "kaefer-fork",
+            "git@github.com:me/kaefer-repo.git",
+            Some(&fork),
+        ),
+    ] {
+        git(&repo, &["remote", "add", remote, url]);
+        if let Some(push_url) = push_url {
+            let key = format!("remote.{remote}.pushurl");
+            git(&repo, &["config", &key, push_url.to_str().unwrap()]);
+        }
+    }
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    fs::write(worktree.join("feature.txt"), "one\n").unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "feature"]);
+    git(&worktree, &["push", "-q", "-u", "origin", "feature"]);
+    git(&worktree, &["push", "-q", "kaefer-fork", "feature"]);
+    let pushed = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(
+        &gh_path,
+        fake_gh_with_pr_candidates(&log_path, &pr_node(7, "me/kaefer-repo", &pushed)),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+    service.snapshot().await.expect("snapshot");
+    PrHeadOnForkFixture {
+        _parent: parent,
+        worktree,
+        origin,
+        fork,
+        pushed,
+        service,
+    }
+}
+
+/// Such a branch has its PR updated where GitHub says the head lives — not on
+/// the `origin` copy the PR never sees.
+#[tokio::test]
+async fn pushes_update_the_pr_where_github_says_its_head_lives() {
+    let fixture = pr_head_on_fork_fixture().await;
+    fs::write(fixture.worktree.join("feature.txt"), "one\ntwo\n").unwrap();
+    git(&fixture.worktree, &["commit", "-q", "-am", "more"]);
+    let head = git_stdout(&fixture.worktree, &["rev-parse", "HEAD"]);
+
+    fixture
+        .service
+        .push_head(fixture.worktree.to_str().unwrap())
+        .await
+        .expect("push HEAD");
+
+    assert_eq!(
+        git_stdout(&fixture.fork, &["rev-parse", "refs/heads/feature"]),
+        head
+    );
+    assert_eq!(
+        git_stdout(&fixture.origin, &["rev-parse", "refs/heads/feature"]),
+        fixture.pushed
+    );
+}
+
+/// A commit pushed only to the `origin` copy the branch tracks is still
+/// missing from the PR, so Merge offers to push it before the squash-merge
+/// rather than silently dropping it.
+#[tokio::test]
+async fn merge_counts_commits_missing_from_the_pr_head_not_the_tracked_copy() {
+    let fixture = pr_head_on_fork_fixture().await;
+    fs::write(fixture.worktree.join("feature.txt"), "one\ntwo\n").unwrap();
+    git(
+        &fixture.worktree,
+        &["commit", "-q", "-am", "pushed to origin only"],
+    );
+    git(&fixture.worktree, &["push", "-q", "origin", "feature"]);
+
+    let unpushed = fixture
+        .service
+        .unpushed_commit_count(fixture.worktree.to_str().unwrap())
+        .await;
+
+    assert_eq!(unpushed, 1);
+}
+
 #[tokio::test]
 async fn fetch_pr_details_returns_title_and_body() {
     let fixture = repo_with_worktree();
@@ -634,7 +1497,10 @@ async fn fetch_pr_details_returns_title_and_body() {
     let service = service_with_isolated_cache_and_config(&fixture, config_with_prs())
         .with_gh_binary(gh_path.clone());
 
-    let details = service.fetch_pr_details(7).await.expect("fetch_pr_details");
+    let details = service
+        .fetch_pr_details(7, None)
+        .await
+        .expect("fetch_pr_details");
     assert_eq!(details.title, "Add merge action");
     assert_eq!(details.body, "Closes #42.");
 
@@ -657,7 +1523,7 @@ async fn merge_pull_request_invokes_gh_with_squash_flag_and_passthrough_message(
         .with_gh_binary(gh_path.clone());
 
     service
-        .merge_pull_request(7, "Add merge action", "Closes #42 with notes.")
+        .merge_pull_request(7, "Add merge action", "Closes #42 with notes.", None)
         .await
         .expect("merge ok");
 
@@ -688,7 +1554,7 @@ async fn merge_pull_request_surfaces_gh_stderr_on_failure() {
         .with_gh_binary(gh_path.clone());
 
     let err = service
-        .merge_pull_request(7, "subject", "body")
+        .merge_pull_request(7, "subject", "body", None)
         .await
         .expect_err("merge should fail when gh exits non-zero");
     let rendered = format!("{err}");
@@ -708,7 +1574,7 @@ async fn merge_pull_request_errors_clearly_when_gh_missing() {
         service_with_isolated_cache_and_config(&fixture, config_with_prs()).with_gh_binary(missing);
 
     let err = service
-        .merge_pull_request(7, "subject", "body")
+        .merge_pull_request(7, "subject", "body", None)
         .await
         .expect_err("merge should fail without gh");
     assert!(format!("{err}").contains("gh CLI not found"));
@@ -778,16 +1644,6 @@ async fn resolve_base_ref_priority_skips_missing_upstream_to_origin_main() {
     assert_eq!(chosen.as_deref(), Some("origin/main"));
 }
 
-/// HEAD of the repo at `path`.
-fn rev_parse_head(path: &Path) -> String {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(path)
-        .output()
-        .expect("rev-parse");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// Build a repo whose current branch `local` tracks the remote-tracking ref
 /// `tracks` (`<remote>/<branch>`) — exactly the config `git worktree add -b
 /// <name> <remote>/<source>` seeds — so `@{upstream}` names the branch the
@@ -798,9 +1654,20 @@ fn repo_with_tracking_branch(
     tracks: &str,
     remote_refs: &[&str],
 ) -> (TempDir, PathBuf) {
+    repo_with_branch_cut_from(local, "HEAD", tracks, remote_refs)
+}
+
+/// Like [`repo_with_tracking_branch`], but `local` is created from
+/// `start_point` (e.g. `kaefer/main`), so its reflog records the ref it was
+/// cut from even after `tracks` points at its own pushed copy.
+fn repo_with_branch_cut_from(
+    local: &str,
+    start_point: &str,
+    tracks: &str,
+    remote_refs: &[&str],
+) -> (TempDir, PathBuf) {
     let (dir, path) = repo_with_remote_refs(remote_refs);
     let (remote, source) = tracks.split_once('/').expect("tracks is <remote>/<branch>");
-    let sha = rev_parse_head(&path);
     git(&path, &["config", &format!("remote.{remote}.url"), "."]);
     git(
         &path,
@@ -810,7 +1677,7 @@ fn repo_with_tracking_branch(
             &format!("+refs/heads/*:refs/remotes/{remote}/*"),
         ],
     );
-    git(&path, &["branch", local, &sha]);
+    git(&path, &["branch", local, start_point]);
     git(
         &path,
         &["config", &format!("branch.{local}.remote"), remote],
@@ -875,4 +1742,57 @@ async fn resolve_base_ref_hint_falls_back_to_origin() {
     let (_dir, repo) = repo_with_remote_refs(&["upstream/main", "origin/release-0.41"]);
     let chosen = resolve_base_ref(&repo, Some("release-0.41")).await;
     assert_eq!(chosen.as_deref(), Some("origin/release-0.41"));
+}
+
+/// A branch pushed with `-u` to a fork remote that is not `origin` tracks its
+/// own copy there too — resolution must not diff the branch against itself.
+#[tokio::test]
+async fn resolve_base_ref_skips_own_pushed_ref_on_any_remote() {
+    let (_dir, repo) =
+        repo_with_tracking_branch("feat", "fork/feat", &["upstream/main", "fork/feat"]);
+    let chosen = resolve_base_ref(&repo, None).await;
+    assert_eq!(chosen.as_deref(), Some("upstream/main"));
+}
+
+/// The reported bug: a branch cut from a third remote (`kaefer/main`) and then
+/// pushed with `-u` to a fork still compares against the ref it was cut from,
+/// recovered from its reflog, rather than `upstream/main`.
+#[tokio::test]
+async fn resolve_base_ref_recovers_source_from_reflog_after_push() {
+    let (_dir, repo) = repo_with_branch_cut_from(
+        "feat",
+        "kaefer/main",
+        "kaefer-fork/feat",
+        &["upstream/main", "kaefer/main", "kaefer-fork/feat"],
+    );
+    let chosen = resolve_base_ref(&repo, None).await;
+    assert_eq!(chosen.as_deref(), Some("kaefer/main"));
+}
+
+/// GitHub's base name (`main`) for a branch cut from a third remote maps onto
+/// that remote, so the PR commands never merge an unrelated `upstream/main`.
+#[tokio::test]
+async fn resolve_base_ref_hint_prefers_the_third_remote_the_branch_was_cut_from() {
+    let (_dir, repo) = repo_with_branch_cut_from(
+        "feat",
+        "kaefer/main",
+        "kaefer-fork/feat",
+        &["upstream/main", "kaefer/main", "kaefer-fork/feat"],
+    );
+    let chosen = resolve_base_ref(&repo, Some("main")).await;
+    assert_eq!(chosen.as_deref(), Some("kaefer/main"));
+}
+
+/// A branch cut from `origin/main` keeps the conventional `upstream` → `origin`
+/// order for the hint: in a fork workflow its PR targets `upstream`.
+#[tokio::test]
+async fn resolve_base_ref_hint_keeps_upstream_first_for_a_branch_cut_from_origin() {
+    let (_dir, repo) = repo_with_branch_cut_from(
+        "feat",
+        "origin/main",
+        "origin/feat",
+        &["upstream/main", "origin/main", "origin/feat"],
+    );
+    let chosen = resolve_base_ref(&repo, Some("main")).await;
+    assert_eq!(chosen.as_deref(), Some("upstream/main"));
 }

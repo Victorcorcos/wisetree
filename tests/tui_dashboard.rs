@@ -86,6 +86,7 @@ fn row(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
 fn row_with_pr(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
     let mut row = row(path, branch, is_clean);
     row.pull_request = Some(PullRequest {
+        head_repository: None,
         number: 42,
         state: PrState::Open,
         url: "https://github.com/example/repo/pull/42".into(),

@@ -200,7 +200,7 @@ spike           spike/cache       Dirty            +2 -4         c0ffee1 WIP
 
 - The top line shows when the data was last refreshed and how many worktrees, dirty worktrees, and open PRs there are.
 - Git data is polled every `dashboard.refreshIntervalMs`. The default is 5 seconds, and the allowed range is 5–60 seconds.
-- Pull request data is refreshed every 30 seconds. On that same cycle Wisetree also fetches the base branch, so that the *behind* count includes commits that teammates pushed. PR results are cached in `~/.wisetree/dashboard_pr_cache.json`, which means the table appears instantly, and Wisetree backs off for 5 minutes if GitHub rate-limits it.
+- Pull request data is refreshed every 30 seconds. On that same cycle Wisetree also fetches the base branch of every worktree (for example both `upstream/main` and `kaefer/main`), so that the *behind* count includes commits that teammates pushed. PR results are cached in `~/.wisetree/dashboard_pr_cache.json`, which means the table appears instantly, and Wisetree backs off for 5 minutes if GitHub rate-limits it.
 - `Ctrl+R` forces a refresh.
 
 #### Search
@@ -216,14 +216,14 @@ The *Worktree* column, which shows the directory name, is always visible. You ch
 | `branch` | Branch | Checked-out branch. |
 | `status` | Status | Status label, plus pull request indicators (see below). |
 | `ahead_behind` | Ahead/Behind | `+N` commits ahead and `-N` commits behind the base ref. `=0` means the worktree is in sync. |
-| `diff` | Diff | `+N -N` lines inserted and deleted relative to the base ref. |
+| `diff` | Diff | `+N -N` lines inserted and deleted since the worktree left the base ref (its merge-base), uncommitted edits included. Commits the base gained afterwards are not counted. |
 | `last_commit` | Last Commit | Short SHA and subject of `HEAD`. |
 | `pull_request` | PR | `#123 Open`, `Merged`, `Closed`, or `Draft`. Requires PR data. |
 
 Wisetree picks the **base ref** for ahead/behind and diff in this order:
 
-1. The PR's base branch on `upstream`, then on `origin`.
-2. The branch's tracked upstream, unless that upstream is just its own pushed copy (`origin/<same-branch>`).
+1. Once the dashboard knows the worktree's PR, the PR's base branch on the remote that points at the PR's repository (for a `kaefer-cit` PR targeting `main`, `kaefer/main`), so the row is measured against what the PR merges into. Without such a remote, the base branch on the remote the worktree was cut from when that is a third remote (such as `kaefer`), then on `upstream`, then on `origin`.
+2. The remote branch the worktree was cut from, on any remote (such as `kaefer/main`). That is the branch's tracked upstream or, once the upstream is just its own pushed copy (`origin/<same-branch>`, `my-fork/<same-branch>`, …), the start point its reflog recorded when the branch was created.
 3. The first reachable ref among `upstream/main`, `upstream/master`, `upstream/develop`, `origin/main`, `origin/master`, and `origin/develop`.
 
 #### Status labels
@@ -251,7 +251,7 @@ For **Opened** PRs, up to three indicators follow the label:
 | | | 📝 draft |
 | | | ❓ unknown |
 
-PR data is shown only when `dashboard.showPullRequests` is `true` and `gh` is installed. If `gh` is missing, the PR column is hidden and a warning is shown.
+PR data is shown only when `dashboard.showPullRequests` is `true` and `gh` is installed. If `gh` is missing, the PR column is hidden and a warning is shown. PRs are looked up in the `upstream` repository (else `origin`) and, for a worktree cut from a third remote such as `kaefer/main`, in that remote's repository too. GitHub matches PRs to a branch by name alone, so Wisetree keeps a PR only when its head lives in the repository the branch is pushed to, or when the branch already contains its head commit: another fork's PR from a same-named branch is never shown, and never merged or closed, as this worktree's PR.
 
 #### Action menu
 
@@ -296,16 +296,16 @@ Opens the PR URL in your default browser with `open`, `xdg-open`, or `start`. On
 
 #### Close
 
-Runs `gh pr close <number>` after a confirmation dialog.
+Runs `gh pr close <number> --repo <owner/repo>` after a confirmation dialog. The repository is read from the PR's URL, so the command closes this PR even when `gh`'s default repository (for example `upstream`) has an unrelated PR with the same number.
 
 #### Merge (squash)
 
 1. Wisetree loads the PR title and description and shows a summary: the worktree, branch, CI status, ahead/behind counts, last commit, and a preview of the **squash commit message**.
 2. The confirmation defaults to **No**.
-3. If the worktree has **local commits that are not pushed**, Wisetree warns you, because a squash merge includes only what GitHub already has. It then asks:
-   - **Push & merge** (default): runs `git push origin HEAD`, then merges.
+3. If the worktree has **local commits that are not on the PR yet** (missing from the copy the PR's head lives on, which GitHub reports), Wisetree warns you, because a squash merge includes only what GitHub already has. It then asks:
+   - **Push & merge** (default): runs `git push <remote> HEAD`, then merges. The remote is the one that points at the repository the PR's head lives in; without one, the remote `git push` itself would send the branch to (such as a fork it was pushed to with `-u`), else `origin`.
    - **Merge only**: merges what is already on GitHub.
-4. Wisetree runs `gh pr merge <number> --squash --subject "<PR title> (#<number>)" --body "<PR description>"`. The resulting commit message matches GitHub's own squash convention.
+4. Wisetree runs `gh pr merge <number> --squash --subject "<PR title> (#<number>)" --body "<PR description>" --repo <owner/repo>`. The resulting commit message matches GitHub's own squash convention. The repository is read from the PR's URL, so a PR opened on another remote's repository (such as `kaefer`) is never confused with a same-numbered PR in `gh`'s default repository.
 
 ### Shared cache screen
 

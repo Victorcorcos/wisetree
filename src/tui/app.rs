@@ -34,7 +34,7 @@ use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 use crate::services::presets::WisePresetDiscovery;
 
 use crate::services::{
-    default_dashboard_warning, detect_shell_integration, install_shell_integration,
+    default_dashboard_warning, detect_shell_integration, install_shell_integration, pr_repository,
     resolve_dashboard_columns, DashboardNoticeLevel, DashboardService, DashboardUpdate,
     DashboardWatch, Shell, ShellIntegrationStatus,
 };
@@ -134,10 +134,12 @@ struct MergePrFailure {
 }
 
 /// Everything the background merge task needs: the `gh pr merge` subject +
-/// body, plus the worktree to (optionally) `git push origin HEAD` from
+/// body, plus the worktree to (optionally) `git push <remote> HEAD` from
 /// before merging so unpushed local commits reach the PR first.
 struct MergeExecution {
     number: u64,
+    /// `owner/repo` of the PR (see [`pr_repository`]).
+    repository: Option<String>,
     subject: String,
     body: String,
     worktree_path: String,
@@ -986,6 +988,10 @@ impl App {
                         worktree_path,
                         push_first,
                     } => {
+                        let repository = self
+                            .merge_pr
+                            .as_ref()
+                            .and_then(|screen| pr_repository(&screen.request().url));
                         if let Some(screen) = self.merge_pr.as_mut() {
                             screen.start_merging(push_first);
                         }
@@ -994,6 +1000,7 @@ impl App {
                             self.current_dashboard_config(),
                             MergeExecution {
                                 number,
+                                repository,
                                 subject: title,
                                 body,
                                 worktree_path,
@@ -1028,6 +1035,10 @@ impl App {
                 worktree_path,
                 push_first,
             } => {
+                let repository = self
+                    .merge_pr
+                    .as_ref()
+                    .and_then(|screen| pr_repository(&screen.request().url));
                 if let Some(screen) = self.merge_pr.as_mut() {
                     screen.start_merging(push_first);
                 }
@@ -1036,6 +1047,7 @@ impl App {
                     self.current_dashboard_config(),
                     MergeExecution {
                         number,
+                        repository,
                         subject: title,
                         body,
                         worktree_path,
@@ -1179,12 +1191,14 @@ impl App {
     ) {
         let number = request.number;
         let worktree_path = request.worktree_path.clone();
+        let repository = pr_repository(&request.url);
         self.merge_pr = Some(MergePullRequestScreen::new(request));
         self.screen = Screen::MergePullRequest;
         kick_off_fetch_pr_details(
             self.git_root.clone(),
             self.current_dashboard_config(),
             number,
+            repository,
             worktree_path,
             tx.clone(),
         );
@@ -1203,6 +1217,7 @@ impl App {
             self.git_root.clone(),
             self.current_dashboard_config(),
             request.number,
+            pr_repository(&request.url),
             tx.clone(),
         );
     }
@@ -2941,6 +2956,7 @@ fn kick_off_fetch_pr_details(
     git_root: Option<String>,
     config: DashboardConfig,
     number: u64,
+    repository: Option<String>,
     worktree_path: String,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
@@ -2956,7 +2972,7 @@ fn kick_off_fetch_pr_details(
         // confirm screen can warn before a squash-merge silently drops them.
         let unpushed_commits = service.unpushed_commit_count(&worktree_path).await;
         let result = service
-            .fetch_pr_details(number)
+            .fetch_pr_details(number, repository.as_deref())
             .await
             .map(|details| MergePrDetailsPayload {
                 title: details.title,
@@ -2988,7 +3004,7 @@ fn kick_off_merge_pull_request(
         // doesn't drop them. A push failure aborts the merge — better to
         // stop than to merge a stale PR and lose the commits.
         if exec.push_first {
-            if let Err(err) = service.push_head_to_origin(&exec.worktree_path).await {
+            if let Err(err) = service.push_head(&exec.worktree_path).await {
                 let _ = tx.send(AppEvent::MergePrFinished(Err(MergePrFailure {
                     number,
                     message: format!(
@@ -3000,7 +3016,12 @@ fn kick_off_merge_pull_request(
             }
         }
         let result = match service
-            .merge_pull_request(number, &exec.subject, &exec.body)
+            .merge_pull_request(
+                number,
+                &exec.subject,
+                &exec.body,
+                exec.repository.as_deref(),
+            )
             .await
         {
             Ok(()) => Ok(number),
@@ -3017,6 +3038,7 @@ fn kick_off_close_pull_request(
     git_root: Option<String>,
     config: DashboardConfig,
     number: u64,
+    repository: Option<String>,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let Some(root) = git_root.map(PathBuf::from) else {
@@ -3027,7 +3049,10 @@ fn kick_off_close_pull_request(
     };
     tokio::spawn(async move {
         let service = DashboardService::new(root, config);
-        let result = match service.close_pull_request(number).await {
+        let result = match service
+            .close_pull_request(number, repository.as_deref())
+            .await
+        {
             Ok(()) => Ok(number),
             Err(err) => Err(user_friendly_message(&err)),
         };

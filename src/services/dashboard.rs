@@ -1,6 +1,6 @@
 //! Live dashboard polling service.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -46,6 +46,12 @@ pub const BASE_REF_PRIORITY: [&str; 6] = [
     "origin/master",
     "origin/develop",
 ];
+/// Remotes searched, in order, for a base branch or the repository hosting
+/// the PRs: `upstream` first so fork-based workflows reach the canonical repo.
+const CONVENTIONAL_REMOTES: [&str; 2] = ["upstream", "origin"];
+/// Remote a PR update is pushed to when the branch has no push destination
+/// of its own yet (see [`resolve_push_remote`]).
+const FALLBACK_PUSH_REMOTE: &str = "origin";
 /// How often the service refetches PR data when branches are otherwise idle.
 /// Catches remote-only changes (merge, close, title edit) without hammering
 /// the API. The Status column countdown is driven by the same timer.
@@ -131,6 +137,14 @@ pub struct PullRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub head_ref_oid: Option<String>,
+    /// `owner/repo` the PR's head branch lives in — where pushes that update
+    /// it must go. `None` when GitHub cannot name it (a deleted fork).
+    #[serde(
+        rename = "headRepository",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub head_repository: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     #[serde(
@@ -406,12 +420,14 @@ impl DashboardService {
             loop {
                 let enrich = service.pr_enrichment_enabled();
                 let on_cycle = enrich && next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
+                let mut base_refs = Vec::new();
                 // Emit git-only rows (with cached PRs applied) first so the
                 // UI exits "Loading dashboard..." instantly, without waiting on
                 // any network round-trip. PR enrichment and the base-ref fetch
                 // below are refinements that fill in afterwards.
                 match service.collect_git_rows().await {
                     Ok(mut rows) => {
+                        base_refs = distinct_base_refs(&rows);
                         if rows_tx
                             .send(DashboardUpdate::GitOnly(rows.clone()))
                             .await
@@ -447,14 +463,14 @@ impl DashboardService {
                     }
                 }
 
-                // On the 30s PR beat, refresh the base branch's remote-tracking
-                // ref so the behind-count reflects commits another developer
-                // pushed to the base. Runs after the paint above so it never
-                // blocks the first
-                // render; when it actually advances the ref, loop again right
-                // away to re-render the refined behind-count. Best-effort: a
-                // failed or no-op fetch just falls through to the normal wait.
-                if on_cycle && service.fetch_base_ref().await {
+                // On the 30s PR beat, refresh the base branches' remote-tracking
+                // refs so the behind-count reflects commits another developer
+                // pushed to a base. Runs after the paint above so it never
+                // blocks the first render; when it actually advances a ref,
+                // loop again right away to re-render the refined behind-count.
+                // Best-effort: a failed or no-op fetch just falls through to
+                // the normal wait.
+                if on_cycle && service.fetch_base_refs(&base_refs).await {
                     continue;
                 }
 
@@ -502,9 +518,14 @@ impl DashboardService {
 
     /// Fetch the latest title + body for a single pull request via
     /// `gh pr view`. Bypasses the dashboard cache so the merge confirmation
-    /// screen always shows the description GitHub currently has.
-    pub async fn fetch_pr_details(&self, number: u64) -> Result<PullRequestDetails> {
-        self.fetch_pr_details_with_repo(number, None).await
+    /// screen always shows the description GitHub currently has. `repo` is
+    /// the PR's repository (see [`pr_repository`]).
+    pub async fn fetch_pr_details(
+        &self,
+        number: u64,
+        repo: Option<&str>,
+    ) -> Result<PullRequestDetails> {
+        self.fetch_pr_details_with_repo(number, repo).await
     }
 
     async fn fetch_pr_details_with_repo(
@@ -543,35 +564,115 @@ impl DashboardService {
     /// ` (#N)` reference appended to the subject to match GitHub's
     /// default squash-merge convention (the `#N` is auto-linked to the
     /// PR by GitHub's web UI).
-    pub async fn merge_pull_request(&self, number: u64, subject: &str, body: &str) -> Result<()> {
-        self.merge_pull_request_with_options(number, subject, body, None, None)
+    pub async fn merge_pull_request(
+        &self,
+        number: u64,
+        subject: &str,
+        body: &str,
+        repo: Option<&str>,
+    ) -> Result<()> {
+        self.merge_pull_request_with_options(number, subject, body, repo, None)
             .await
     }
 
-    /// Number of commits on the worktree's local `HEAD` that have not yet
-    /// been pushed to its tracking remote (`@{upstream}`). Powers the Merge
+    /// Number of commits on the worktree's local `HEAD` that its PR does not
+    /// have yet (see [`Self::commits_missing_from_pr`]). Powers the Merge
     /// confirm guard: a squash-merge only ever includes what GitHub already
     /// has, so unpushed local commits are silently dropped unless the user
-    /// pushes them first. Returns 0 when the tracking ref is unconfigured or
-    /// the count can't be parsed — a safe fallback that leaves the existing
-    /// merge-straight-away flow untouched.
+    /// pushes them first. Returns 0 when nothing to compare against is
+    /// configured or the count can't be parsed — a safe fallback that leaves
+    /// the existing merge-straight-away flow untouched.
     pub async fn unpushed_commit_count(&self, worktree_path: &str) -> u64 {
-        local_ahead_of_tracking(&self.git_binary, &PathBuf::from(worktree_path)).await
+        self.commits_missing_from_pr(&PathBuf::from(worktree_path))
+            .await
     }
 
-    /// Push the worktree's `HEAD` to `origin` (`git push origin HEAD`). Used
-    /// by the Merge flow to flush local commits into the PR before it is
+    /// Commits on `HEAD` missing from the copy on the PR head's remote
+    /// (`<remote>/<branch>`, see [`Self::pr_head_remote`]) — where Merge's
+    /// push-first step goes — else from the branch's tracking ref
+    /// (`@{upstream}`). A commit pushed only to another copy (e.g. the
+    /// `origin` one the branch tracks) is not on the PR yet.
+    async fn commits_missing_from_pr(&self, cwd: &Path) -> u64 {
+        if let (Some(remote), Some(branch)) = (
+            self.pr_head_remote(cwd).await,
+            current_branch_name(&self.git_binary, cwd).await,
+        ) {
+            let copy = format!("refs/remotes/{remote}/{branch}");
+            if ref_is_reachable(&self.git_binary, cwd, &copy).await {
+                return commits_in_range(&self.git_binary, cwd, &format!("{copy}..HEAD")).await;
+            }
+        }
+        local_ahead_of_tracking(&self.git_binary, cwd).await
+    }
+
+    /// Push the worktree's `HEAD` to its PR's push remote
+    /// (`git push <remote> HEAD`, see [`Self::pr_push_remote`]). Used by the
+    /// Merge flow to flush local commits into the PR before it is
     /// squash-merged, so nothing is lost.
-    pub async fn push_head_to_origin(&self, worktree_path: &str) -> Result<()> {
+    pub async fn push_head(&self, worktree_path: &str) -> Result<()> {
         let cwd = PathBuf::from(worktree_path);
+        let remote = self.pr_push_remote(&cwd).await;
         with_timeout(
             "git push",
             PUSH_TIMEOUT,
-            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+            run_command(&self.git_binary, &["push", &remote, "HEAD"], Some(&cwd)),
         )
         .await?
         .map_err(WisetreeError::other)?;
         Ok(())
+    }
+
+    /// The remote every push that updates the worktree's existing PR goes
+    /// to: the one pointing at the repository GitHub reports the PR's head
+    /// in ([`Self::pr_head_remote`]), else [`resolve_push_remote`]. The
+    /// branch's own tracking can name a copy elsewhere — e.g. one pushed to
+    /// `origin` before the PR was opened from `kaefer-fork` — which the PR
+    /// never sees.
+    async fn pr_push_remote(&self, cwd: &Path) -> String {
+        match self.pr_head_remote(cwd).await {
+            Some(remote) => remote,
+            None => resolve_push_remote_with_binary(&self.git_binary, cwd).await,
+        }
+    }
+
+    /// The remote pointing at the repository the checked-out branch's PR
+    /// head lives in, read from the dashboard's PR cache. `None` when the
+    /// branch has no known PR, GitHub could not name the head repository,
+    /// or no remote points at it.
+    async fn pr_head_remote(&self, cwd: &Path) -> Option<String> {
+        let branch = current_branch_name(&self.git_binary, cwd).await?;
+        self.ensure_cache_loaded();
+        let head_repository = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            state
+                .entries
+                .get(&branch)?
+                .pull_request
+                .as_ref()?
+                .head_repository
+                .clone()?
+        };
+        self.remote_for_repository(&head_repository).await
+    }
+
+    /// The first remote whose GitHub URL points at `repository` (`owner/repo`).
+    async fn remote_for_repository(&self, repository: &str) -> Option<String> {
+        let remotes = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(&self.git_binary, &["remote"], Some(&self.git_root)),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        for remote in remotes.lines().map(str::trim).filter(|r| !r.is_empty()) {
+            let Some((owner, repo)) = self.remote_github_slug(remote).await else {
+                continue;
+            };
+            if format!("{owner}/{repo}").eq_ignore_ascii_case(repository) {
+                return Some(remote.to_string());
+            }
+        }
+        None
     }
 
     async fn merge_pull_request_with_options(
@@ -614,18 +715,19 @@ impl DashboardService {
         Ok(())
     }
 
-    /// Close a pull request via `gh pr close <number>`.
-    pub async fn close_pull_request(&self, number: u64) -> Result<()> {
+    /// Close a pull request via `gh pr close <number>`, in its own
+    /// repository `repo` (see [`pr_repository`]).
+    pub async fn close_pull_request(&self, number: u64, repo: Option<&str>) -> Result<()> {
         self.require_gh()?;
         let number_arg = number.to_string();
+        let mut args = vec!["pr", "close", &number_arg];
+        if let Some(repo) = repo {
+            args.extend(["--repo", repo]);
+        }
         with_timeout(
             "gh pr close",
             PR_MERGE_TIMEOUT,
-            run_command(
-                &self.gh_binary,
-                &["pr", "close", &number_arg],
-                Some(&self.git_root),
-            ),
+            run_command(&self.gh_binary, &args, Some(&self.git_root)),
         )
         .await?
         .map_err(WisetreeError::other)?;
@@ -639,10 +741,12 @@ impl DashboardService {
     async fn collect_git_rows(&self) -> Result<Vec<DashboardRow>> {
         let worktrees = self.list_worktrees_basic().await?;
         let mut tasks = JoinSet::new();
+        self.ensure_cache_loaded();
 
         for worktree in worktrees {
             let service = self.clone();
-            tasks.spawn(async move { service.enrich_worktree_git(worktree).await });
+            let pr_base = self.cached_pr_base(&worktree.branch);
+            tasks.spawn(async move { service.enrich_worktree_git(worktree, pr_base).await });
         }
 
         let mut rows = Vec::new();
@@ -656,8 +760,6 @@ impl DashboardService {
                 }
             }
         }
-
-        self.ensure_cache_loaded();
 
         let live_branches: HashSet<String> =
             rows.iter().map(|row| row.worktree.branch.clone()).collect();
@@ -722,10 +824,29 @@ impl DashboardService {
         Ok(worktrees)
     }
 
-    async fn enrich_worktree_git(&self, mut worktree: GitWorktree) -> DashboardRow {
+    /// Base branch and repository of the PR cached for `branch`, so its row is
+    /// measured against the PR's own base (see
+    /// [`resolve_pr_base_ref_with_binary`]).
+    fn cached_pr_base(&self, branch: &str) -> Option<PrBase> {
+        let state = self.pr_state.lock().expect("pr_state poisoned");
+        let pr = state.entries.get(branch)?.pull_request.as_ref()?;
+        Some(PrBase {
+            name: pr.base_ref_name.clone()?,
+            repository: pr.base_repository.clone(),
+        })
+    }
+
+    async fn enrich_worktree_git(
+        &self,
+        mut worktree: GitWorktree,
+        pr_base: Option<PrBase>,
+    ) -> DashboardRow {
         let mut errors = Vec::new();
 
-        match self.fetch_status(Path::new(&worktree.path)).await {
+        match self
+            .fetch_status(Path::new(&worktree.path), pr_base.as_ref())
+            .await
+        {
             Ok((is_clean, branch_status)) => {
                 worktree.is_clean = is_clean;
                 worktree.branch_status = branch_status;
@@ -753,6 +874,7 @@ impl DashboardService {
     async fn fetch_status(
         &self,
         cwd: &Path,
+        pr_base: Option<&PrBase>,
     ) -> std::result::Result<(bool, Option<BranchStatus>), String> {
         let output = time::timeout(
             COMMAND_TIMEOUT,
@@ -769,20 +891,32 @@ impl DashboardService {
             }
         }
 
-        let branch_status = self.fetch_upstream_diff(cwd).await;
+        let branch_status = self.fetch_upstream_diff(cwd, pr_base).await;
         Ok((!dirty, branch_status))
     }
 
-    /// Compute the commit-level ahead/behind of HEAD relative to the first
-    /// reachable ref in `upstream/main`, `upstream/master`, `origin/main`,
-    /// `origin/master`. `ahead`/`behind` come from
+    /// Compute the commit-level ahead/behind of HEAD relative to the base ref:
+    /// the PR's own base when the row has one (`pr_base`, resolved through the
+    /// PR's repository), else the ref the branch was cut from
+    /// ([`resolve_base_ref_with_binary`]). `ahead`/`behind` come from
     /// `git rev-list --left-right --count` (matching `GitService::branch_status`),
     /// and `insertions`/`deletions` come from a follow-up
-    /// `git diff --shortstat <upstream>` so the "Diff" column can render the
-    /// line-level change set. Returns `None` when none of those remote refs are
-    /// reachable.
-    async fn fetch_upstream_diff(&self, cwd: &Path) -> Option<BranchStatus> {
-        let upstream = resolve_base_ref_with_binary(&self.git_binary, cwd, None).await?;
+    /// `git diff --shortstat --merge-base <upstream>` so the "Diff" column
+    /// renders the branch's own line-level changes (committed or not) since it
+    /// was cut — never the inverse of commits the base gained in the meantime.
+    /// Returns `None` when no base ref is reachable.
+    async fn fetch_upstream_diff(
+        &self,
+        cwd: &Path,
+        pr_base: Option<&PrBase>,
+    ) -> Option<BranchStatus> {
+        let upstream = resolve_pr_base_ref_with_binary(
+            &self.git_binary,
+            cwd,
+            pr_base.map(|base| base.name.as_str()),
+            pr_base.and_then(|base| base.repository.as_deref()),
+        )
+        .await?;
         let spec = format!("{upstream}...HEAD");
         let result = time::timeout(
             COMMAND_TIMEOUT,
@@ -812,7 +946,7 @@ impl DashboardService {
             COMMAND_TIMEOUT,
             run_command(
                 &self.git_binary,
-                &["diff", "--shortstat", &upstream],
+                &["diff", "--shortstat", "--merge-base", &upstream],
                 Some(cwd),
             ),
         )
@@ -834,34 +968,45 @@ impl DashboardService {
         })
     }
 
-    /// Best-effort refresh of the PR base branch's remote-tracking ref so the
-    /// dashboard's behind-count reflects commits another developer pushed to
-    /// the base. Without this the count is measured against a possibly-stale
-    /// `origin/main`, so a behind-but-conflict-free PR never surfaces the
-    /// "Update" command in repos that don't enforce up-to-date branches.
+    /// Best-effort refresh of every base branch's remote-tracking ref (one per
+    /// distinct base the rows were measured against, e.g. `upstream/main` and
+    /// `kaefer/main`) so the dashboard's behind-count reflects commits another
+    /// developer pushed to any base. Without this the count is measured against
+    /// a possibly-stale ref, so a behind-but-conflict-free PR never surfaces
+    /// the "Update" command in repos that don't enforce up-to-date branches.
     ///
+    /// Bases are fetched one after another: concurrent fetches in the same
+    /// repository would race on `FETCH_HEAD`.
+    ///
+    /// Returns `true` only when a fetch actually advanced a base's
+    /// remote-tracking ref, so the caller can re-render the refined
+    /// behind-count exactly when there is new data — and skip the churn when
+    /// every ref was already current.
+    async fn fetch_base_refs(&self, base_refs: &[String]) -> bool {
+        let mut advanced = false;
+        for base_ref in base_refs {
+            advanced |= self.fetch_base_ref(base_ref).await;
+        }
+        advanced
+    }
+
     /// Fetches a single branch with an explicit destination refspec
     /// (`+<branch>:refs/remotes/<remote>/<branch>`) so only the one
     /// remote-tracking ref `fetch_upstream_diff` reads is updated — no
-    /// `--all`, no extra branches, minimal transfer. Failures (offline, auth,
-    /// missing ref) are swallowed: a stale tracking ref just means the count
-    /// lags until the next successful fetch, never a stalled tick.
-    ///
-    /// Returns `true` only when the fetch actually advanced the base's
-    /// remote-tracking ref, so the caller can re-render the refined
-    /// behind-count exactly when there is new data — and skip the churn when
-    /// the ref was already current.
-    async fn fetch_base_ref(&self) -> bool {
-        let Some(base_ref) =
-            resolve_base_ref_with_binary(&self.git_binary, &self.git_root, None).await
-        else {
-            return false;
-        };
+    /// `--all`, no extra branches, minimal transfer. A base that is not a
+    /// remote-tracking ref is skipped. Failures (offline, auth, missing ref)
+    /// are swallowed: a stale tracking ref just means the count lags until
+    /// the next successful fetch, never a stalled tick.
+    async fn fetch_base_ref(&self, base_ref: &str) -> bool {
         let Some((remote, branch)) = base_ref.split_once('/') else {
             return false;
         };
-        let before = self.rev_parse(&base_ref).await;
-        let refspec = format!("+{branch}:refs/remotes/{remote}/{branch}");
+        let tracking_ref = format!("refs/remotes/{base_ref}");
+        let before = self.rev_parse(&tracking_ref).await;
+        if before.is_none() {
+            return false;
+        }
+        let refspec = format!("+{branch}:{tracking_ref}");
         let _ = time::timeout(
             BASE_FETCH_TIMEOUT,
             run_command(
@@ -871,7 +1016,7 @@ impl DashboardService {
             ),
         )
         .await;
-        let after = self.rev_parse(&base_ref).await;
+        let after = self.rev_parse(&tracking_ref).await;
         after.is_some() && after != before
     }
 
@@ -919,8 +1064,12 @@ impl DashboardService {
         }))
     }
 
-    /// Decide which branches need a PR refresh, then (if any) issue a single
-    /// batched GraphQL request and update the cache.
+    /// Decide which branches need a PR refresh, then (if any) issue one
+    /// batched GraphQL request per repository and update the cache.
+    ///
+    /// Every branch is looked up in the default repository. A branch cut from
+    /// a third remote (e.g. `kaefer/main`) is also looked up in that remote's
+    /// repository, whose PR wins when it has one.
     ///
     /// `on_cycle` is decided by the watch loop based on `next_pr_fetch_at`:
     /// `true` once per refresh period, `false` between periods. Off-cycle
@@ -931,7 +1080,7 @@ impl DashboardService {
             return false;
         }
 
-        let to_fetch: Vec<(String, String)> = {
+        let to_fetch: Vec<PrFetchTarget> = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
             rows.iter()
                 .filter_map(|row| {
@@ -944,7 +1093,12 @@ impl DashboardService {
                         Some(entry) => entry.sha != sha || on_cycle,
                         None => true,
                     };
-                    needs.then_some((branch, sha))
+                    needs.then(|| PrFetchTarget {
+                        branch,
+                        sha,
+                        base_remote: row_base_remote(row),
+                        worktree_path: PathBuf::from(&row.worktree.path),
+                    })
                 })
                 .collect()
         };
@@ -953,44 +1107,176 @@ impl DashboardService {
             return false;
         }
 
-        let Some((owner, repo)) = self.resolve_repo_slug().await else {
+        let Some(default_repo) = self.resolve_repo_slug().await else {
             return false;
         };
+        let source_repos = self.source_pr_repositories(&to_fetch, &default_repo).await;
 
-        let branches: Vec<&str> = to_fetch.iter().map(|(b, _)| b.as_str()).collect();
-        match self.fetch_prs_batched(&owner, &repo, &branches).await {
-            Ok(results) => {
-                let mut state = self.pr_state.lock().expect("pr_state poisoned");
-                for (branch, sha) in &to_fetch {
-                    let pr = results.get(branch).cloned().flatten();
-                    state.entries.insert(
-                        branch.clone(),
-                        PrCacheEntry {
-                            sha: sha.clone(),
-                            pull_request: pr,
-                        },
-                    );
+        let mut queries = vec![(
+            default_repo.clone(),
+            to_fetch
+                .iter()
+                .map(|target| target.branch.as_str())
+                .collect::<Vec<_>>(),
+        )];
+        for (target, source_repo) in to_fetch.iter().zip(&source_repos) {
+            let Some(repo) = source_repo else { continue };
+            match queries.iter_mut().find(|(queried, _)| queried == repo) {
+                Some((_, branches)) => branches.push(&target.branch),
+                None => queries.push((repo.clone(), vec![&target.branch])),
+            }
+        }
+
+        let mut fetched = HashMap::new();
+        let mut failure = None;
+        for (repo, branches) in &queries {
+            match self.fetch_prs_batched(&repo.0, &repo.1, branches).await {
+                Ok(prs) => {
+                    fetched.insert(repo, prs);
                 }
-                if !to_fetch.is_empty() {
-                    state.dirty = true;
+                Err(err) => {
+                    let rate_limited = is_rate_limit_error(&err);
+                    failure = Some(err);
+                    if rate_limited {
+                        break;
+                    }
                 }
+            }
+        }
+
+        let mut selected = Vec::new();
+        for (target, source_repo) in to_fetch.iter().zip(&source_repos) {
+            if let Some(pr) = self
+                .select_branch_pr(&fetched, target, source_repo.as_ref(), &default_repo)
+                .await
+            {
+                selected.push((target, pr));
+            }
+        }
+
+        let refreshed = {
+            let mut state = self.pr_state.lock().expect("pr_state poisoned");
+            let refreshed = !selected.is_empty();
+            for (target, pr) in selected {
+                state.entries.insert(
+                    target.branch.clone(),
+                    PrCacheEntry {
+                        sha: target.sha.clone(),
+                        pull_request: pr,
+                    },
+                );
+            }
+            state.dirty |= refreshed;
+            if failure.is_none() {
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
                 state.rate_limit_notice_sent = false;
-                true
             }
-            Err(err) => {
-                if is_rate_limit_error(&err) {
-                    self.mark_rate_limited();
-                } else {
-                    self.mark_pr_refresh_failed(&err);
+            refreshed
+        };
+
+        // Failures fall back to cached or empty PR data. Surface a single
+        // dashboard-level notice instead of per-row errors, because each
+        // GraphQL request covers many branches at once.
+        match failure {
+            Some(err) if is_rate_limit_error(&err) => self.mark_rate_limited(),
+            Some(err) => self.mark_pr_refresh_failed(&err),
+            None => {}
+        }
+        refreshed
+    }
+
+    /// For each branch to fetch, the GitHub repository of the third remote it
+    /// was cut from (e.g. `kaefer/main` → the `kaefer` remote's repository),
+    /// or `None` when the default repository already covers it.
+    async fn source_pr_repositories(
+        &self,
+        to_fetch: &[PrFetchTarget],
+        default_repo: &(String, String),
+    ) -> Vec<Option<(String, String)>> {
+        let mut repos = Vec::with_capacity(to_fetch.len());
+        for target in to_fetch {
+            let repo = match unconventional_remote(target.base_remote.as_deref()) {
+                Some(remote) => self.remote_github_slug(remote).await,
+                None => None,
+            };
+            repos.push(repo.filter(|repo| repo != default_repo));
+        }
+        repos
+    }
+
+    /// The target branch's PR once every repository it is looked up in has
+    /// answered: the newest candidate that is this branch's own (see
+    /// [`Self::is_own_pull_request`]), from the source repository first, then
+    /// the default one. `None` while an answer is missing, so the cached
+    /// entry is kept rather than cleared.
+    async fn select_branch_pr(
+        &self,
+        fetched: &HashMap<&(String, String), HashMap<String, Vec<PullRequest>>>,
+        target: &PrFetchTarget,
+        source_repo: Option<&(String, String)>,
+        default_repo: &(String, String),
+    ) -> Option<Option<PullRequest>> {
+        let mut own_repository = None;
+        for repo in source_repo.into_iter().chain([default_repo]) {
+            let candidates = fetched.get(repo)?.get(&target.branch);
+            for candidate in candidates.into_iter().flatten() {
+                if self
+                    .is_own_pull_request(&target.worktree_path, candidate, &mut own_repository)
+                    .await
+                {
+                    return Some(Some(candidate.clone()));
                 }
-                // Failures fall back to cached or empty PR data. Surface a
-                // single dashboard-level notice instead of per-row errors,
-                // because this GraphQL request covers every branch at once.
-                false
             }
         }
+        Some(None)
+    }
+
+    /// GitHub matches PRs to a branch by name alone, so another fork's PR
+    /// from a same-named branch is a candidate too. A candidate is this
+    /// branch's own when its head lives in the repository this branch is
+    /// pushed to, or when HEAD already contains its head commit. One whose
+    /// head repository GitHub cannot name (a deleted fork) is kept.
+    /// `own_repository` caches that repository across a branch's candidates.
+    async fn is_own_pull_request(
+        &self,
+        cwd: &Path,
+        candidate: &PullRequest,
+        own_repository: &mut Option<Option<String>>,
+    ) -> bool {
+        let Some(head_repository) = &candidate.head_repository else {
+            return true;
+        };
+        if own_repository.is_none() {
+            let slug = match own_push_remote(&self.git_binary, cwd).await {
+                Some(remote) => self
+                    .remote_github_slug(&remote)
+                    .await
+                    .map(|(owner, repo)| format!("{owner}/{repo}")),
+                None => None,
+            };
+            *own_repository = Some(slug);
+        }
+        if own_repository
+            .as_ref()
+            .and_then(Option::as_deref)
+            .is_some_and(|own| own.eq_ignore_ascii_case(head_repository))
+        {
+            return true;
+        }
+        let Some(head) = candidate.head_ref_oid.as_deref() else {
+            return false;
+        };
+        time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["merge-base", "--is-ancestor", head, "HEAD"],
+                Some(cwd),
+            ),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
     }
 
     fn apply_cached_prs(&self, rows: &mut [DashboardRow]) {
@@ -1061,22 +1347,9 @@ impl DashboardService {
         // the repository that actually hosts the PRs. Matches the precedence
         // used by `fetch_upstream_diff`.
         let mut slug = None;
-        for remote in ["upstream", "origin"] {
-            let Ok(result) = time::timeout(
-                COMMAND_TIMEOUT,
-                run_command(
-                    &self.git_binary,
-                    &["remote", "get-url", remote],
-                    Some(&self.git_root),
-                ),
-            )
-            .await
-            else {
-                continue;
-            };
-            let Ok(url) = result else { continue };
-            if let Some(parsed) = parse_github_slug(&url) {
-                slug = Some(parsed);
+        for remote in CONVENTIONAL_REMOTES {
+            slug = self.remote_github_slug(remote).await;
+            if slug.is_some() {
                 break;
             }
         }
@@ -1088,12 +1361,28 @@ impl DashboardService {
         Some(slug)
     }
 
+    /// `(owner, repo)` of `remote` when its URL points at GitHub.
+    async fn remote_github_slug(&self, remote: &str) -> Option<(String, String)> {
+        let url = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["remote", "get-url", remote],
+                Some(&self.git_root),
+            ),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        parse_github_slug(&url)
+    }
+
     async fn fetch_prs_batched(
         &self,
         owner: &str,
         repo: &str,
         branches: &[&str],
-    ) -> std::result::Result<HashMap<String, Option<PullRequest>>, String> {
+    ) -> std::result::Result<HashMap<String, Vec<PullRequest>>, String> {
         let query = build_graphql_query(owner, repo, branches);
         let arg = format!("query={query}");
         let output = time::timeout(
@@ -1206,6 +1495,26 @@ fn pr_refresh_period(_config: &DashboardConfig) -> Duration {
     Duration::from_millis(PR_REFRESH_PERIOD_MS)
 }
 
+/// The base ref the row's ahead/behind was measured against.
+fn row_base_ref(row: &DashboardRow) -> Option<&str> {
+    row.worktree
+        .branch_status
+        .as_ref()?
+        .upstream_branch
+        .as_deref()
+}
+
+/// The remote of the row's base ref.
+fn row_base_remote(row: &DashboardRow) -> Option<String> {
+    remote_name_from_ref(row_base_ref(row)?).map(str::to_string)
+}
+
+/// Each distinct base ref the rows were measured against, in sorted order.
+fn distinct_base_refs(rows: &[DashboardRow]) -> Vec<String> {
+    let base_refs: BTreeSet<&str> = rows.iter().filter_map(row_base_ref).collect();
+    base_refs.into_iter().map(str::to_string).collect()
+}
+
 fn branch_name_from_ref(base_ref: &str) -> &str {
     base_ref
         .split_once('/')
@@ -1228,6 +1537,16 @@ fn summarize_notice_text(message: &str) -> String {
 
 /// Extract `(owner, repo)` from a GitHub remote URL. Handles the common SSH,
 /// HTTPS, and `git@` SCP-style forms.
+/// `owner/repo` of the repository a pull request belongs to, read from its
+/// URL (`https://github.com/<owner>/<repo>/pull/<N>`). Every `gh` call that
+/// selects a PR by number passes it as `--repo`: `gh` otherwise picks its
+/// default repository (typically `upstream`), where a PR opened on another
+/// remote's repository (e.g. `kaefer`) resolves to an unrelated PR with the
+/// same number.
+pub fn pr_repository(url: &str) -> Option<String> {
+    parse_github_slug(url).map(|(owner, repo)| format!("{owner}/{repo}"))
+}
+
 fn parse_github_slug(remote: &str) -> Option<(String, String)> {
     let trimmed = remote.trim();
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
@@ -1243,6 +1562,26 @@ fn parse_github_slug(remote: &str) -> Option<(String, String)> {
     Some((owner.to_string(), repo.to_string()))
 }
 
+/// PRs fetched per branch name, newest first: GitHub matches PRs to a branch
+/// by name alone, so a newer PR from another fork's same-named branch must not
+/// hide this branch's own.
+const PR_CANDIDATES_PER_BRANCH: u8 = 5;
+
+/// GitHub's base branch name of a PR and the repository it targets.
+struct PrBase {
+    name: String,
+    repository: Option<String>,
+}
+
+/// A branch whose PR the dashboard refreshes.
+struct PrFetchTarget {
+    branch: String,
+    sha: String,
+    /// Remote of the base ref the row was measured against.
+    base_remote: Option<String>,
+    worktree_path: PathBuf,
+}
+
 fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     let mut q = String::new();
     q.push_str("query { repository(owner: \"");
@@ -1252,7 +1591,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft baseRefName baseRepository {{ nameWithOwner }} headRefOid mergeStateStatus reviewDecision labels(first: 20) {{ nodes {{ name }} }} reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: {PR_CANDIDATES_PER_BRANCH}, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft baseRefName baseRepository {{ nameWithOwner }} headRefOid headRepository {{ nameWithOwner }} mergeStateStatus reviewDecision labels(first: 20) {{ nodes {{ name }} }} reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -1314,7 +1653,7 @@ fn parse_pr_view_json(body: &str) -> Result<PullRequestDetails> {
 fn parse_graphql_response(
     body: &str,
     branches: &[&str],
-) -> std::result::Result<HashMap<String, Option<PullRequest>>, String> {
+) -> std::result::Result<HashMap<String, Vec<PullRequest>>, String> {
     let envelope: GhEnvelope =
         serde_json::from_str(body).map_err(|err| format!("invalid gh response: {err}"))?;
 
@@ -1334,14 +1673,20 @@ fn parse_graphql_response(
         .get("repository")
         .ok_or_else(|| "missing repository in response".to_string())?;
 
-    let mut out: HashMap<String, Option<PullRequest>> = HashMap::new();
+    let mut out: HashMap<String, Vec<PullRequest>> = HashMap::new();
     for (i, branch) in branches.iter().enumerate() {
         let key = format!("b{i}");
-        let pr = repo
+        let candidates = repo
             .get(&key)
             .and_then(|v| serde_json::from_value::<GhConnection>(v.clone()).ok())
-            .and_then(|conn| conn.nodes.into_iter().next())
+            .map(|conn| conn.nodes)
+            .unwrap_or_default()
+            .into_iter()
             .map(|node| {
+                let head_repository = node
+                    .head_repository
+                    .as_ref()
+                    .and_then(|repo| repo.name_with_owner.clone());
                 // GitHub keeps `isDraft = true` on a PR that was closed while
                 // still a draft, so the terminal states must win over the draft
                 // flag — otherwise a closed draft keeps reading as "Drafted".
@@ -1416,14 +1761,16 @@ fn parse_graphql_response(
                     base_ref_name: node.base_ref_name,
                     base_repository: node.base_repository.and_then(|repo| repo.name_with_owner),
                     head_ref_oid: node.head_ref_oid,
+                    head_repository,
                     labels,
                     checks_status,
                     review_status,
                     merge_status,
                     reviewers,
                 }
-            });
-        out.insert((*branch).to_string(), pr);
+            })
+            .collect();
+        out.insert((*branch).to_string(), candidates);
     }
     Ok(out)
 }
@@ -1541,6 +1888,8 @@ struct GhNode {
     base_repository: Option<GhBaseRepository>,
     #[serde(rename = "headRefOid", default)]
     head_ref_oid: Option<String>,
+    #[serde(rename = "headRepository", default)]
+    head_repository: Option<GhBaseRepository>,
     #[serde(rename = "mergeStateStatus", default)]
     merge_state_status: Option<String>,
     #[serde(rename = "reviewDecision", default)]
@@ -1810,10 +2159,7 @@ async fn run_command_once(
 ///
 /// 1. `pr_base_ref` — GitHub's own `baseRefName` for an existing PR, mapped
 ///    onto a reachable remote-tracking ref. Authoritative when a PR exists.
-/// 2. The branch's tracked upstream (`@{upstream}`), which `git worktree add`
-///    seeds from the source branch (e.g. `upstream/release-0.41`). Skipped
-///    once the branch has been pushed with `-u` and now tracks its own
-///    `origin/<branch>` counterpart — that is never a base.
+/// 2. The ref the branch was cut from (see [`branch_source_ref`]).
 /// 3. The conventional `BASE_REF_PRIORITY` list, as a last resort.
 ///
 /// This replaces the old "first reachable in `BASE_REF_PRIORITY`" behavior,
@@ -1829,10 +2175,13 @@ pub(crate) async fn resolve_base_ref_with_binary(
     cwd: &Path,
     pr_base_ref: Option<&str>,
 ) -> Option<String> {
+    let source = branch_source_ref(git_binary, cwd).await;
+
     // 1. Prefer GitHub's known base branch for the PR, mapped to whichever
     //    remote-tracking ref we actually have locally.
     if let Some(name) = pr_base_ref.map(str::trim).filter(|n| !n.is_empty()) {
-        for remote in ["upstream", "origin"] {
+        let source_remote = source.as_deref().and_then(remote_name_from_ref);
+        for remote in base_remotes(source_remote) {
             let candidate = format!("{remote}/{name}");
             if ref_is_reachable(git_binary, cwd, &candidate).await {
                 return Some(candidate);
@@ -1840,22 +2189,259 @@ pub(crate) async fn resolve_base_ref_with_binary(
         }
     }
 
-    // 2. Trust the branch's own tracked upstream, unless it is the branch's
-    //    own pushed ref (`origin/<self>`), which a PR is never based on.
-    if let Some(upstream) = tracked_upstream(git_binary, cwd).await {
-        let is_own_push_ref = remote_name_from_ref(&upstream) == Some("origin")
-            && current_branch_name(git_binary, cwd)
-                .await
-                .is_some_and(|branch| branch_name_from_ref(&upstream) == branch);
-        if !is_own_push_ref && ref_is_reachable(git_binary, cwd, &upstream).await {
-            return Some(upstream);
-        }
+    // 2. The ref the branch was cut from.
+    if source.is_some() {
+        return source;
     }
 
     // 3. Fall back to the conventional priority list.
     for candidate in BASE_REF_PRIORITY {
         if ref_is_reachable(git_binary, cwd, candidate).await {
             return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Remotes a base branch name is mapped onto: the conventional
+/// `upstream` → `origin` order, led by the remote the branch was cut from
+/// when that is a third one (e.g. a second canonical repository such as
+/// `kaefer`), so its `main` never resolves to an unrelated `upstream/main`.
+fn base_remotes(source_remote: Option<&str>) -> Vec<&str> {
+    let mut remotes = Vec::with_capacity(CONVENTIONAL_REMOTES.len() + 1);
+    remotes.extend(unconventional_remote(source_remote));
+    remotes.extend(CONVENTIONAL_REMOTES);
+    remotes
+}
+
+/// `remote` when it is a third remote, neither `upstream` nor `origin`.
+fn unconventional_remote(remote: Option<&str>) -> Option<&str> {
+    remote.filter(|remote| !CONVENTIONAL_REMOTES.contains(remote))
+}
+
+/// The remote-tracking ref the current branch was cut from: its tracked
+/// upstream (`@{upstream}`), which `git worktree add` seeds from the source
+/// branch (e.g. `upstream/release-0.41`). Once a push with `-u` replaced that
+/// with the branch's own pushed copy — on `origin` or any other remote, and
+/// never a base — the start point its reflog recorded at creation is used.
+async fn branch_source_ref(git_binary: &Path, cwd: &Path) -> Option<String> {
+    let branch = current_branch_name(git_binary, cwd).await?;
+    if let Some(upstream) = tracked_upstream(git_binary, cwd).await {
+        if !is_own_pushed_ref(&upstream, &branch)
+            && ref_is_reachable(git_binary, cwd, &upstream).await
+        {
+            return Some(upstream);
+        }
+    }
+    reflog_source_ref(git_binary, cwd, &branch).await
+}
+
+/// The remote every push that updates the worktree's PR goes to: the one
+/// `git push` sends the current branch to (`@{push}`), e.g. a `kaefer-fork`
+/// the branch was pushed to with `-u` — where its PR's head lives — or, when
+/// git has none, the remote the branch was pushed to without `-u` (see
+/// [`pushed_copy_remote`]). Falls back to `origin` when neither exists. A
+/// destination that is a differently named branch (such as the base it was
+/// cut from) never counts: HEAD must never be pushed into it.
+pub async fn resolve_push_remote(cwd: &Path) -> String {
+    resolve_push_remote_with_binary(Path::new("git"), cwd).await
+}
+
+pub(crate) async fn resolve_push_remote_with_binary(git_binary: &Path, cwd: &Path) -> String {
+    own_push_remote(git_binary, cwd)
+        .await
+        .unwrap_or_else(|| FALLBACK_PUSH_REMOTE.to_string())
+}
+
+async fn own_push_remote(git_binary: &Path, cwd: &Path) -> Option<String> {
+    let branch = current_branch_name(git_binary, cwd).await?;
+    match git_push_destination(git_binary, cwd, &branch).await {
+        Some(remote) => Some(remote),
+        None => pushed_copy_remote(git_binary, cwd, &branch).await,
+    }
+}
+
+/// The remote of `@{push}` when it is `branch`'s own counterpart.
+async fn git_push_destination(git_binary: &Path, cwd: &Path, branch: &str) -> Option<String> {
+    let push_ref = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(
+            git_binary,
+            &["rev-parse", "--abbrev-ref", "@{push}"],
+            Some(cwd),
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let push_ref = push_ref.trim();
+    if !is_own_pushed_ref(push_ref, branch) {
+        return None;
+    }
+    remote_name_from_ref(push_ref).map(str::to_string)
+}
+
+/// The one remote holding a copy of `branch` that HEAD already contains —
+/// what `git push <remote> HEAD` without `-u` leaves behind while the branch
+/// keeps tracking the base it was cut from. A same-named branch HEAD does not
+/// contain belongs to someone else, and two candidates are ambiguous: both
+/// yield `None`.
+async fn pushed_copy_remote(git_binary: &Path, cwd: &Path, branch: &str) -> Option<String> {
+    let remotes = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(git_binary, &["remote"], Some(cwd)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut holders = Vec::new();
+    for remote in remotes.lines().map(str::trim).filter(|r| !r.is_empty()) {
+        let copy = format!("refs/remotes/{remote}/{branch}");
+        let contained = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                git_binary,
+                &["merge-base", "--is-ancestor", &copy, "HEAD"],
+                Some(cwd),
+            ),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok());
+        if contained {
+            holders.push(remote.to_string());
+        }
+    }
+    match holders.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// `true` when `remote_ref` (`<remote>/<branch>`) is `branch`'s own
+/// counterpart on some remote rather than a branch it was cut from.
+fn is_own_pushed_ref(remote_ref: &str, branch: &str) -> bool {
+    branch_name_from_ref(remote_ref) == branch
+}
+
+/// The remote-tracking ref `branch` was created from, read from the
+/// `branch: Created from <start-point>` entry that `git worktree add -b`,
+/// `git branch` and `git switch -c` write first. `None` when that entry has
+/// expired, or the start point was not a remote-tracking ref (a local
+/// branch, `HEAD`, a commit) or was the branch's own remote counterpart.
+async fn reflog_source_ref(git_binary: &Path, cwd: &Path, branch: &str) -> Option<String> {
+    let reflog = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(
+            git_binary,
+            &[
+                "reflog",
+                "show",
+                "--format=%gs",
+                &format!("refs/heads/{branch}"),
+            ],
+            Some(cwd),
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let start_point = reflog
+        .lines()
+        .last()?
+        .strip_prefix("branch: Created from ")?
+        .trim();
+    let start_point = start_point
+        .strip_prefix("refs/remotes/")
+        .unwrap_or(start_point);
+    // `--abbrev-ref` also resolves a symbolic `<remote>/HEAD` to its branch.
+    let source = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(
+            git_binary,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--abbrev-ref",
+                &format!("refs/remotes/{start_point}"),
+            ],
+            Some(cwd),
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let source = source.trim();
+    (!source.is_empty() && !is_own_pushed_ref(source, branch)).then(|| source.to_string())
+}
+
+/// Resolve the local base ref of an existing PR: GitHub's base branch name
+/// through the remote that points at the PR's repository (`pr_repository`,
+/// e.g. `kaefer-cit/dpms-api-norway` → `kaefer/main`), so it never lands on a
+/// same-named branch of an unrelated remote even when the worktree's own
+/// source is unknown (a `gh pr checkout`, an expired reflog). Falls back to
+/// [`resolve_base_ref`].
+pub(crate) async fn resolve_pr_base_ref_with_binary(
+    git_binary: &Path,
+    cwd: &Path,
+    pr_base_ref: Option<&str>,
+    pr_repository: Option<&str>,
+) -> Option<String> {
+    let name = pr_base_ref.map(str::trim).filter(|name| !name.is_empty());
+    if let (Some(name), Some(repository)) = (name, pr_repository) {
+        if let Some(base_ref) =
+            resolve_github_repository_ref(git_binary, cwd, name, repository).await
+        {
+            return Some(base_ref);
+        }
+    }
+    resolve_base_ref_with_binary(git_binary, cwd, pr_base_ref).await
+}
+
+/// Resolve a branch only through a remote that points at the repository which
+/// owns an existing pull request. This avoids mapping `main` to an unrelated
+/// canonical `upstream` when the PR and its stack live in the user's fork.
+async fn resolve_github_repository_ref(
+    git_binary: &Path,
+    cwd: &Path,
+    branch: &str,
+    repository: &str,
+) -> Option<String> {
+    let remotes = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(git_binary, &["remote"], Some(cwd)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut candidates = remotes
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|remote| match *remote {
+        "origin" => 0,
+        "upstream" => 1,
+        _ => 2,
+    });
+    for remote in candidates {
+        let url = match time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(git_binary, &["remote", "get-url", remote], Some(cwd)),
+        )
+        .await
+        {
+            Ok(Ok(url)) => url,
+            _ => continue,
+        };
+        let remote_repository =
+            parse_github_slug(&url).map(|(owner, repo)| format!("{owner}/{repo}"));
+        if remote_repository.as_deref() != Some(repository) {
+            continue;
+        }
+        let candidate = format!("{remote}/{}", branch.trim());
+        if ref_is_reachable(git_binary, cwd, &candidate).await {
+            return Some(candidate);
         }
     }
     None
@@ -1918,15 +2504,16 @@ async fn current_branch_name(git_binary: &Path, cwd: &Path) -> Option<String> {
 /// configured or the count cannot be parsed — a safe fallback that
 /// avoids a spurious push when the tracking state is unknown.
 async fn local_ahead_of_tracking(git_binary: &Path, cwd: &Path) -> u64 {
-    run_command(
-        git_binary,
-        &["rev-list", "--count", "@{upstream}..HEAD"],
-        Some(cwd),
-    )
-    .await
-    .ok()
-    .and_then(|out| out.trim().parse::<u64>().ok())
-    .unwrap_or(0)
+    commits_in_range(git_binary, cwd, "@{upstream}..HEAD").await
+}
+
+/// `git rev-list --count <range>`, or 0 when it cannot be counted.
+async fn commits_in_range(git_binary: &Path, cwd: &Path, range: &str) -> u64 {
+    run_command(git_binary, &["rev-list", "--count", range], Some(cwd))
+        .await
+        .ok()
+        .and_then(|out| out.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 pub fn default_dashboard_warning(config: &DashboardConfig, gh_available: bool) -> Option<String> {
