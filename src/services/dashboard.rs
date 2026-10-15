@@ -46,6 +46,9 @@ pub const BASE_REF_PRIORITY: [&str; 6] = [
     "origin/master",
     "origin/develop",
 ];
+/// Remotes searched, in order, for a base branch or the repository hosting
+/// the PRs: `upstream` first so fork-based workflows reach the canonical repo.
+const CONVENTIONAL_REMOTES: [&str; 2] = ["upstream", "origin"];
 /// How often the service refetches PR data when branches are otherwise idle.
 /// Catches remote-only changes (merge, close, title edit) without hammering
 /// the API. The Status column countdown is driven by the same timer.
@@ -919,8 +922,12 @@ impl DashboardService {
         }))
     }
 
-    /// Decide which branches need a PR refresh, then (if any) issue a single
-    /// batched GraphQL request and update the cache.
+    /// Decide which branches need a PR refresh, then (if any) issue one
+    /// batched GraphQL request per repository and update the cache.
+    ///
+    /// Every branch is looked up in the default repository. A branch cut from
+    /// a third remote (e.g. `kaefer/main`) is also looked up in that remote's
+    /// repository, whose PR wins when it has one.
     ///
     /// `on_cycle` is decided by the watch loop based on `next_pr_fetch_at`:
     /// `true` once per refresh period, `false` between periods. Off-cycle
@@ -931,7 +938,7 @@ impl DashboardService {
             return false;
         }
 
-        let to_fetch: Vec<(String, String)> = {
+        let to_fetch: Vec<(String, String, Option<String>)> = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
             rows.iter()
                 .filter_map(|row| {
@@ -944,7 +951,7 @@ impl DashboardService {
                         Some(entry) => entry.sha != sha || on_cycle,
                         None => true,
                     };
-                    needs.then_some((branch, sha))
+                    needs.then(|| (branch, sha, row_base_remote(row)))
                 })
                 .collect()
         };
@@ -953,44 +960,98 @@ impl DashboardService {
             return false;
         }
 
-        let Some((owner, repo)) = self.resolve_repo_slug().await else {
+        let Some(default_repo) = self.resolve_repo_slug().await else {
             return false;
         };
+        let source_repos = self.source_pr_repositories(&to_fetch, &default_repo).await;
 
-        let branches: Vec<&str> = to_fetch.iter().map(|(b, _)| b.as_str()).collect();
-        match self.fetch_prs_batched(&owner, &repo, &branches).await {
-            Ok(results) => {
-                let mut state = self.pr_state.lock().expect("pr_state poisoned");
-                for (branch, sha) in &to_fetch {
-                    let pr = results.get(branch).cloned().flatten();
-                    state.entries.insert(
-                        branch.clone(),
-                        PrCacheEntry {
-                            sha: sha.clone(),
-                            pull_request: pr,
-                        },
-                    );
+        let mut queries = vec![(
+            default_repo.clone(),
+            to_fetch
+                .iter()
+                .map(|(branch, ..)| branch.as_str())
+                .collect::<Vec<_>>(),
+        )];
+        for ((branch, ..), source_repo) in to_fetch.iter().zip(&source_repos) {
+            let Some(repo) = source_repo else { continue };
+            match queries.iter_mut().find(|(queried, _)| queried == repo) {
+                Some((_, branches)) => branches.push(branch),
+                None => queries.push((repo.clone(), vec![branch])),
+            }
+        }
+
+        let mut fetched = HashMap::new();
+        let mut failure = None;
+        for (repo, branches) in &queries {
+            match self.fetch_prs_batched(&repo.0, &repo.1, branches).await {
+                Ok(prs) => {
+                    fetched.insert(repo, prs);
                 }
-                if !to_fetch.is_empty() {
-                    state.dirty = true;
+                Err(err) => {
+                    let rate_limited = is_rate_limit_error(&err);
+                    failure = Some(err);
+                    if rate_limited {
+                        break;
+                    }
                 }
+            }
+        }
+
+        let refreshed = {
+            let mut state = self.pr_state.lock().expect("pr_state poisoned");
+            let mut refreshed = false;
+            for ((branch, sha, _), source_repo) in to_fetch.iter().zip(&source_repos) {
+                let Some(pr) =
+                    fetched_branch_pr(&fetched, branch, source_repo.as_ref(), &default_repo)
+                else {
+                    continue;
+                };
+                state.entries.insert(
+                    branch.clone(),
+                    PrCacheEntry {
+                        sha: sha.clone(),
+                        pull_request: pr,
+                    },
+                );
+                refreshed = true;
+            }
+            state.dirty |= refreshed;
+            if failure.is_none() {
                 // Successful round-trip — clear any prior rate-limit state.
                 state.rate_limited_until = None;
                 state.rate_limit_notice_sent = false;
-                true
             }
-            Err(err) => {
-                if is_rate_limit_error(&err) {
-                    self.mark_rate_limited();
-                } else {
-                    self.mark_pr_refresh_failed(&err);
-                }
-                // Failures fall back to cached or empty PR data. Surface a
-                // single dashboard-level notice instead of per-row errors,
-                // because this GraphQL request covers every branch at once.
-                false
-            }
+            refreshed
+        };
+
+        // Failures fall back to cached or empty PR data. Surface a single
+        // dashboard-level notice instead of per-row errors, because each
+        // GraphQL request covers many branches at once.
+        match failure {
+            Some(err) if is_rate_limit_error(&err) => self.mark_rate_limited(),
+            Some(err) => self.mark_pr_refresh_failed(&err),
+            None => {}
         }
+        refreshed
+    }
+
+    /// For each branch to fetch, the GitHub repository of the third remote it
+    /// was cut from (e.g. `kaefer/main` → the `kaefer` remote's repository),
+    /// or `None` when the default repository already covers it.
+    async fn source_pr_repositories(
+        &self,
+        to_fetch: &[(String, String, Option<String>)],
+        default_repo: &(String, String),
+    ) -> Vec<Option<(String, String)>> {
+        let mut repos = Vec::with_capacity(to_fetch.len());
+        for (_, _, base_remote) in to_fetch {
+            let repo = match unconventional_remote(base_remote.as_deref()) {
+                Some(remote) => self.remote_github_slug(remote).await,
+                None => None,
+            };
+            repos.push(repo.filter(|repo| repo != default_repo));
+        }
+        repos
     }
 
     fn apply_cached_prs(&self, rows: &mut [DashboardRow]) {
@@ -1061,22 +1122,9 @@ impl DashboardService {
         // the repository that actually hosts the PRs. Matches the precedence
         // used by `fetch_upstream_diff`.
         let mut slug = None;
-        for remote in ["upstream", "origin"] {
-            let Ok(result) = time::timeout(
-                COMMAND_TIMEOUT,
-                run_command(
-                    &self.git_binary,
-                    &["remote", "get-url", remote],
-                    Some(&self.git_root),
-                ),
-            )
-            .await
-            else {
-                continue;
-            };
-            let Ok(url) = result else { continue };
-            if let Some(parsed) = parse_github_slug(&url) {
-                slug = Some(parsed);
+        for remote in CONVENTIONAL_REMOTES {
+            slug = self.remote_github_slug(remote).await;
+            if slug.is_some() {
                 break;
             }
         }
@@ -1086,6 +1134,22 @@ impl DashboardService {
             state.repo_slug = Some(slug.clone());
         }
         Some(slug)
+    }
+
+    /// `(owner, repo)` of `remote` when its URL points at GitHub.
+    async fn remote_github_slug(&self, remote: &str) -> Option<(String, String)> {
+        let url = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["remote", "get-url", remote],
+                Some(&self.git_root),
+            ),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        parse_github_slug(&url)
     }
 
     async fn fetch_prs_batched(
@@ -1204,6 +1268,37 @@ fn is_rate_limit_error(err: &str) -> bool {
 
 fn pr_refresh_period(_config: &DashboardConfig) -> Duration {
     Duration::from_millis(PR_REFRESH_PERIOD_MS)
+}
+
+/// The remote of the base ref the row's ahead/behind was measured against.
+fn row_base_remote(row: &DashboardRow) -> Option<String> {
+    let base_ref = row
+        .worktree
+        .branch_status
+        .as_ref()?
+        .upstream_branch
+        .as_deref()?;
+    remote_name_from_ref(base_ref).map(str::to_string)
+}
+
+/// `branch`'s PR once every repository it is looked up in has answered: the
+/// source repository's PR wins, then the default repository's answer. `None`
+/// while an answer is missing, so the cached entry is kept rather than cleared.
+fn fetched_branch_pr(
+    fetched: &HashMap<&(String, String), HashMap<String, Option<PullRequest>>>,
+    branch: &str,
+    source_repo: Option<&(String, String)>,
+    default_repo: &(String, String),
+) -> Option<Option<PullRequest>> {
+    if let Some(repo) = source_repo {
+        let pr = fetched.get(repo)?.get(branch).cloned().flatten();
+        if pr.is_some() {
+            return Some(pr);
+        }
+    }
+    fetched
+        .get(default_repo)
+        .map(|prs| prs.get(branch).cloned().flatten())
 }
 
 fn branch_name_from_ref(base_ref: &str) -> &str {
@@ -1810,10 +1905,7 @@ async fn run_command_once(
 ///
 /// 1. `pr_base_ref` — GitHub's own `baseRefName` for an existing PR, mapped
 ///    onto a reachable remote-tracking ref. Authoritative when a PR exists.
-/// 2. The branch's tracked upstream (`@{upstream}`), which `git worktree add`
-///    seeds from the source branch (e.g. `upstream/release-0.41`). Skipped
-///    once the branch has been pushed with `-u` and now tracks its own
-///    `origin/<branch>` counterpart — that is never a base.
+/// 2. The ref the branch was cut from (see [`branch_source_ref`]).
 /// 3. The conventional `BASE_REF_PRIORITY` list, as a last resort.
 ///
 /// This replaces the old "first reachable in `BASE_REF_PRIORITY`" behavior,
@@ -1829,10 +1921,13 @@ pub(crate) async fn resolve_base_ref_with_binary(
     cwd: &Path,
     pr_base_ref: Option<&str>,
 ) -> Option<String> {
+    let source = branch_source_ref(git_binary, cwd).await;
+
     // 1. Prefer GitHub's known base branch for the PR, mapped to whichever
     //    remote-tracking ref we actually have locally.
     if let Some(name) = pr_base_ref.map(str::trim).filter(|n| !n.is_empty()) {
-        for remote in ["upstream", "origin"] {
+        let source_remote = source.as_deref().and_then(remote_name_from_ref);
+        for remote in base_remotes(source_remote) {
             let candidate = format!("{remote}/{name}");
             if ref_is_reachable(git_binary, cwd, &candidate).await {
                 return Some(candidate);
@@ -1840,16 +1935,9 @@ pub(crate) async fn resolve_base_ref_with_binary(
         }
     }
 
-    // 2. Trust the branch's own tracked upstream, unless it is the branch's
-    //    own pushed ref (`origin/<self>`), which a PR is never based on.
-    if let Some(upstream) = tracked_upstream(git_binary, cwd).await {
-        let is_own_push_ref = remote_name_from_ref(&upstream) == Some("origin")
-            && current_branch_name(git_binary, cwd)
-                .await
-                .is_some_and(|branch| branch_name_from_ref(&upstream) == branch);
-        if !is_own_push_ref && ref_is_reachable(git_binary, cwd, &upstream).await {
-            return Some(upstream);
-        }
+    // 2. The ref the branch was cut from.
+    if source.is_some() {
+        return source;
     }
 
     // 3. Fall back to the conventional priority list.
@@ -1859,6 +1947,97 @@ pub(crate) async fn resolve_base_ref_with_binary(
         }
     }
     None
+}
+
+/// Remotes a base branch name is mapped onto: the conventional
+/// `upstream` → `origin` order, led by the remote the branch was cut from
+/// when that is a third one (e.g. a second canonical repository such as
+/// `kaefer`), so its `main` never resolves to an unrelated `upstream/main`.
+fn base_remotes(source_remote: Option<&str>) -> Vec<&str> {
+    let mut remotes = Vec::with_capacity(CONVENTIONAL_REMOTES.len() + 1);
+    remotes.extend(unconventional_remote(source_remote));
+    remotes.extend(CONVENTIONAL_REMOTES);
+    remotes
+}
+
+/// `remote` when it is a third remote, neither `upstream` nor `origin`.
+fn unconventional_remote(remote: Option<&str>) -> Option<&str> {
+    remote.filter(|remote| !CONVENTIONAL_REMOTES.contains(remote))
+}
+
+/// The remote-tracking ref the current branch was cut from: its tracked
+/// upstream (`@{upstream}`), which `git worktree add` seeds from the source
+/// branch (e.g. `upstream/release-0.41`). Once a push with `-u` replaced that
+/// with the branch's own pushed copy — on `origin` or any other remote, and
+/// never a base — the start point its reflog recorded at creation is used.
+async fn branch_source_ref(git_binary: &Path, cwd: &Path) -> Option<String> {
+    let branch = current_branch_name(git_binary, cwd).await?;
+    if let Some(upstream) = tracked_upstream(git_binary, cwd).await {
+        if !is_own_pushed_ref(&upstream, &branch)
+            && ref_is_reachable(git_binary, cwd, &upstream).await
+        {
+            return Some(upstream);
+        }
+    }
+    reflog_source_ref(git_binary, cwd, &branch).await
+}
+
+/// `true` when `remote_ref` (`<remote>/<branch>`) is `branch`'s own
+/// counterpart on some remote rather than a branch it was cut from.
+fn is_own_pushed_ref(remote_ref: &str, branch: &str) -> bool {
+    branch_name_from_ref(remote_ref) == branch
+}
+
+/// The remote-tracking ref `branch` was created from, read from the
+/// `branch: Created from <start-point>` entry that `git worktree add -b`,
+/// `git branch` and `git switch -c` write first. `None` when that entry has
+/// expired, or the start point was not a remote-tracking ref (a local
+/// branch, `HEAD`, a commit) or was the branch's own remote counterpart.
+async fn reflog_source_ref(git_binary: &Path, cwd: &Path, branch: &str) -> Option<String> {
+    let reflog = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(
+            git_binary,
+            &[
+                "reflog",
+                "show",
+                "--format=%gs",
+                &format!("refs/heads/{branch}"),
+            ],
+            Some(cwd),
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let start_point = reflog
+        .lines()
+        .last()?
+        .strip_prefix("branch: Created from ")?
+        .trim();
+    let start_point = start_point
+        .strip_prefix("refs/remotes/")
+        .unwrap_or(start_point);
+    // `--abbrev-ref` also resolves a symbolic `<remote>/HEAD` to its branch.
+    let source = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(
+            git_binary,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--abbrev-ref",
+                &format!("refs/remotes/{start_point}"),
+            ],
+            Some(cwd),
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let source = source.trim();
+    (!source.is_empty() && !is_own_pushed_ref(source, branch)).then(|| source.to_string())
 }
 
 /// `true` when `git rev-parse --verify` resolves `refname` in `cwd`. A

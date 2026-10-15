@@ -4,7 +4,7 @@ use std::process::Command;
 
 use tempfile::TempDir;
 use wisetree::config::schema::DashboardConfig;
-use wisetree::services::{resolve_base_ref, DashboardNoticeLevel, DashboardService};
+use wisetree::services::{resolve_base_ref, DashboardNoticeLevel, DashboardService, PrState};
 
 /// Tests that exercise the PR-fetching path need `show_pull_requests`
 /// enabled — otherwise the service short-circuits before calling gh.
@@ -149,6 +149,131 @@ async fn resolves_pr_repo_via_upstream_when_origin_is_a_fork() {
         !log.contains("example"),
         "graphql call should NOT target origin `example/repo` when upstream exists, got log {log:?}"
     );
+}
+
+/// Fake `gh` whose GraphQL reply carries one open PR (`b0`) only when the
+/// query targets a repository owned by `owner`; every other repository has
+/// no PRs.
+fn fake_gh_with_pr_owned_by(log_path: &Path, owner: &str, number: u64) -> String {
+    format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  case "$*" in
+    *'owner: "{owner}"'*) printf '%s' '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":{number},"state":"OPEN","url":"u","title":"t","isDraft":false}}]}}}}}}}}' ;;
+    *) printf '%s' '{{"data":{{"repository":{{}}}}}}' ;;
+  esac
+  exit 0
+fi
+printf '[]'
+"#,
+        log = log_path.display()
+    )
+}
+
+/// The reported bug: a worktree cut from a third remote (`kaefer/main`) and
+/// pushed with `-u` to a fork must still show its PR — which lives in the
+/// `kaefer` remote's repository, not `upstream`'s — and its ahead/behind/diff
+/// against `kaefer/main`.
+#[tokio::test]
+async fn snapshot_compares_and_finds_pr_on_the_third_remote_a_branch_was_cut_from() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-kaefer");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    for (remote, url) in [
+        ("upstream", "git@github.com:canonical/repo.git"),
+        ("kaefer", "git@github.com:kaefer/repo.git"),
+        ("kaefer-fork", "git@github.com:me/kaefer-repo.git"),
+    ] {
+        git(&repo, &["remote", "add", remote, url]);
+    }
+    git(&repo, &["update-ref", "refs/remotes/kaefer/main", "HEAD"]);
+    let upstream_only = Command::new("git")
+        .args([
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-m",
+            "upstream only",
+        ])
+        .current_dir(&repo)
+        .output()
+        .expect("commit-tree");
+    let upstream_only = String::from_utf8_lossy(&upstream_only.stdout)
+        .trim()
+        .to_string();
+    git(
+        &repo,
+        &["update-ref", "refs/remotes/upstream/main", &upstream_only],
+    );
+
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "kaefer-feature",
+            worktree.to_str().unwrap(),
+            "kaefer/main",
+        ],
+    );
+    fs::write(worktree.join("feature.txt"), "one\ntwo\n").unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "feature"]);
+    git(
+        &worktree,
+        &[
+            "update-ref",
+            "refs/remotes/kaefer-fork/kaefer-feature",
+            "HEAD",
+        ],
+    );
+    git(
+        &worktree,
+        &["branch", "-q", "-u", "kaefer-fork/kaefer-feature"],
+    );
+
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_with_pr_owned_by(&log_path, "kaefer", 402)).unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+
+    let rows = service.snapshot().await.expect("snapshot");
+
+    let row = rows
+        .iter()
+        .find(|row| row.worktree.branch == "kaefer-feature")
+        .expect("kaefer-feature row");
+    let status = row
+        .worktree
+        .branch_status
+        .as_ref()
+        .expect("branch status against the base");
+    assert_eq!(status.upstream_branch.as_deref(), Some("kaefer/main"));
+    assert_eq!((status.ahead, status.behind), (1, 0));
+    assert_eq!((status.insertions, status.deletions), (Some(2), Some(0)));
+    let pr = row
+        .pull_request
+        .as_ref()
+        .expect("PR found in the kaefer remote's repository");
+    assert_eq!(pr.number, 402);
+    assert_eq!(pr.state, PrState::Open);
 }
 
 #[tokio::test]
@@ -778,16 +903,6 @@ async fn resolve_base_ref_priority_skips_missing_upstream_to_origin_main() {
     assert_eq!(chosen.as_deref(), Some("origin/main"));
 }
 
-/// HEAD of the repo at `path`.
-fn rev_parse_head(path: &Path) -> String {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(path)
-        .output()
-        .expect("rev-parse");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// Build a repo whose current branch `local` tracks the remote-tracking ref
 /// `tracks` (`<remote>/<branch>`) — exactly the config `git worktree add -b
 /// <name> <remote>/<source>` seeds — so `@{upstream}` names the branch the
@@ -798,9 +913,20 @@ fn repo_with_tracking_branch(
     tracks: &str,
     remote_refs: &[&str],
 ) -> (TempDir, PathBuf) {
+    repo_with_branch_cut_from(local, "HEAD", tracks, remote_refs)
+}
+
+/// Like [`repo_with_tracking_branch`], but `local` is created from
+/// `start_point` (e.g. `kaefer/main`), so its reflog records the ref it was
+/// cut from even after `tracks` points at its own pushed copy.
+fn repo_with_branch_cut_from(
+    local: &str,
+    start_point: &str,
+    tracks: &str,
+    remote_refs: &[&str],
+) -> (TempDir, PathBuf) {
     let (dir, path) = repo_with_remote_refs(remote_refs);
     let (remote, source) = tracks.split_once('/').expect("tracks is <remote>/<branch>");
-    let sha = rev_parse_head(&path);
     git(&path, &["config", &format!("remote.{remote}.url"), "."]);
     git(
         &path,
@@ -810,7 +936,7 @@ fn repo_with_tracking_branch(
             &format!("+refs/heads/*:refs/remotes/{remote}/*"),
         ],
     );
-    git(&path, &["branch", local, &sha]);
+    git(&path, &["branch", local, start_point]);
     git(
         &path,
         &["config", &format!("branch.{local}.remote"), remote],
@@ -875,4 +1001,57 @@ async fn resolve_base_ref_hint_falls_back_to_origin() {
     let (_dir, repo) = repo_with_remote_refs(&["upstream/main", "origin/release-0.41"]);
     let chosen = resolve_base_ref(&repo, Some("release-0.41")).await;
     assert_eq!(chosen.as_deref(), Some("origin/release-0.41"));
+}
+
+/// A branch pushed with `-u` to a fork remote that is not `origin` tracks its
+/// own copy there too — resolution must not diff the branch against itself.
+#[tokio::test]
+async fn resolve_base_ref_skips_own_pushed_ref_on_any_remote() {
+    let (_dir, repo) =
+        repo_with_tracking_branch("feat", "fork/feat", &["upstream/main", "fork/feat"]);
+    let chosen = resolve_base_ref(&repo, None).await;
+    assert_eq!(chosen.as_deref(), Some("upstream/main"));
+}
+
+/// The reported bug: a branch cut from a third remote (`kaefer/main`) and then
+/// pushed with `-u` to a fork still compares against the ref it was cut from,
+/// recovered from its reflog, rather than `upstream/main`.
+#[tokio::test]
+async fn resolve_base_ref_recovers_source_from_reflog_after_push() {
+    let (_dir, repo) = repo_with_branch_cut_from(
+        "feat",
+        "kaefer/main",
+        "kaefer-fork/feat",
+        &["upstream/main", "kaefer/main", "kaefer-fork/feat"],
+    );
+    let chosen = resolve_base_ref(&repo, None).await;
+    assert_eq!(chosen.as_deref(), Some("kaefer/main"));
+}
+
+/// GitHub's base name (`main`) for a branch cut from a third remote maps onto
+/// that remote, so the PR commands never merge an unrelated `upstream/main`.
+#[tokio::test]
+async fn resolve_base_ref_hint_prefers_the_third_remote_the_branch_was_cut_from() {
+    let (_dir, repo) = repo_with_branch_cut_from(
+        "feat",
+        "kaefer/main",
+        "kaefer-fork/feat",
+        &["upstream/main", "kaefer/main", "kaefer-fork/feat"],
+    );
+    let chosen = resolve_base_ref(&repo, Some("main")).await;
+    assert_eq!(chosen.as_deref(), Some("kaefer/main"));
+}
+
+/// A branch cut from `origin/main` keeps the conventional `upstream` → `origin`
+/// order for the hint: in a fork workflow its PR targets `upstream`.
+#[tokio::test]
+async fn resolve_base_ref_hint_keeps_upstream_first_for_a_branch_cut_from_origin() {
+    let (_dir, repo) = repo_with_branch_cut_from(
+        "feat",
+        "origin/main",
+        "origin/feat",
+        &["upstream/main", "origin/main", "origin/feat"],
+    );
+    let chosen = resolve_base_ref(&repo, Some("main")).await;
+    assert_eq!(chosen.as_deref(), Some("upstream/main"));
 }

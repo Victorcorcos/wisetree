@@ -222,8 +222,8 @@ The *Worktree* column, which shows the directory name, is always visible. You ch
 
 Wisetree picks the **base ref** for ahead/behind and diff in this order:
 
-1. The PR's base branch on `upstream`, then on `origin`.
-2. The branch's tracked upstream, unless that upstream is just its own pushed copy (`origin/<same-branch>`).
+1. The PR's base branch on the remote the worktree was cut from when that is a third remote (such as `kaefer`), then on `upstream`, then on `origin`.
+2. The remote branch the worktree was cut from, on any remote (such as `kaefer/main`). That is the branch's tracked upstream or, once the upstream is just its own pushed copy (`origin/<same-branch>`, `my-fork/<same-branch>`, …), the start point its reflog recorded when the branch was created.
 3. The first reachable ref among `upstream/main`, `upstream/master`, `upstream/develop`, `origin/main`, `origin/master`, and `origin/develop`.
 
 #### Status labels
@@ -251,7 +251,7 @@ For **Opened** PRs, up to three indicators follow the label:
 | | | 📝 draft |
 | | | ❓ unknown |
 
-PR data is shown only when `dashboard.showPullRequests` is `true` and `gh` is installed. If `gh` is missing, the PR column is hidden and a warning is shown.
+PR data is shown only when `dashboard.showPullRequests` is `true` and `gh` is installed. If `gh` is missing, the PR column is hidden and a warning is shown. PRs are looked up in the `upstream` repository (else `origin`) and, for a worktree cut from a third remote such as `kaefer/main`, in that remote's repository too.
 
 #### Action menu
 
