@@ -641,6 +641,73 @@ async fn push_head_sends_a_branch_to_the_fork_remote_it_tracks() {
     );
 }
 
+/// A branch cut from `kaefer/main` and pushed with `git push kaefer-fork HEAD`
+/// (no `-u`) still tracks its base, so git has no push destination for it.
+/// The Merge flow's push-first step follows the copy it left on the fork,
+/// while a teammate's same-named branch on another remote, which HEAD does
+/// not contain, is ignored.
+#[tokio::test]
+async fn push_head_follows_a_branch_pushed_to_its_fork_without_upstream() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let kaefer = parent.path().join("kaefer.git");
+    let origin = parent.path().join("origin.git");
+    let fork = parent.path().join("fork.git");
+    let work = parent.path().join("work");
+    for bare in [&kaefer, &origin, &fork] {
+        git(
+            parent.path(),
+            &["init", "-q", "--bare", bare.to_str().unwrap()],
+        );
+    }
+    fs::create_dir_all(&work).unwrap();
+    init_repo_with_main(&work);
+    git(&work, &["config", "user.email", "test@example.com"]);
+    git(&work, &["config", "user.name", "Test"]);
+    fs::write(work.join("a.txt"), "1\n").unwrap();
+    git(&work, &["add", "a.txt"]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    for (remote, path) in [
+        ("kaefer", &kaefer),
+        ("origin", &origin),
+        ("kaefer-fork", &fork),
+    ] {
+        git(&work, &["remote", "add", remote, path.to_str().unwrap()]);
+    }
+    git(
+        &work,
+        &["remote", "add", "upstream", "https://example.invalid/u.git"],
+    );
+    git(&work, &["push", "-q", "kaefer", "main"]);
+    git(&work, &["fetch", "-q", "kaefer"]);
+    git(
+        &work,
+        &["switch", "-q", "-c", "feat", "--track", "kaefer/main"],
+    );
+    fs::write(work.join("b.txt"), "2\n").unwrap();
+    git(&work, &["add", "b.txt"]);
+    git(&work, &["commit", "-q", "-m", "feature"]);
+    git(&work, &["push", "-q", "kaefer-fork", "HEAD"]);
+    let unrelated = git_stdout(&work, &["commit-tree", "HEAD^{tree}", "-m", "teammate"]);
+    git(
+        &work,
+        &["update-ref", "refs/remotes/upstream/feat", &unrelated],
+    );
+    fs::write(work.join("c.txt"), "3\n").unwrap();
+    git(&work, &["add", "c.txt"]);
+    git(&work, &["commit", "-q", "-m", "more"]);
+    let head = git_stdout(&work, &["rev-parse", "HEAD"]);
+    let service = DashboardService::new(work.clone(), DashboardConfig::default())
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+
+    service
+        .push_head(work.to_str().unwrap())
+        .await
+        .expect("push HEAD");
+
+    assert_eq!(git_stdout(&fork, &["rev-parse", "refs/heads/feat"]), head);
+    assert_eq!(git_stdout(&origin, &["for-each-ref", "refs/heads"]), "");
+}
+
 /// When git's push destination for the branch is a differently named branch
 /// (here the base it tracks, under `push.default=upstream`), the push remote
 /// falls back to `origin` so HEAD never lands on the base.

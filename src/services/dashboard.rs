@@ -2033,10 +2033,11 @@ async fn branch_source_ref(git_binary: &Path, cwd: &Path) -> Option<String> {
 
 /// The remote every push that updates the worktree's PR goes to: the one
 /// `git push` sends the current branch to (`@{push}`), e.g. a `kaefer-fork`
-/// the branch was pushed to with `-u` — where its PR's head lives. Falls back
-/// to `origin` when git has no push destination for the branch, or when that
-/// destination is a differently named branch (such as the base it was cut
-/// from), which HEAD must never be pushed into.
+/// the branch was pushed to with `-u` — where its PR's head lives — or, when
+/// git has none, the remote the branch was pushed to without `-u` (see
+/// [`pushed_copy_remote`]). Falls back to `origin` when neither exists. A
+/// destination that is a differently named branch (such as the base it was
+/// cut from) never counts: HEAD must never be pushed into it.
 pub async fn resolve_push_remote(cwd: &Path) -> String {
     resolve_push_remote_with_binary(Path::new("git"), cwd).await
 }
@@ -2049,6 +2050,14 @@ pub(crate) async fn resolve_push_remote_with_binary(git_binary: &Path, cwd: &Pat
 
 async fn own_push_remote(git_binary: &Path, cwd: &Path) -> Option<String> {
     let branch = current_branch_name(git_binary, cwd).await?;
+    match git_push_destination(git_binary, cwd, &branch).await {
+        Some(remote) => Some(remote),
+        None => pushed_copy_remote(git_binary, cwd, &branch).await,
+    }
+}
+
+/// The remote of `@{push}` when it is `branch`'s own counterpart.
+async fn git_push_destination(git_binary: &Path, cwd: &Path, branch: &str) -> Option<String> {
     let push_ref = time::timeout(
         COMMAND_TIMEOUT,
         run_command(
@@ -2061,10 +2070,46 @@ async fn own_push_remote(git_binary: &Path, cwd: &Path) -> Option<String> {
     .ok()?
     .ok()?;
     let push_ref = push_ref.trim();
-    if !is_own_pushed_ref(push_ref, &branch) {
+    if !is_own_pushed_ref(push_ref, branch) {
         return None;
     }
     remote_name_from_ref(push_ref).map(str::to_string)
+}
+
+/// The one remote holding a copy of `branch` that HEAD already contains —
+/// what `git push <remote> HEAD` without `-u` leaves behind while the branch
+/// keeps tracking the base it was cut from. A same-named branch HEAD does not
+/// contain belongs to someone else, and two candidates are ambiguous: both
+/// yield `None`.
+async fn pushed_copy_remote(git_binary: &Path, cwd: &Path, branch: &str) -> Option<String> {
+    let remotes = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(git_binary, &["remote"], Some(cwd)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut holders = Vec::new();
+    for remote in remotes.lines().map(str::trim).filter(|r| !r.is_empty()) {
+        let copy = format!("refs/remotes/{remote}/{branch}");
+        let contained = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                git_binary,
+                &["merge-base", "--is-ancestor", &copy, "HEAD"],
+                Some(cwd),
+            ),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok());
+        if contained {
+            holders.push(remote.to_string());
+        }
+    }
+    match holders.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// `true` when `remote_ref` (`<remote>/<branch>`) is `branch`'s own
