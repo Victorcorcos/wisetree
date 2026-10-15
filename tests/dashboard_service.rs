@@ -1135,6 +1135,134 @@ async fn close_targets_the_pr_in_its_own_repository() {
     assert!(log.contains("pr close 402 --repo kaefer/repo"), "{log}");
 }
 
+/// A worktree whose `feature` branch is pushed with `-u` to the `me/repo`
+/// fork, plus the head commit of that branch and of an unrelated branch a
+/// teammate named `feature` in their own fork.
+struct SameNamedBranchFixture {
+    parent: TempDir,
+    repo: PathBuf,
+    our_head: String,
+    teammate_head: String,
+}
+
+fn same_named_branch_fixture() -> SameNamedBranchFixture {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-feature");
+    let fork = parent.path().join("fork.git");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    git(
+        parent.path(),
+        &["init", "-q", "--bare", fork.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:canonical/repo.git",
+        ],
+    );
+    git(
+        &repo,
+        &["remote", "add", "fork", "git@github.com:me/repo.git"],
+    );
+    git(
+        &repo,
+        &["config", "remote.fork.pushurl", fork.to_str().unwrap()],
+    );
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    fs::write(worktree.join("feature.txt"), "ours\n").unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "our feature"]);
+    git(&worktree, &["push", "-q", "-u", "fork", "feature"]);
+    let our_head = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    let teammate_head = git_stdout(
+        &repo,
+        &["commit-tree", "HEAD^{tree}", "-m", "their feature"],
+    );
+    SameNamedBranchFixture {
+        parent,
+        repo,
+        our_head,
+        teammate_head,
+    }
+}
+
+/// Fake `gh` answering every branch of the PR lookup with `nodes`.
+fn fake_gh_with_pr_candidates(log_path: &Path, nodes: &str) -> String {
+    let branch = format!(r#"{{"nodes":[{nodes}]}}"#);
+    format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{log}\"\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"graphql\" ]; then\n  printf '%s' '{{\"data\":{{\"repository\":{{\"b0\":{branch},\"b1\":{branch}}}}}}}'\n  exit 0\nfi\nprintf '[]'\n",
+        log = log_path.display()
+    )
+}
+
+fn pr_node(number: u64, head_repository: &str, head: &str) -> String {
+    format!(
+        r#"{{"number":{number},"state":"OPEN","url":"https://github.com/canonical/repo/pull/{number}","title":"PR {number}","isDraft":false,"headRefOid":"{head}","headRepository":{{"nameWithOwner":"{head_repository}"}}}}"#
+    )
+}
+
+async fn feature_row_pr(fixture: &SameNamedBranchFixture, nodes: &str) -> Option<u64> {
+    let log_path = fixture.parent.path().join("gh.log");
+    let gh_path = fixture.parent.path().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_with_pr_candidates(&log_path, nodes)).unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(fixture.repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(fixture.parent.path().join("dashboard_pr_cache.json")));
+    let rows = service.snapshot().await.expect("snapshot");
+    rows.into_iter()
+        .find(|row| row.worktree.branch == "feature")
+        .expect("feature row")
+        .pull_request
+        .map(|pr| pr.number)
+}
+
+/// GitHub matches PRs to a branch by name, so a teammate's newer PR from a
+/// same-named branch in their fork comes back first. The row keeps its own
+/// PR — the one whose head lives where the branch is pushed — so no command
+/// ever acts on the teammate's.
+#[tokio::test]
+async fn row_keeps_its_own_pr_over_a_newer_same_named_pr_from_another_fork() {
+    let fixture = same_named_branch_fixture();
+    let nodes = format!(
+        "{},{}",
+        pr_node(20, "teammate/repo", &fixture.teammate_head),
+        pr_node(10, "me/repo", &fixture.our_head)
+    );
+
+    assert_eq!(feature_row_pr(&fixture, &nodes).await, Some(10));
+}
+
+/// When the only PR for the branch name is another fork's, the row has none.
+#[tokio::test]
+async fn row_has_no_pr_when_only_another_fork_has_a_same_named_one() {
+    let fixture = same_named_branch_fixture();
+    let nodes = pr_node(20, "teammate/repo", &fixture.teammate_head);
+
+    assert_eq!(feature_row_pr(&fixture, &nodes).await, None);
+}
+
 #[tokio::test]
 async fn fetch_pr_details_returns_title_and_body() {
     let fixture = repo_with_worktree();

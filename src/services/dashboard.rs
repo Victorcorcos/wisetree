@@ -137,6 +137,14 @@ pub struct PullRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub head_ref_oid: Option<String>,
+    /// `owner/repo` the PR's head branch lives in — where pushes that update
+    /// it must go. `None` when GitHub cannot name it (a deleted fork).
+    #[serde(
+        rename = "headRepository",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub head_repository: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     #[serde(
@@ -968,7 +976,7 @@ impl DashboardService {
             return false;
         }
 
-        let to_fetch: Vec<(String, String, Option<String>)> = {
+        let to_fetch: Vec<PrFetchTarget> = {
             let state = self.pr_state.lock().expect("pr_state poisoned");
             rows.iter()
                 .filter_map(|row| {
@@ -981,7 +989,12 @@ impl DashboardService {
                         Some(entry) => entry.sha != sha || on_cycle,
                         None => true,
                     };
-                    needs.then(|| (branch, sha, row_base_remote(row)))
+                    needs.then(|| PrFetchTarget {
+                        branch,
+                        sha,
+                        base_remote: row_base_remote(row),
+                        worktree_path: PathBuf::from(&row.worktree.path),
+                    })
                 })
                 .collect()
         };
@@ -999,14 +1012,14 @@ impl DashboardService {
             default_repo.clone(),
             to_fetch
                 .iter()
-                .map(|(branch, ..)| branch.as_str())
+                .map(|target| target.branch.as_str())
                 .collect::<Vec<_>>(),
         )];
-        for ((branch, ..), source_repo) in to_fetch.iter().zip(&source_repos) {
+        for (target, source_repo) in to_fetch.iter().zip(&source_repos) {
             let Some(repo) = source_repo else { continue };
             match queries.iter_mut().find(|(queried, _)| queried == repo) {
-                Some((_, branches)) => branches.push(branch),
-                None => queries.push((repo.clone(), vec![branch])),
+                Some((_, branches)) => branches.push(&target.branch),
+                None => queries.push((repo.clone(), vec![&target.branch])),
             }
         }
 
@@ -1027,23 +1040,27 @@ impl DashboardService {
             }
         }
 
+        let mut selected = Vec::new();
+        for (target, source_repo) in to_fetch.iter().zip(&source_repos) {
+            if let Some(pr) = self
+                .select_branch_pr(&fetched, target, source_repo.as_ref(), &default_repo)
+                .await
+            {
+                selected.push((target, pr));
+            }
+        }
+
         let refreshed = {
             let mut state = self.pr_state.lock().expect("pr_state poisoned");
-            let mut refreshed = false;
-            for ((branch, sha, _), source_repo) in to_fetch.iter().zip(&source_repos) {
-                let Some(pr) =
-                    fetched_branch_pr(&fetched, branch, source_repo.as_ref(), &default_repo)
-                else {
-                    continue;
-                };
+            let refreshed = !selected.is_empty();
+            for (target, pr) in selected {
                 state.entries.insert(
-                    branch.clone(),
+                    target.branch.clone(),
                     PrCacheEntry {
-                        sha: sha.clone(),
+                        sha: target.sha.clone(),
                         pull_request: pr,
                     },
                 );
-                refreshed = true;
             }
             state.dirty |= refreshed;
             if failure.is_none() {
@@ -1070,18 +1087,92 @@ impl DashboardService {
     /// or `None` when the default repository already covers it.
     async fn source_pr_repositories(
         &self,
-        to_fetch: &[(String, String, Option<String>)],
+        to_fetch: &[PrFetchTarget],
         default_repo: &(String, String),
     ) -> Vec<Option<(String, String)>> {
         let mut repos = Vec::with_capacity(to_fetch.len());
-        for (_, _, base_remote) in to_fetch {
-            let repo = match unconventional_remote(base_remote.as_deref()) {
+        for target in to_fetch {
+            let repo = match unconventional_remote(target.base_remote.as_deref()) {
                 Some(remote) => self.remote_github_slug(remote).await,
                 None => None,
             };
             repos.push(repo.filter(|repo| repo != default_repo));
         }
         repos
+    }
+
+    /// The target branch's PR once every repository it is looked up in has
+    /// answered: the newest candidate that is this branch's own (see
+    /// [`Self::is_own_pull_request`]), from the source repository first, then
+    /// the default one. `None` while an answer is missing, so the cached
+    /// entry is kept rather than cleared.
+    async fn select_branch_pr(
+        &self,
+        fetched: &HashMap<&(String, String), HashMap<String, Vec<PullRequest>>>,
+        target: &PrFetchTarget,
+        source_repo: Option<&(String, String)>,
+        default_repo: &(String, String),
+    ) -> Option<Option<PullRequest>> {
+        let mut own_repository = None;
+        for repo in source_repo.into_iter().chain([default_repo]) {
+            let candidates = fetched.get(repo)?.get(&target.branch);
+            for candidate in candidates.into_iter().flatten() {
+                if self
+                    .is_own_pull_request(&target.worktree_path, candidate, &mut own_repository)
+                    .await
+                {
+                    return Some(Some(candidate.clone()));
+                }
+            }
+        }
+        Some(None)
+    }
+
+    /// GitHub matches PRs to a branch by name alone, so another fork's PR
+    /// from a same-named branch is a candidate too. A candidate is this
+    /// branch's own when its head lives in the repository this branch is
+    /// pushed to, or when HEAD already contains its head commit. One whose
+    /// head repository GitHub cannot name (a deleted fork) is kept.
+    /// `own_repository` caches that repository across a branch's candidates.
+    async fn is_own_pull_request(
+        &self,
+        cwd: &Path,
+        candidate: &PullRequest,
+        own_repository: &mut Option<Option<String>>,
+    ) -> bool {
+        let Some(head_repository) = &candidate.head_repository else {
+            return true;
+        };
+        if own_repository.is_none() {
+            let slug = match own_push_remote(&self.git_binary, cwd).await {
+                Some(remote) => self
+                    .remote_github_slug(&remote)
+                    .await
+                    .map(|(owner, repo)| format!("{owner}/{repo}")),
+                None => None,
+            };
+            *own_repository = Some(slug);
+        }
+        if own_repository
+            .as_ref()
+            .and_then(Option::as_deref)
+            .is_some_and(|own| own.eq_ignore_ascii_case(head_repository))
+        {
+            return true;
+        }
+        let Some(head) = candidate.head_ref_oid.as_deref() else {
+            return false;
+        };
+        time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(
+                &self.git_binary,
+                &["merge-base", "--is-ancestor", head, "HEAD"],
+                Some(cwd),
+            ),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
     }
 
     fn apply_cached_prs(&self, rows: &mut [DashboardRow]) {
@@ -1187,7 +1278,7 @@ impl DashboardService {
         owner: &str,
         repo: &str,
         branches: &[&str],
-    ) -> std::result::Result<HashMap<String, Option<PullRequest>>, String> {
+    ) -> std::result::Result<HashMap<String, Vec<PullRequest>>, String> {
         let query = build_graphql_query(owner, repo, branches);
         let arg = format!("query={query}");
         let output = time::timeout(
@@ -1320,26 +1411,6 @@ fn distinct_base_refs(rows: &[DashboardRow]) -> Vec<String> {
     base_refs.into_iter().map(str::to_string).collect()
 }
 
-/// `branch`'s PR once every repository it is looked up in has answered: the
-/// source repository's PR wins, then the default repository's answer. `None`
-/// while an answer is missing, so the cached entry is kept rather than cleared.
-fn fetched_branch_pr(
-    fetched: &HashMap<&(String, String), HashMap<String, Option<PullRequest>>>,
-    branch: &str,
-    source_repo: Option<&(String, String)>,
-    default_repo: &(String, String),
-) -> Option<Option<PullRequest>> {
-    if let Some(repo) = source_repo {
-        let pr = fetched.get(repo)?.get(branch).cloned().flatten();
-        if pr.is_some() {
-            return Some(pr);
-        }
-    }
-    fetched
-        .get(default_repo)
-        .map(|prs| prs.get(branch).cloned().flatten())
-}
-
 fn branch_name_from_ref(base_ref: &str) -> &str {
     base_ref
         .split_once('/')
@@ -1387,6 +1458,20 @@ fn parse_github_slug(remote: &str) -> Option<(String, String)> {
     Some((owner.to_string(), repo.to_string()))
 }
 
+/// PRs fetched per branch name, newest first: GitHub matches PRs to a branch
+/// by name alone, so a newer PR from another fork's same-named branch must not
+/// hide this branch's own.
+const PR_CANDIDATES_PER_BRANCH: u8 = 5;
+
+/// A branch whose PR the dashboard refreshes.
+struct PrFetchTarget {
+    branch: String,
+    sha: String,
+    /// Remote of the base ref the row was measured against.
+    base_remote: Option<String>,
+    worktree_path: PathBuf,
+}
+
 fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     let mut q = String::new();
     q.push_str("query { repository(owner: \"");
@@ -1396,7 +1481,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft baseRefName baseRepository {{ nameWithOwner }} headRefOid mergeStateStatus reviewDecision labels(first: 20) {{ nodes {{ name }} }} reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: {PR_CANDIDATES_PER_BRANCH}, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft baseRefName baseRepository {{ nameWithOwner }} headRefOid headRepository {{ nameWithOwner }} mergeStateStatus reviewDecision labels(first: 20) {{ nodes {{ name }} }} reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -1458,7 +1543,7 @@ fn parse_pr_view_json(body: &str) -> Result<PullRequestDetails> {
 fn parse_graphql_response(
     body: &str,
     branches: &[&str],
-) -> std::result::Result<HashMap<String, Option<PullRequest>>, String> {
+) -> std::result::Result<HashMap<String, Vec<PullRequest>>, String> {
     let envelope: GhEnvelope =
         serde_json::from_str(body).map_err(|err| format!("invalid gh response: {err}"))?;
 
@@ -1478,14 +1563,20 @@ fn parse_graphql_response(
         .get("repository")
         .ok_or_else(|| "missing repository in response".to_string())?;
 
-    let mut out: HashMap<String, Option<PullRequest>> = HashMap::new();
+    let mut out: HashMap<String, Vec<PullRequest>> = HashMap::new();
     for (i, branch) in branches.iter().enumerate() {
         let key = format!("b{i}");
-        let pr = repo
+        let candidates = repo
             .get(&key)
             .and_then(|v| serde_json::from_value::<GhConnection>(v.clone()).ok())
-            .and_then(|conn| conn.nodes.into_iter().next())
+            .map(|conn| conn.nodes)
+            .unwrap_or_default()
+            .into_iter()
             .map(|node| {
+                let head_repository = node
+                    .head_repository
+                    .as_ref()
+                    .and_then(|repo| repo.name_with_owner.clone());
                 // GitHub keeps `isDraft = true` on a PR that was closed while
                 // still a draft, so the terminal states must win over the draft
                 // flag — otherwise a closed draft keeps reading as "Drafted".
@@ -1560,14 +1651,16 @@ fn parse_graphql_response(
                     base_ref_name: node.base_ref_name,
                     base_repository: node.base_repository.and_then(|repo| repo.name_with_owner),
                     head_ref_oid: node.head_ref_oid,
+                    head_repository,
                     labels,
                     checks_status,
                     review_status,
                     merge_status,
                     reviewers,
                 }
-            });
-        out.insert((*branch).to_string(), pr);
+            })
+            .collect();
+        out.insert((*branch).to_string(), candidates);
     }
     Ok(out)
 }
@@ -1685,6 +1778,8 @@ struct GhNode {
     base_repository: Option<GhBaseRepository>,
     #[serde(rename = "headRefOid", default)]
     head_ref_oid: Option<String>,
+    #[serde(rename = "headRepository", default)]
+    head_repository: Option<GhBaseRepository>,
     #[serde(rename = "mergeStateStatus", default)]
     merge_state_status: Option<String>,
     #[serde(rename = "reviewDecision", default)]

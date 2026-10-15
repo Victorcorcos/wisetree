@@ -251,7 +251,7 @@ For **Opened** PRs, up to three indicators follow the label:
 | | | 📝 draft |
 | | | ❓ unknown |
 
-PR data is shown only when `dashboard.showPullRequests` is `true` and `gh` is installed. If `gh` is missing, the PR column is hidden and a warning is shown. PRs are looked up in the `upstream` repository (else `origin`) and, for a worktree cut from a third remote such as `kaefer/main`, in that remote's repository too.
+PR data is shown only when `dashboard.showPullRequests` is `true` and `gh` is installed. If `gh` is missing, the PR column is hidden and a warning is shown. PRs are looked up in the `upstream` repository (else `origin`) and, for a worktree cut from a third remote such as `kaefer/main`, in that remote's repository too. GitHub matches PRs to a branch by name alone, so Wisetree keeps a PR only when its head lives in the repository the branch is pushed to, or when the branch already contains its head commit: another fork's PR from a same-named branch is never shown, and never merged or closed, as this worktree's PR.
 
 #### Action menu
 
