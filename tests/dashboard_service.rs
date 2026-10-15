@@ -1353,6 +1353,138 @@ async fn row_is_measured_against_its_prs_base_once_the_pr_is_known() {
     );
 }
 
+/// A `feature` worktree that tracks its copy on `origin` (`me/repo`) while its
+/// PR #7 was opened from the same commit on `kaefer-fork` (`me/kaefer-repo`) —
+/// e.g. after a push to the wrong fork. `service` already knows the PR.
+struct PrHeadOnForkFixture {
+    _parent: TempDir,
+    worktree: PathBuf,
+    origin: PathBuf,
+    fork: PathBuf,
+    pushed: String,
+    service: DashboardService,
+}
+
+async fn pr_head_on_fork_fixture() -> PrHeadOnForkFixture {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-feature");
+    let origin = parent.path().join("origin.git");
+    let fork = parent.path().join("fork.git");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    for bare in [&origin, &fork] {
+        git(
+            parent.path(),
+            &["init", "-q", "--bare", bare.to_str().unwrap()],
+        );
+    }
+    for (remote, url, push_url) in [
+        ("upstream", "git@github.com:canonical/repo.git", None),
+        ("origin", "git@github.com:me/repo.git", Some(&origin)),
+        (
+            "kaefer-fork",
+            "git@github.com:me/kaefer-repo.git",
+            Some(&fork),
+        ),
+    ] {
+        git(&repo, &["remote", "add", remote, url]);
+        if let Some(push_url) = push_url {
+            let key = format!("remote.{remote}.pushurl");
+            git(&repo, &["config", &key, push_url.to_str().unwrap()]);
+        }
+    }
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    fs::write(worktree.join("feature.txt"), "one\n").unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "feature"]);
+    git(&worktree, &["push", "-q", "-u", "origin", "feature"]);
+    git(&worktree, &["push", "-q", "kaefer-fork", "feature"]);
+    let pushed = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(
+        &gh_path,
+        fake_gh_with_pr_candidates(&log_path, &pr_node(7, "me/kaefer-repo", &pushed)),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+    service.snapshot().await.expect("snapshot");
+    PrHeadOnForkFixture {
+        _parent: parent,
+        worktree,
+        origin,
+        fork,
+        pushed,
+        service,
+    }
+}
+
+/// Such a branch has its PR updated where GitHub says the head lives — not on
+/// the `origin` copy the PR never sees.
+#[tokio::test]
+async fn pushes_update_the_pr_where_github_says_its_head_lives() {
+    let fixture = pr_head_on_fork_fixture().await;
+    fs::write(fixture.worktree.join("feature.txt"), "one\ntwo\n").unwrap();
+    git(&fixture.worktree, &["commit", "-q", "-am", "more"]);
+    let head = git_stdout(&fixture.worktree, &["rev-parse", "HEAD"]);
+
+    fixture
+        .service
+        .push_head(fixture.worktree.to_str().unwrap())
+        .await
+        .expect("push HEAD");
+
+    assert_eq!(
+        git_stdout(&fixture.fork, &["rev-parse", "refs/heads/feature"]),
+        head
+    );
+    assert_eq!(
+        git_stdout(&fixture.origin, &["rev-parse", "refs/heads/feature"]),
+        fixture.pushed
+    );
+}
+
+/// A commit pushed only to the `origin` copy the branch tracks is still
+/// missing from the PR, so Merge offers to push it before the squash-merge
+/// rather than silently dropping it.
+#[tokio::test]
+async fn merge_counts_commits_missing_from_the_pr_head_not_the_tracked_copy() {
+    let fixture = pr_head_on_fork_fixture().await;
+    fs::write(fixture.worktree.join("feature.txt"), "one\ntwo\n").unwrap();
+    git(
+        &fixture.worktree,
+        &["commit", "-q", "-am", "pushed to origin only"],
+    );
+    git(&fixture.worktree, &["push", "-q", "origin", "feature"]);
+
+    let unpushed = fixture
+        .service
+        .unpushed_commit_count(fixture.worktree.to_str().unwrap())
+        .await;
+
+    assert_eq!(unpushed, 1);
+}
+
 #[tokio::test]
 async fn fetch_pr_details_returns_title_and_body() {
     let fixture = repo_with_worktree();

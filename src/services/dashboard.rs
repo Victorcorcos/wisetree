@@ -575,24 +575,43 @@ impl DashboardService {
             .await
     }
 
-    /// Number of commits on the worktree's local `HEAD` that have not yet
-    /// been pushed to its tracking remote (`@{upstream}`). Powers the Merge
+    /// Number of commits on the worktree's local `HEAD` that its PR does not
+    /// have yet (see [`Self::commits_missing_from_pr`]). Powers the Merge
     /// confirm guard: a squash-merge only ever includes what GitHub already
     /// has, so unpushed local commits are silently dropped unless the user
-    /// pushes them first. Returns 0 when the tracking ref is unconfigured or
-    /// the count can't be parsed — a safe fallback that leaves the existing
-    /// merge-straight-away flow untouched.
+    /// pushes them first. Returns 0 when nothing to compare against is
+    /// configured or the count can't be parsed — a safe fallback that leaves
+    /// the existing merge-straight-away flow untouched.
     pub async fn unpushed_commit_count(&self, worktree_path: &str) -> u64 {
-        local_ahead_of_tracking(&self.git_binary, &PathBuf::from(worktree_path)).await
+        self.commits_missing_from_pr(&PathBuf::from(worktree_path))
+            .await
     }
 
-    /// Push the worktree's `HEAD` to its push remote
-    /// (`git push <remote> HEAD`, see [`resolve_push_remote`]). Used by the
+    /// Commits on `HEAD` missing from the copy on the PR head's remote
+    /// (`<remote>/<branch>`, see [`Self::pr_head_remote`]) — where Merge's
+    /// push-first step goes — else from the branch's tracking ref
+    /// (`@{upstream}`). A commit pushed only to another copy (e.g. the
+    /// `origin` one the branch tracks) is not on the PR yet.
+    async fn commits_missing_from_pr(&self, cwd: &Path) -> u64 {
+        if let (Some(remote), Some(branch)) = (
+            self.pr_head_remote(cwd).await,
+            current_branch_name(&self.git_binary, cwd).await,
+        ) {
+            let copy = format!("refs/remotes/{remote}/{branch}");
+            if ref_is_reachable(&self.git_binary, cwd, &copy).await {
+                return commits_in_range(&self.git_binary, cwd, &format!("{copy}..HEAD")).await;
+            }
+        }
+        local_ahead_of_tracking(&self.git_binary, cwd).await
+    }
+
+    /// Push the worktree's `HEAD` to its PR's push remote
+    /// (`git push <remote> HEAD`, see [`Self::pr_push_remote`]). Used by the
     /// Merge flow to flush local commits into the PR before it is
     /// squash-merged, so nothing is lost.
     pub async fn push_head(&self, worktree_path: &str) -> Result<()> {
         let cwd = PathBuf::from(worktree_path);
-        let remote = resolve_push_remote_with_binary(&self.git_binary, &cwd).await;
+        let remote = self.pr_push_remote(&cwd).await;
         with_timeout(
             "git push",
             PUSH_TIMEOUT,
@@ -601,6 +620,59 @@ impl DashboardService {
         .await?
         .map_err(WisetreeError::other)?;
         Ok(())
+    }
+
+    /// The remote every push that updates the worktree's existing PR goes
+    /// to: the one pointing at the repository GitHub reports the PR's head
+    /// in ([`Self::pr_head_remote`]), else [`resolve_push_remote`]. The
+    /// branch's own tracking can name a copy elsewhere — e.g. one pushed to
+    /// `origin` before the PR was opened from `kaefer-fork` — which the PR
+    /// never sees.
+    async fn pr_push_remote(&self, cwd: &Path) -> String {
+        match self.pr_head_remote(cwd).await {
+            Some(remote) => remote,
+            None => resolve_push_remote_with_binary(&self.git_binary, cwd).await,
+        }
+    }
+
+    /// The remote pointing at the repository the checked-out branch's PR
+    /// head lives in, read from the dashboard's PR cache. `None` when the
+    /// branch has no known PR, GitHub could not name the head repository,
+    /// or no remote points at it.
+    async fn pr_head_remote(&self, cwd: &Path) -> Option<String> {
+        let branch = current_branch_name(&self.git_binary, cwd).await?;
+        self.ensure_cache_loaded();
+        let head_repository = {
+            let state = self.pr_state.lock().expect("pr_state poisoned");
+            state
+                .entries
+                .get(&branch)?
+                .pull_request
+                .as_ref()?
+                .head_repository
+                .clone()?
+        };
+        self.remote_for_repository(&head_repository).await
+    }
+
+    /// The first remote whose GitHub URL points at `repository` (`owner/repo`).
+    async fn remote_for_repository(&self, repository: &str) -> Option<String> {
+        let remotes = time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(&self.git_binary, &["remote"], Some(&self.git_root)),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        for remote in remotes.lines().map(str::trim).filter(|r| !r.is_empty()) {
+            let Some((owner, repo)) = self.remote_github_slug(remote).await else {
+                continue;
+            };
+            if format!("{owner}/{repo}").eq_ignore_ascii_case(repository) {
+                return Some(remote.to_string());
+            }
+        }
+        None
     }
 
     async fn merge_pull_request_with_options(
@@ -2432,15 +2504,16 @@ async fn current_branch_name(git_binary: &Path, cwd: &Path) -> Option<String> {
 /// configured or the count cannot be parsed — a safe fallback that
 /// avoids a spurious push when the tracking state is unknown.
 async fn local_ahead_of_tracking(git_binary: &Path, cwd: &Path) -> u64 {
-    run_command(
-        git_binary,
-        &["rev-list", "--count", "@{upstream}..HEAD"],
-        Some(cwd),
-    )
-    .await
-    .ok()
-    .and_then(|out| out.trim().parse::<u64>().ok())
-    .unwrap_or(0)
+    commits_in_range(git_binary, cwd, "@{upstream}..HEAD").await
+}
+
+/// `git rev-list --count <range>`, or 0 when it cannot be counted.
+async fn commits_in_range(git_binary: &Path, cwd: &Path, range: &str) -> u64 {
+    run_command(git_binary, &["rev-list", "--count", range], Some(cwd))
+        .await
+        .ok()
+        .and_then(|out| out.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 pub fn default_dashboard_warning(config: &DashboardConfig, gh_available: bool) -> Option<String> {

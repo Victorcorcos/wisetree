@@ -302,8 +302,8 @@ Runs `gh pr close <number> --repo <owner/repo>` after a confirmation dialog. The
 
 1. Wisetree loads the PR title and description and shows a summary: the worktree, branch, CI status, ahead/behind counts, last commit, and a preview of the **squash commit message**.
 2. The confirmation defaults to **No**.
-3. If the worktree has **local commits that are not pushed**, Wisetree warns you, because a squash merge includes only what GitHub already has. It then asks:
-   - **Push & merge** (default): runs `git push <remote> HEAD`, then merges. The remote is the one `git push` itself would send the branch to (such as a fork it was pushed to with `-u`), else `origin`.
+3. If the worktree has **local commits that are not on the PR yet** (missing from the copy the PR's head lives on, which GitHub reports), Wisetree warns you, because a squash merge includes only what GitHub already has. It then asks:
+   - **Push & merge** (default): runs `git push <remote> HEAD`, then merges. The remote is the one that points at the repository the PR's head lives in; without one, the remote `git push` itself would send the branch to (such as a fork it was pushed to with `-u`), else `origin`.
    - **Merge only**: merges what is already on GitHub.
 4. Wisetree runs `gh pr merge <number> --squash --subject "<PR title> (#<number>)" --body "<PR description>" --repo <owner/repo>`. The resulting commit message matches GitHub's own squash convention. The repository is read from the PR's URL, so a PR opened on another remote's repository (such as `kaefer`) is never confused with a same-numbered PR in `gh`'s default repository.
 
