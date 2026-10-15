@@ -3,10 +3,11 @@ pub mod dashboard;
 pub mod presets;
 pub mod shell_integration;
 pub use dashboard::{
-    default_dashboard_warning, resolve_base_ref, resolve_dashboard_columns, resolve_push_remote,
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow,
-    DashboardService, DashboardUpdate, DashboardWatch, MergeStatus, PrState, PullRequest,
-    PullRequestDetails, ReviewStatus, ReviewerSummary, BASE_REF_PRIORITY, PR_REFRESH_PERIOD_MS,
+    default_dashboard_warning, pr_repository, resolve_base_ref, resolve_dashboard_columns,
+    resolve_push_remote, CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel,
+    DashboardRow, DashboardService, DashboardUpdate, DashboardWatch, MergeStatus, PrState,
+    PullRequest, PullRequestDetails, ReviewStatus, ReviewerSummary, BASE_REF_PRIORITY,
+    PR_REFRESH_PERIOD_MS,
 };
 pub use shell_integration::{
     detect_shell, detect_shell_integration, generate_setup_block, get_config_path,

@@ -510,9 +510,14 @@ impl DashboardService {
 
     /// Fetch the latest title + body for a single pull request via
     /// `gh pr view`. Bypasses the dashboard cache so the merge confirmation
-    /// screen always shows the description GitHub currently has.
-    pub async fn fetch_pr_details(&self, number: u64) -> Result<PullRequestDetails> {
-        self.fetch_pr_details_with_repo(number, None).await
+    /// screen always shows the description GitHub currently has. `repo` is
+    /// the PR's repository (see [`pr_repository`]).
+    pub async fn fetch_pr_details(
+        &self,
+        number: u64,
+        repo: Option<&str>,
+    ) -> Result<PullRequestDetails> {
+        self.fetch_pr_details_with_repo(number, repo).await
     }
 
     async fn fetch_pr_details_with_repo(
@@ -551,8 +556,14 @@ impl DashboardService {
     /// ` (#N)` reference appended to the subject to match GitHub's
     /// default squash-merge convention (the `#N` is auto-linked to the
     /// PR by GitHub's web UI).
-    pub async fn merge_pull_request(&self, number: u64, subject: &str, body: &str) -> Result<()> {
-        self.merge_pull_request_with_options(number, subject, body, None, None)
+    pub async fn merge_pull_request(
+        &self,
+        number: u64,
+        subject: &str,
+        body: &str,
+        repo: Option<&str>,
+    ) -> Result<()> {
+        self.merge_pull_request_with_options(number, subject, body, repo, None)
             .await
     }
 
@@ -624,18 +635,19 @@ impl DashboardService {
         Ok(())
     }
 
-    /// Close a pull request via `gh pr close <number>`.
-    pub async fn close_pull_request(&self, number: u64) -> Result<()> {
+    /// Close a pull request via `gh pr close <number>`, in its own
+    /// repository `repo` (see [`pr_repository`]).
+    pub async fn close_pull_request(&self, number: u64, repo: Option<&str>) -> Result<()> {
         self.require_gh()?;
         let number_arg = number.to_string();
+        let mut args = vec!["pr", "close", &number_arg];
+        if let Some(repo) = repo {
+            args.extend(["--repo", repo]);
+        }
         with_timeout(
             "gh pr close",
             PR_MERGE_TIMEOUT,
-            run_command(
-                &self.gh_binary,
-                &["pr", "close", &number_arg],
-                Some(&self.git_root),
-            ),
+            run_command(&self.gh_binary, &args, Some(&self.git_root)),
         )
         .await?
         .map_err(WisetreeError::other)?;
@@ -1350,6 +1362,16 @@ fn summarize_notice_text(message: &str) -> String {
 
 /// Extract `(owner, repo)` from a GitHub remote URL. Handles the common SSH,
 /// HTTPS, and `git@` SCP-style forms.
+/// `owner/repo` of the repository a pull request belongs to, read from its
+/// URL (`https://github.com/<owner>/<repo>/pull/<N>`). Every `gh` call that
+/// selects a PR by number passes it as `--repo`: `gh` otherwise picks its
+/// default repository (typically `upstream`), where a PR opened on another
+/// remote's repository (e.g. `kaefer`) resolves to an unrelated PR with the
+/// same number.
+pub fn pr_repository(url: &str) -> Option<String> {
+    parse_github_slug(url).map(|(owner, repo)| format!("{owner}/{repo}"))
+}
+
 fn parse_github_slug(remote: &str) -> Option<(String, String)> {
     let trimmed = remote.trim();
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);

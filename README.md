@@ -296,7 +296,7 @@ Opens the PR URL in your default browser with `open`, `xdg-open`, or `start`. On
 
 #### Close
 
-Runs `gh pr close <number>` after a confirmation dialog.
+Runs `gh pr close <number> --repo <owner/repo>` after a confirmation dialog. The repository is read from the PR's URL, so the command closes this PR even when `gh`'s default repository (for example `upstream`) has an unrelated PR with the same number.
 
 #### Merge (squash)
 
@@ -305,7 +305,7 @@ Runs `gh pr close <number>` after a confirmation dialog.
 3. If the worktree has **local commits that are not pushed**, Wisetree warns you, because a squash merge includes only what GitHub already has. It then asks:
    - **Push & merge** (default): runs `git push <remote> HEAD`, then merges. The remote is the one `git push` itself would send the branch to (such as a fork it was pushed to with `-u`), else `origin`.
    - **Merge only**: merges what is already on GitHub.
-4. Wisetree runs `gh pr merge <number> --squash --subject "<PR title> (#<number>)" --body "<PR description>"`. The resulting commit message matches GitHub's own squash convention.
+4. Wisetree runs `gh pr merge <number> --squash --subject "<PR title> (#<number>)" --body "<PR description>" --repo <owner/repo>`. The resulting commit message matches GitHub's own squash convention. The repository is read from the PR's URL, so a PR opened on another remote's repository (such as `kaefer`) is never confused with a same-numbered PR in `gh`'s default repository.
 
 ### Shared cache screen
 

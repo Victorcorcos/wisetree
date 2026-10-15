@@ -147,7 +147,7 @@ async fn confirm_flow_invokes_gh_pr_merge_with_live_title_and_body() {
     // arrived. Real `App` calls `fetch_pr_details` then `override_title`
     // + `set_body`; mirror that here.
     let details = service
-        .fetch_pr_details(sample_request().number)
+        .fetch_pr_details(sample_request().number, None)
         .await
         .expect("details fetch");
     let mut screen = MergePullRequestScreen::new(sample_request());
@@ -167,7 +167,7 @@ async fn confirm_flow_invokes_gh_pr_merge_with_live_title_and_body() {
 
     // Now run the merge with the exact payload the screen produced.
     service
-        .merge_pull_request(7, &title, &body)
+        .merge_pull_request(7, &title, &body, None)
         .await
         .expect("merge ok");
 
@@ -213,7 +213,7 @@ async fn failure_flow_surfaces_gh_stderr_for_toast() {
     };
 
     let err = service
-        .merge_pull_request(7, &title, &body)
+        .merge_pull_request(7, &title, &body, None)
         .await
         .expect_err("merge should fail when gh exits non-zero");
     let rendered = format!("{err}");

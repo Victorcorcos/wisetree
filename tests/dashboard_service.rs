@@ -5,7 +5,8 @@ use std::process::Command;
 use tempfile::TempDir;
 use wisetree::config::schema::DashboardConfig;
 use wisetree::services::{
-    resolve_base_ref, resolve_push_remote, DashboardNoticeLevel, DashboardService, PrState,
+    pr_repository, resolve_base_ref, resolve_push_remote, DashboardNoticeLevel, DashboardService,
+    PrState,
 };
 
 /// Tests that exercise the PR-fetching path need `show_pull_requests`
@@ -974,6 +975,99 @@ fn fake_gh_pr_script(log_path: &Path, pr_view_json: &str, merge_exit_code: i32) 
     )
 }
 
+/// Fake `gh` that resolves a PR the way the real one does: without `--repo`
+/// it falls back to its default repository (`canonical/repo`, like a
+/// `gh repo set-default` on `upstream`), where the same number is an
+/// unrelated PR; `--repo <owner/repo>` selects the PR in that repository.
+/// Every call is logged, and `pr view` answers with the selected repository.
+fn fake_gh_with_default_repository(log_path: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "--version" ]; then exit 0; fi
+repo=canonical/repo
+previous=
+for arg in "$@"; do
+  if [ "$previous" = "--repo" ]; then repo="$arg"; fi
+  previous="$arg"
+done
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '{{"title":"%s title","body":"%s body"}}' "$repo" "$repo"
+  exit 0
+fi
+printf 'ok %s\n' "$repo"
+"#,
+        log = log_path.display()
+    )
+}
+
+fn service_with_default_repository_gh(parent: &Path) -> (DashboardService, PathBuf) {
+    let repo = parent.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    let log_path = parent.join("gh.log");
+    let gh_path = parent.join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_with_default_repository(&log_path)).unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo, DashboardConfig::default())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.join("dashboard_pr_cache.json")));
+    (service, log_path)
+}
+
+#[test]
+fn pr_repository_reads_owner_and_repo_off_the_pr_url() {
+    assert_eq!(
+        pr_repository("https://github.com/kaefer-cit/dpms-api-norway/pull/402").as_deref(),
+        Some("kaefer-cit/dpms-api-norway")
+    );
+    assert_eq!(pr_repository("not a github url"), None);
+}
+
+/// Merge on a PR opened on a third remote's repository (`kaefer/repo`) reads
+/// and squash-merges that PR — never the unrelated PR with the same number
+/// in `gh`'s default repository.
+#[tokio::test]
+async fn merge_reads_and_merges_the_pr_in_its_own_repository() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let (service, log_path) = service_with_default_repository_gh(parent.path());
+    let repository = pr_repository("https://github.com/kaefer/repo/pull/402");
+
+    let details = service
+        .fetch_pr_details(402, repository.as_deref())
+        .await
+        .expect("details");
+    service
+        .merge_pull_request(402, &details.title, &details.body, repository.as_deref())
+        .await
+        .expect("merge");
+
+    assert_eq!(details.title, "kaefer/repo title");
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("pr merge 402 --squash"), "{log}");
+    assert!(
+        log.lines()
+            .filter(|line| line.starts_with("pr merge"))
+            .all(|line| line.ends_with("--repo kaefer/repo")),
+        "{log}"
+    );
+}
+
+/// Close acts on the PR in its own repository.
+#[tokio::test]
+async fn close_targets_the_pr_in_its_own_repository() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let (service, log_path) = service_with_default_repository_gh(parent.path());
+
+    service
+        .close_pull_request(402, Some("kaefer/repo"))
+        .await
+        .expect("close");
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("pr close 402 --repo kaefer/repo"), "{log}");
+}
+
 #[tokio::test]
 async fn fetch_pr_details_returns_title_and_body() {
     let fixture = repo_with_worktree();
@@ -986,7 +1080,10 @@ async fn fetch_pr_details_returns_title_and_body() {
     let service = service_with_isolated_cache_and_config(&fixture, config_with_prs())
         .with_gh_binary(gh_path.clone());
 
-    let details = service.fetch_pr_details(7).await.expect("fetch_pr_details");
+    let details = service
+        .fetch_pr_details(7, None)
+        .await
+        .expect("fetch_pr_details");
     assert_eq!(details.title, "Add merge action");
     assert_eq!(details.body, "Closes #42.");
 
@@ -1009,7 +1106,7 @@ async fn merge_pull_request_invokes_gh_with_squash_flag_and_passthrough_message(
         .with_gh_binary(gh_path.clone());
 
     service
-        .merge_pull_request(7, "Add merge action", "Closes #42 with notes.")
+        .merge_pull_request(7, "Add merge action", "Closes #42 with notes.", None)
         .await
         .expect("merge ok");
 
@@ -1040,7 +1137,7 @@ async fn merge_pull_request_surfaces_gh_stderr_on_failure() {
         .with_gh_binary(gh_path.clone());
 
     let err = service
-        .merge_pull_request(7, "subject", "body")
+        .merge_pull_request(7, "subject", "body", None)
         .await
         .expect_err("merge should fail when gh exits non-zero");
     let rendered = format!("{err}");
@@ -1060,7 +1157,7 @@ async fn merge_pull_request_errors_clearly_when_gh_missing() {
         service_with_isolated_cache_and_config(&fixture, config_with_prs()).with_gh_binary(missing);
 
     let err = service
-        .merge_pull_request(7, "subject", "body")
+        .merge_pull_request(7, "subject", "body", None)
         .await
         .expect_err("merge should fail without gh");
     assert!(format!("{err}").contains("gh CLI not found"));
