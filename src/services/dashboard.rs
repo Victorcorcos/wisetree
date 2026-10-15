@@ -49,6 +49,9 @@ pub const BASE_REF_PRIORITY: [&str; 6] = [
 /// Remotes searched, in order, for a base branch or the repository hosting
 /// the PRs: `upstream` first so fork-based workflows reach the canonical repo.
 const CONVENTIONAL_REMOTES: [&str; 2] = ["upstream", "origin"];
+/// Remote a PR update is pushed to when the branch has no push destination
+/// of its own yet (see [`resolve_push_remote`]).
+const FALLBACK_PUSH_REMOTE: &str = "origin";
 /// How often the service refetches PR data when branches are otherwise idle.
 /// Catches remote-only changes (merge, close, title edit) without hammering
 /// the API. The Status column countdown is driven by the same timer.
@@ -564,15 +567,17 @@ impl DashboardService {
         local_ahead_of_tracking(&self.git_binary, &PathBuf::from(worktree_path)).await
     }
 
-    /// Push the worktree's `HEAD` to `origin` (`git push origin HEAD`). Used
-    /// by the Merge flow to flush local commits into the PR before it is
+    /// Push the worktree's `HEAD` to its push remote
+    /// (`git push <remote> HEAD`, see [`resolve_push_remote`]). Used by the
+    /// Merge flow to flush local commits into the PR before it is
     /// squash-merged, so nothing is lost.
-    pub async fn push_head_to_origin(&self, worktree_path: &str) -> Result<()> {
+    pub async fn push_head(&self, worktree_path: &str) -> Result<()> {
         let cwd = PathBuf::from(worktree_path);
+        let remote = resolve_push_remote_with_binary(&self.git_binary, &cwd).await;
         with_timeout(
             "git push",
             PUSH_TIMEOUT,
-            run_command(&self.git_binary, &["push", "origin", "HEAD"], Some(&cwd)),
+            run_command(&self.git_binary, &["push", &remote, "HEAD"], Some(&cwd)),
         )
         .await?
         .map_err(WisetreeError::other)?;
@@ -2002,6 +2007,42 @@ async fn branch_source_ref(git_binary: &Path, cwd: &Path) -> Option<String> {
         }
     }
     reflog_source_ref(git_binary, cwd, &branch).await
+}
+
+/// The remote every push that updates the worktree's PR goes to: the one
+/// `git push` sends the current branch to (`@{push}`), e.g. a `kaefer-fork`
+/// the branch was pushed to with `-u` — where its PR's head lives. Falls back
+/// to `origin` when git has no push destination for the branch, or when that
+/// destination is a differently named branch (such as the base it was cut
+/// from), which HEAD must never be pushed into.
+pub async fn resolve_push_remote(cwd: &Path) -> String {
+    resolve_push_remote_with_binary(Path::new("git"), cwd).await
+}
+
+pub(crate) async fn resolve_push_remote_with_binary(git_binary: &Path, cwd: &Path) -> String {
+    own_push_remote(git_binary, cwd)
+        .await
+        .unwrap_or_else(|| FALLBACK_PUSH_REMOTE.to_string())
+}
+
+async fn own_push_remote(git_binary: &Path, cwd: &Path) -> Option<String> {
+    let branch = current_branch_name(git_binary, cwd).await?;
+    let push_ref = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(
+            git_binary,
+            &["rev-parse", "--abbrev-ref", "@{push}"],
+            Some(cwd),
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let push_ref = push_ref.trim();
+    if !is_own_pushed_ref(push_ref, &branch) {
+        return None;
+    }
+    remote_name_from_ref(push_ref).map(str::to_string)
 }
 
 /// `true` when `remote_ref` (`<remote>/<branch>`) is `branch`'s own

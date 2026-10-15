@@ -303,7 +303,7 @@ Runs `gh pr close <number>` after a confirmation dialog.
 1. Wisetree loads the PR title and description and shows a summary: the worktree, branch, CI status, ahead/behind counts, last commit, and a preview of the **squash commit message**.
 2. The confirmation defaults to **No**.
 3. If the worktree has **local commits that are not pushed**, Wisetree warns you, because a squash merge includes only what GitHub already has. It then asks:
-   - **Push & merge** (default): runs `git push origin HEAD`, then merges.
+   - **Push & merge** (default): runs `git push <remote> HEAD`, then merges. The remote is the one `git push` itself would send the branch to (such as a fork it was pushed to with `-u`), else `origin`.
    - **Merge only**: merges what is already on GitHub.
 4. Wisetree runs `gh pr merge <number> --squash --subject "<PR title> (#<number>)" --body "<PR description>"`. The resulting commit message matches GitHub's own squash convention.
 

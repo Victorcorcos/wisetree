@@ -134,7 +134,7 @@ struct MergePrFailure {
 }
 
 /// Everything the background merge task needs: the `gh pr merge` subject +
-/// body, plus the worktree to (optionally) `git push origin HEAD` from
+/// body, plus the worktree to (optionally) `git push <remote> HEAD` from
 /// before merging so unpushed local commits reach the PR first.
 struct MergeExecution {
     number: u64,
@@ -2988,7 +2988,7 @@ fn kick_off_merge_pull_request(
         // doesn't drop them. A push failure aborts the merge — better to
         // stop than to merge a stale PR and lose the commits.
         if exec.push_first {
-            if let Err(err) = service.push_head_to_origin(&exec.worktree_path).await {
+            if let Err(err) = service.push_head(&exec.worktree_path).await {
                 let _ = tx.send(AppEvent::MergePrFinished(Err(MergePrFailure {
                     number,
                     message: format!(

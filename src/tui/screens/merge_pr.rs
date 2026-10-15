@@ -7,7 +7,7 @@
 //!   **No** default) on the bottom. When the worktree has unpushed local
 //!   commits the panel warns about them.
 //! - `ConfirmPush` : reached only when unpushed commits exist and the user
-//!   confirmed the merge — a second modal asks whether to `git push origin
+//!   confirmed the merge — a second modal asks whether to `git push <remote>
 //!   HEAD` first (**default**) or merge without pushing, so a squash-merge
 //!   never silently drops local work. Both choices return
 //!   `MergeAction::Confirmed`, carrying `push_first`.
@@ -60,7 +60,7 @@ pub enum MergeAction {
         title: String,
         body: String,
         worktree_path: String,
-        /// Run `git push origin HEAD` in the worktree before merging so
+        /// Run `git push <remote> HEAD` in the worktree before merging so
         /// local commits reach the PR first.
         push_first: bool,
     },
@@ -379,7 +379,7 @@ fn build_push_confirm(request: &MergePullRequestRequest, count: u64) -> Confirma
         .with_title(format!("Push before merging PR #{}?", request.number))
         .with_subtitle(format!(
             "This worktree has {count} local {plural} not on the PR. Push them \
-             (git push origin HEAD) before the squash-merge so they aren't lost?"
+             to the PR branch before the squash-merge so they aren't lost?"
         ))
         .with_confirm_text("Push & merge")
         .with_cancel_text("Merge only")

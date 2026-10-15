@@ -4,7 +4,9 @@ use std::process::Command;
 
 use tempfile::TempDir;
 use wisetree::config::schema::DashboardConfig;
-use wisetree::services::{resolve_base_ref, DashboardNoticeLevel, DashboardService, PrState};
+use wisetree::services::{
+    resolve_base_ref, resolve_push_remote, DashboardNoticeLevel, DashboardService, PrState,
+};
 
 /// Tests that exercise the PR-fetching path need `show_pull_requests`
 /// enabled — otherwise the service short-circuits before calling gh.
@@ -573,6 +575,95 @@ async fn watch_refreshes_the_third_remote_base_a_worktree_was_cut_from() {
             break;
         }
     }
+}
+
+/// Stdout of `git <args>` in `cwd`, trimmed.
+fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("git invocation");
+    assert!(out.status.success(), "git {args:?} failed in {cwd:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A branch pushed with `-u` to a fork remote that is not `origin` (the PR's
+/// head lives there) is pushed back to that fork by the Merge flow's
+/// push-first step, never to `origin`.
+#[tokio::test]
+async fn push_head_sends_a_branch_to_the_fork_remote_it_tracks() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let origin = parent.path().join("origin.git");
+    let fork = parent.path().join("fork.git");
+    let work = parent.path().join("work");
+    for bare in [&origin, &fork] {
+        git(
+            parent.path(),
+            &["init", "-q", "--bare", bare.to_str().unwrap()],
+        );
+    }
+    fs::create_dir_all(&work).unwrap();
+    init_repo_with_main(&work);
+    git(&work, &["config", "user.email", "test@example.com"]);
+    git(&work, &["config", "user.name", "Test"]);
+    git(&work, &["switch", "-q", "-c", "feat"]);
+    fs::write(work.join("a.txt"), "1\n").unwrap();
+    git(&work, &["add", "a.txt"]);
+    git(&work, &["commit", "-q", "-m", "init"]);
+    git(
+        &work,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(
+        &work,
+        &["remote", "add", "kaefer-fork", fork.to_str().unwrap()],
+    );
+    git(&work, &["push", "-q", "-u", "kaefer-fork", "feat"]);
+    fs::write(work.join("b.txt"), "2\n").unwrap();
+    git(&work, &["add", "b.txt"]);
+    git(&work, &["commit", "-q", "-m", "second"]);
+    let head = git_stdout(&work, &["rev-parse", "HEAD"]);
+    let service = DashboardService::new(work.clone(), DashboardConfig::default())
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+
+    service
+        .push_head(work.to_str().unwrap())
+        .await
+        .expect("push HEAD");
+
+    assert_eq!(git_stdout(&fork, &["rev-parse", "refs/heads/feat"]), head);
+    assert_eq!(
+        git_stdout(&origin, &["for-each-ref", "refs/heads"]),
+        "",
+        "origin must not receive the fork's branch"
+    );
+}
+
+/// When git's push destination for the branch is a differently named branch
+/// (here the base it tracks, under `push.default=upstream`), the push remote
+/// falls back to `origin` so HEAD never lands on the base.
+#[tokio::test]
+async fn resolve_push_remote_never_targets_the_base_a_branch_tracks() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    git(
+        &repo,
+        &["remote", "add", "upstream", "https://example.invalid/u.git"],
+    );
+    git(&repo, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+    git(
+        &repo,
+        &["switch", "-q", "-c", "feat", "--track", "upstream/main"],
+    );
+    git(&repo, &["config", "push.default", "upstream"]);
+
+    assert_eq!(resolve_push_remote(&repo).await, "origin");
 }
 
 #[tokio::test]
