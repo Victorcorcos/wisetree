@@ -1,6 +1,6 @@
 //! Live dashboard polling service.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -409,12 +409,14 @@ impl DashboardService {
             loop {
                 let enrich = service.pr_enrichment_enabled();
                 let on_cycle = enrich && next_pr_fetch_at.map_or(true, |due| Instant::now() >= due);
+                let mut base_refs = Vec::new();
                 // Emit git-only rows (with cached PRs applied) first so the
                 // UI exits "Loading dashboard..." instantly, without waiting on
                 // any network round-trip. PR enrichment and the base-ref fetch
                 // below are refinements that fill in afterwards.
                 match service.collect_git_rows().await {
                     Ok(mut rows) => {
+                        base_refs = distinct_base_refs(&rows);
                         if rows_tx
                             .send(DashboardUpdate::GitOnly(rows.clone()))
                             .await
@@ -450,14 +452,14 @@ impl DashboardService {
                     }
                 }
 
-                // On the 30s PR beat, refresh the base branch's remote-tracking
-                // ref so the behind-count reflects commits another developer
-                // pushed to the base. Runs after the paint above so it never
-                // blocks the first
-                // render; when it actually advances the ref, loop again right
-                // away to re-render the refined behind-count. Best-effort: a
-                // failed or no-op fetch just falls through to the normal wait.
-                if on_cycle && service.fetch_base_ref().await {
+                // On the 30s PR beat, refresh the base branches' remote-tracking
+                // refs so the behind-count reflects commits another developer
+                // pushed to a base. Runs after the paint above so it never
+                // blocks the first render; when it actually advances a ref,
+                // loop again right away to re-render the refined behind-count.
+                // Best-effort: a failed or no-op fetch just falls through to
+                // the normal wait.
+                if on_cycle && service.fetch_base_refs(&base_refs).await {
                     continue;
                 }
 
@@ -837,34 +839,45 @@ impl DashboardService {
         })
     }
 
-    /// Best-effort refresh of the PR base branch's remote-tracking ref so the
-    /// dashboard's behind-count reflects commits another developer pushed to
-    /// the base. Without this the count is measured against a possibly-stale
-    /// `origin/main`, so a behind-but-conflict-free PR never surfaces the
-    /// "Update" command in repos that don't enforce up-to-date branches.
+    /// Best-effort refresh of every base branch's remote-tracking ref (one per
+    /// distinct base the rows were measured against, e.g. `upstream/main` and
+    /// `kaefer/main`) so the dashboard's behind-count reflects commits another
+    /// developer pushed to any base. Without this the count is measured against
+    /// a possibly-stale ref, so a behind-but-conflict-free PR never surfaces
+    /// the "Update" command in repos that don't enforce up-to-date branches.
     ///
+    /// Bases are fetched one after another: concurrent fetches in the same
+    /// repository would race on `FETCH_HEAD`.
+    ///
+    /// Returns `true` only when a fetch actually advanced a base's
+    /// remote-tracking ref, so the caller can re-render the refined
+    /// behind-count exactly when there is new data — and skip the churn when
+    /// every ref was already current.
+    async fn fetch_base_refs(&self, base_refs: &[String]) -> bool {
+        let mut advanced = false;
+        for base_ref in base_refs {
+            advanced |= self.fetch_base_ref(base_ref).await;
+        }
+        advanced
+    }
+
     /// Fetches a single branch with an explicit destination refspec
     /// (`+<branch>:refs/remotes/<remote>/<branch>`) so only the one
     /// remote-tracking ref `fetch_upstream_diff` reads is updated — no
-    /// `--all`, no extra branches, minimal transfer. Failures (offline, auth,
-    /// missing ref) are swallowed: a stale tracking ref just means the count
-    /// lags until the next successful fetch, never a stalled tick.
-    ///
-    /// Returns `true` only when the fetch actually advanced the base's
-    /// remote-tracking ref, so the caller can re-render the refined
-    /// behind-count exactly when there is new data — and skip the churn when
-    /// the ref was already current.
-    async fn fetch_base_ref(&self) -> bool {
-        let Some(base_ref) =
-            resolve_base_ref_with_binary(&self.git_binary, &self.git_root, None).await
-        else {
-            return false;
-        };
+    /// `--all`, no extra branches, minimal transfer. A base that is not a
+    /// remote-tracking ref is skipped. Failures (offline, auth, missing ref)
+    /// are swallowed: a stale tracking ref just means the count lags until
+    /// the next successful fetch, never a stalled tick.
+    async fn fetch_base_ref(&self, base_ref: &str) -> bool {
         let Some((remote, branch)) = base_ref.split_once('/') else {
             return false;
         };
-        let before = self.rev_parse(&base_ref).await;
-        let refspec = format!("+{branch}:refs/remotes/{remote}/{branch}");
+        let tracking_ref = format!("refs/remotes/{base_ref}");
+        let before = self.rev_parse(&tracking_ref).await;
+        if before.is_none() {
+            return false;
+        }
+        let refspec = format!("+{branch}:{tracking_ref}");
         let _ = time::timeout(
             BASE_FETCH_TIMEOUT,
             run_command(
@@ -874,7 +887,7 @@ impl DashboardService {
             ),
         )
         .await;
-        let after = self.rev_parse(&base_ref).await;
+        let after = self.rev_parse(&tracking_ref).await;
         after.is_some() && after != before
     }
 
@@ -1270,15 +1283,24 @@ fn pr_refresh_period(_config: &DashboardConfig) -> Duration {
     Duration::from_millis(PR_REFRESH_PERIOD_MS)
 }
 
-/// The remote of the base ref the row's ahead/behind was measured against.
-fn row_base_remote(row: &DashboardRow) -> Option<String> {
-    let base_ref = row
-        .worktree
+/// The base ref the row's ahead/behind was measured against.
+fn row_base_ref(row: &DashboardRow) -> Option<&str> {
+    row.worktree
         .branch_status
         .as_ref()?
         .upstream_branch
-        .as_deref()?;
-    remote_name_from_ref(base_ref).map(str::to_string)
+        .as_deref()
+}
+
+/// The remote of the row's base ref.
+fn row_base_remote(row: &DashboardRow) -> Option<String> {
+    remote_name_from_ref(row_base_ref(row)?).map(str::to_string)
+}
+
+/// Each distinct base ref the rows were measured against, in sorted order.
+fn distinct_base_refs(rows: &[DashboardRow]) -> Vec<String> {
+    let base_refs: BTreeSet<&str> = rows.iter().filter_map(row_base_ref).collect();
+    base_refs.into_iter().map(str::to_string).collect()
 }
 
 /// `branch`'s PR once every repository it is looked up in has answered: the

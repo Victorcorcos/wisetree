@@ -488,6 +488,93 @@ async fn watch_emits_initial_snapshot() {
     assert_eq!(update.rows().len(), 2);
 }
 
+/// On its PR beat the watch loop refreshes the base of every worktree, so a
+/// worktree cut from a third remote (`kaefer/main`) shows the commit a
+/// teammate pushed there as `behind` — not only the mother's `upstream/main`.
+#[tokio::test]
+async fn watch_refreshes_the_third_remote_base_a_worktree_was_cut_from() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let upstream = parent.path().join("upstream.git");
+    let kaefer = parent.path().join("kaefer.git");
+    let teammate = parent.path().join("teammate");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-kaefer");
+    for bare in [&upstream, &kaefer] {
+        git(
+            parent.path(),
+            &["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+    }
+    fs::create_dir_all(&teammate).unwrap();
+    init_repo_with_main(&teammate);
+    git(&teammate, &["config", "user.email", "test@example.com"]);
+    git(&teammate, &["config", "user.name", "Test"]);
+    fs::write(teammate.join("README.md"), "# repo\n").unwrap();
+    git(&teammate, &["add", "README.md"]);
+    git(&teammate, &["commit", "-q", "-m", "init"]);
+    for bare in [&upstream, &kaefer] {
+        git(&teammate, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    }
+    git(
+        parent.path(),
+        &[
+            "clone",
+            "-q",
+            "-o",
+            "upstream",
+            upstream.to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ],
+    );
+    git(
+        &repo,
+        &["remote", "add", "kaefer", kaefer.to_str().unwrap()],
+    );
+    git(&repo, &["fetch", "-q", "kaefer"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "kaefer-feature",
+            worktree.to_str().unwrap(),
+            "kaefer/main",
+        ],
+    );
+    fs::write(teammate.join("kaefer.txt"), "kaefer only\n").unwrap();
+    git(&teammate, &["add", "kaefer.txt"]);
+    git(&teammate, &["commit", "-q", "-m", "kaefer moves on"]);
+    git(&teammate, &["push", "-q", kaefer.to_str().unwrap(), "main"]);
+
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_script(&log_path)).unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+    let mut watch = service.watch();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let update = tokio::time::timeout_at(deadline, watch.rx.recv())
+            .await
+            .expect("the kaefer base was never refreshed")
+            .expect("watch rows");
+        let behind = update
+            .rows()
+            .iter()
+            .find(|row| row.worktree.branch == "kaefer-feature")
+            .and_then(|row| row.worktree.branch_status.as_ref())
+            .map(|status| (status.upstream_branch.clone(), status.behind));
+        if behind == Some((Some("kaefer/main".to_string()), 1)) {
+            break;
+        }
+    }
+}
+
 #[tokio::test]
 async fn watch_reports_refresh_errors_without_emitting_empty_rows() {
     let missing_root = tempfile::tempdir().expect("tempdir");

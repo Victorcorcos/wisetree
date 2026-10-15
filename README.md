@@ -200,7 +200,7 @@ spike           spike/cache       Dirty            +2 -4         c0ffee1 WIP
 
 - The top line shows when the data was last refreshed and how many worktrees, dirty worktrees, and open PRs there are.
 - Git data is polled every `dashboard.refreshIntervalMs`. The default is 5 seconds, and the allowed range is 5–60 seconds.
-- Pull request data is refreshed every 30 seconds. On that same cycle Wisetree also fetches the base branch, so that the *behind* count includes commits that teammates pushed. PR results are cached in `~/.wisetree/dashboard_pr_cache.json`, which means the table appears instantly, and Wisetree backs off for 5 minutes if GitHub rate-limits it.
+- Pull request data is refreshed every 30 seconds. On that same cycle Wisetree also fetches the base branch of every worktree (for example both `upstream/main` and `kaefer/main`), so that the *behind* count includes commits that teammates pushed. PR results are cached in `~/.wisetree/dashboard_pr_cache.json`, which means the table appears instantly, and Wisetree backs off for 5 minutes if GitHub rate-limits it.
 - `Ctrl+R` forces a refresh.
 
 #### Search
