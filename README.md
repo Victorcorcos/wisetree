@@ -222,7 +222,7 @@ The *Worktree* column, which shows the directory name, is always visible. You ch
 
 Wisetree picks the **base ref** for ahead/behind and diff in this order:
 
-1. The PR's base branch on the remote the worktree was cut from when that is a third remote (such as `kaefer`), then on `upstream`, then on `origin`.
+1. Once the dashboard knows the worktree's PR, the PR's base branch on the remote that points at the PR's repository (for a `kaefer-cit` PR targeting `main`, `kaefer/main`), so the row is measured against what the PR merges into. Without such a remote, the base branch on the remote the worktree was cut from when that is a third remote (such as `kaefer`), then on `upstream`, then on `origin`.
 2. The remote branch the worktree was cut from, on any remote (such as `kaefer/main`). That is the branch's tracked upstream or, once the upstream is just its own pushed copy (`origin/<same-branch>`, `my-fork/<same-branch>`, …), the start point its reflog recorded when the branch was created.
 3. The first reachable ref among `upstream/main`, `upstream/master`, `upstream/develop`, `origin/main`, `origin/master`, and `origin/develop`.
 

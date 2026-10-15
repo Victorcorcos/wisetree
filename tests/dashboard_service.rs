@@ -1263,6 +1263,96 @@ async fn row_has_no_pr_when_only_another_fork_has_a_same_named_one() {
     assert_eq!(feature_row_pr(&fixture, &nodes).await, None);
 }
 
+/// A worktree cut from the fork's `origin/main` whose PR targets
+/// `upstream/main` is measured against the PR's base once the dashboard knows
+/// the PR, not against the stale fork branch it was cut from.
+#[tokio::test]
+async fn row_is_measured_against_its_prs_base_once_the_pr_is_known() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-feature");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:canonical/repo.git",
+        ],
+    );
+    git(
+        &repo,
+        &["remote", "add", "origin", "git@github.com:me/repo.git"],
+    );
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let upstream_ahead = git_stdout(
+        &repo,
+        &[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-m",
+            "upstream moves on",
+        ],
+    );
+    git(
+        &repo,
+        &["update-ref", "refs/remotes/upstream/main", &upstream_ahead],
+    );
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    fs::write(worktree.join("feature.txt"), "one\n").unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "feature"]);
+    let head = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    let pr = format!(
+        r#"{{"number":7,"state":"OPEN","url":"https://github.com/canonical/repo/pull/7","title":"t","isDraft":false,"baseRefName":"main","baseRepository":{{"nameWithOwner":"canonical/repo"}},"headRefOid":"{head}","headRepository":{{"nameWithOwner":"me/repo"}}}}"#
+    );
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(&gh_path, fake_gh_with_pr_candidates(&log_path, &pr)).unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+    let feature_status = |rows: Vec<wisetree::services::DashboardRow>| {
+        rows.into_iter()
+            .find(|row| row.worktree.branch == "feature")
+            .and_then(|row| row.worktree.branch_status)
+            .map(|status| (status.upstream_branch, status.ahead, status.behind))
+    };
+
+    let before_pr_known = feature_status(service.snapshot().await.expect("first snapshot"));
+    let after_pr_known = feature_status(service.snapshot().await.expect("second snapshot"));
+
+    assert_eq!(
+        before_pr_known,
+        Some((Some("origin/main".to_string()), 1, 0))
+    );
+    assert_eq!(
+        after_pr_known,
+        Some((Some("upstream/main".to_string()), 1, 1))
+    );
+}
+
 #[tokio::test]
 async fn fetch_pr_details_returns_title_and_body() {
     let fixture = repo_with_worktree();

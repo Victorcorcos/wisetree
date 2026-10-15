@@ -669,10 +669,12 @@ impl DashboardService {
     async fn collect_git_rows(&self) -> Result<Vec<DashboardRow>> {
         let worktrees = self.list_worktrees_basic().await?;
         let mut tasks = JoinSet::new();
+        self.ensure_cache_loaded();
 
         for worktree in worktrees {
             let service = self.clone();
-            tasks.spawn(async move { service.enrich_worktree_git(worktree).await });
+            let pr_base = self.cached_pr_base(&worktree.branch);
+            tasks.spawn(async move { service.enrich_worktree_git(worktree, pr_base).await });
         }
 
         let mut rows = Vec::new();
@@ -686,8 +688,6 @@ impl DashboardService {
                 }
             }
         }
-
-        self.ensure_cache_loaded();
 
         let live_branches: HashSet<String> =
             rows.iter().map(|row| row.worktree.branch.clone()).collect();
@@ -752,10 +752,29 @@ impl DashboardService {
         Ok(worktrees)
     }
 
-    async fn enrich_worktree_git(&self, mut worktree: GitWorktree) -> DashboardRow {
+    /// Base branch and repository of the PR cached for `branch`, so its row is
+    /// measured against the PR's own base (see
+    /// [`resolve_pr_base_ref_with_binary`]).
+    fn cached_pr_base(&self, branch: &str) -> Option<PrBase> {
+        let state = self.pr_state.lock().expect("pr_state poisoned");
+        let pr = state.entries.get(branch)?.pull_request.as_ref()?;
+        Some(PrBase {
+            name: pr.base_ref_name.clone()?,
+            repository: pr.base_repository.clone(),
+        })
+    }
+
+    async fn enrich_worktree_git(
+        &self,
+        mut worktree: GitWorktree,
+        pr_base: Option<PrBase>,
+    ) -> DashboardRow {
         let mut errors = Vec::new();
 
-        match self.fetch_status(Path::new(&worktree.path)).await {
+        match self
+            .fetch_status(Path::new(&worktree.path), pr_base.as_ref())
+            .await
+        {
             Ok((is_clean, branch_status)) => {
                 worktree.is_clean = is_clean;
                 worktree.branch_status = branch_status;
@@ -783,6 +802,7 @@ impl DashboardService {
     async fn fetch_status(
         &self,
         cwd: &Path,
+        pr_base: Option<&PrBase>,
     ) -> std::result::Result<(bool, Option<BranchStatus>), String> {
         let output = time::timeout(
             COMMAND_TIMEOUT,
@@ -799,20 +819,32 @@ impl DashboardService {
             }
         }
 
-        let branch_status = self.fetch_upstream_diff(cwd).await;
+        let branch_status = self.fetch_upstream_diff(cwd, pr_base).await;
         Ok((!dirty, branch_status))
     }
 
-    /// Compute the commit-level ahead/behind of HEAD relative to the base ref
-    /// from [`resolve_base_ref_with_binary`]. `ahead`/`behind` come from
+    /// Compute the commit-level ahead/behind of HEAD relative to the base ref:
+    /// the PR's own base when the row has one (`pr_base`, resolved through the
+    /// PR's repository), else the ref the branch was cut from
+    /// ([`resolve_base_ref_with_binary`]). `ahead`/`behind` come from
     /// `git rev-list --left-right --count` (matching `GitService::branch_status`),
     /// and `insertions`/`deletions` come from a follow-up
     /// `git diff --shortstat --merge-base <upstream>` so the "Diff" column
     /// renders the branch's own line-level changes (committed or not) since it
     /// was cut — never the inverse of commits the base gained in the meantime.
     /// Returns `None` when no base ref is reachable.
-    async fn fetch_upstream_diff(&self, cwd: &Path) -> Option<BranchStatus> {
-        let upstream = resolve_base_ref_with_binary(&self.git_binary, cwd, None).await?;
+    async fn fetch_upstream_diff(
+        &self,
+        cwd: &Path,
+        pr_base: Option<&PrBase>,
+    ) -> Option<BranchStatus> {
+        let upstream = resolve_pr_base_ref_with_binary(
+            &self.git_binary,
+            cwd,
+            pr_base.map(|base| base.name.as_str()),
+            pr_base.and_then(|base| base.repository.as_deref()),
+        )
+        .await?;
         let spec = format!("{upstream}...HEAD");
         let result = time::timeout(
             COMMAND_TIMEOUT,
@@ -1462,6 +1494,12 @@ fn parse_github_slug(remote: &str) -> Option<(String, String)> {
 /// by name alone, so a newer PR from another fork's same-named branch must not
 /// hide this branch's own.
 const PR_CANDIDATES_PER_BRANCH: u8 = 5;
+
+/// GitHub's base branch name of a PR and the repository it targets.
+struct PrBase {
+    name: String,
+    repository: Option<String>,
+}
 
 /// A branch whose PR the dashboard refreshes.
 struct PrFetchTarget {
@@ -2263,6 +2301,78 @@ async fn reflog_source_ref(git_binary: &Path, cwd: &Path, branch: &str) -> Optio
     .ok()?;
     let source = source.trim();
     (!source.is_empty() && !is_own_pushed_ref(source, branch)).then(|| source.to_string())
+}
+
+/// Resolve the local base ref of an existing PR: GitHub's base branch name
+/// through the remote that points at the PR's repository (`pr_repository`,
+/// e.g. `kaefer-cit/dpms-api-norway` → `kaefer/main`), so it never lands on a
+/// same-named branch of an unrelated remote even when the worktree's own
+/// source is unknown (a `gh pr checkout`, an expired reflog). Falls back to
+/// [`resolve_base_ref`].
+pub(crate) async fn resolve_pr_base_ref_with_binary(
+    git_binary: &Path,
+    cwd: &Path,
+    pr_base_ref: Option<&str>,
+    pr_repository: Option<&str>,
+) -> Option<String> {
+    let name = pr_base_ref.map(str::trim).filter(|name| !name.is_empty());
+    if let (Some(name), Some(repository)) = (name, pr_repository) {
+        if let Some(base_ref) =
+            resolve_github_repository_ref(git_binary, cwd, name, repository).await
+        {
+            return Some(base_ref);
+        }
+    }
+    resolve_base_ref_with_binary(git_binary, cwd, pr_base_ref).await
+}
+
+/// Resolve a branch only through a remote that points at the repository which
+/// owns an existing pull request. This avoids mapping `main` to an unrelated
+/// canonical `upstream` when the PR and its stack live in the user's fork.
+async fn resolve_github_repository_ref(
+    git_binary: &Path,
+    cwd: &Path,
+    branch: &str,
+    repository: &str,
+) -> Option<String> {
+    let remotes = time::timeout(
+        COMMAND_TIMEOUT,
+        run_command(git_binary, &["remote"], Some(cwd)),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let mut candidates = remotes
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|remote| match *remote {
+        "origin" => 0,
+        "upstream" => 1,
+        _ => 2,
+    });
+    for remote in candidates {
+        let url = match time::timeout(
+            COMMAND_TIMEOUT,
+            run_command(git_binary, &["remote", "get-url", remote], Some(cwd)),
+        )
+        .await
+        {
+            Ok(Ok(url)) => url,
+            _ => continue,
+        };
+        let remote_repository =
+            parse_github_slug(&url).map(|(owner, repo)| format!("{owner}/{repo}"));
+        if remote_repository.as_deref() != Some(repository) {
+            continue;
+        }
+        let candidate = format!("{remote}/{}", branch.trim());
+        if ref_is_reachable(git_binary, cwd, &candidate).await {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// `true` when `git rev-parse --verify` resolves `refname` in `cwd`. A
