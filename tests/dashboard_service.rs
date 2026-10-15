@@ -276,6 +276,55 @@ async fn snapshot_compares_and_finds_pr_on_the_third_remote_a_branch_was_cut_fro
     assert_eq!(pr.state, PrState::Open);
 }
 
+/// A branch behind its base shows only its own changes in the Diff column —
+/// not the inverse of the commits the base gained after the branch was cut.
+#[tokio::test]
+async fn snapshot_diff_counts_only_the_branch_changes_when_behind_its_base() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-feature");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    fs::write(repo.join("README.md"), "# repo\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    git(&repo, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().unwrap(),
+            "upstream/main",
+        ],
+    );
+    fs::write(worktree.join("feature.txt"), "one\ntwo\n").unwrap();
+    git(&worktree, &["add", "feature.txt"]);
+    git(&worktree, &["commit", "-q", "-m", "feature"]);
+    fs::write(repo.join("upstream.txt"), "a\nb\nc\nd\ne\n").unwrap();
+    git(&repo, &["add", "upstream.txt"]);
+    git(&repo, &["commit", "-q", "-m", "upstream moves on"]);
+    git(&repo, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+    let service = DashboardService::new(repo.clone(), DashboardConfig::default())
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+
+    let rows = service.snapshot().await.expect("snapshot");
+
+    let status = rows
+        .iter()
+        .find(|row| row.worktree.branch == "feature")
+        .and_then(|row| row.worktree.branch_status.as_ref())
+        .expect("feature row with a branch status");
+    assert_eq!(status.upstream_branch.as_deref(), Some("upstream/main"));
+    assert_eq!((status.ahead, status.behind), (1, 1));
+    assert_eq!((status.insertions, status.deletions), (Some(2), Some(0)));
+}
+
 #[tokio::test]
 async fn snapshot_skips_gh_by_default_when_pull_requests_disabled() {
     let fixture = repo_with_worktree();

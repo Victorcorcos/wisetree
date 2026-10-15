@@ -776,14 +776,14 @@ impl DashboardService {
         Ok((!dirty, branch_status))
     }
 
-    /// Compute the commit-level ahead/behind of HEAD relative to the first
-    /// reachable ref in `upstream/main`, `upstream/master`, `origin/main`,
-    /// `origin/master`. `ahead`/`behind` come from
+    /// Compute the commit-level ahead/behind of HEAD relative to the base ref
+    /// from [`resolve_base_ref_with_binary`]. `ahead`/`behind` come from
     /// `git rev-list --left-right --count` (matching `GitService::branch_status`),
     /// and `insertions`/`deletions` come from a follow-up
-    /// `git diff --shortstat <upstream>` so the "Diff" column can render the
-    /// line-level change set. Returns `None` when none of those remote refs are
-    /// reachable.
+    /// `git diff --shortstat --merge-base <upstream>` so the "Diff" column
+    /// renders the branch's own line-level changes (committed or not) since it
+    /// was cut — never the inverse of commits the base gained in the meantime.
+    /// Returns `None` when no base ref is reachable.
     async fn fetch_upstream_diff(&self, cwd: &Path) -> Option<BranchStatus> {
         let upstream = resolve_base_ref_with_binary(&self.git_binary, cwd, None).await?;
         let spec = format!("{upstream}...HEAD");
@@ -815,7 +815,7 @@ impl DashboardService {
             COMMAND_TIMEOUT,
             run_command(
                 &self.git_binary,
-                &["diff", "--shortstat", &upstream],
+                &["diff", "--shortstat", "--merge-base", &upstream],
                 Some(cwd),
             ),
         )

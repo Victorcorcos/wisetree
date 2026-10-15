@@ -216,7 +216,7 @@ The *Worktree* column, which shows the directory name, is always visible. You ch
 | `branch` | Branch | Checked-out branch. |
 | `status` | Status | Status label, plus pull request indicators (see below). |
 | `ahead_behind` | Ahead/Behind | `+N` commits ahead and `-N` commits behind the base ref. `=0` means the worktree is in sync. |
-| `diff` | Diff | `+N -N` lines inserted and deleted relative to the base ref. |
+| `diff` | Diff | `+N -N` lines inserted and deleted since the worktree left the base ref (its merge-base), uncommitted edits included. Commits the base gained afterwards are not counted. |
 | `last_commit` | Last Commit | Short SHA and subject of `HEAD`. |
 | `pull_request` | PR | `#123 Open`, `Merged`, `Closed`, or `Draft`. Requires PR data. |
 
