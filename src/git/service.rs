@@ -299,6 +299,24 @@ impl GitService {
         result.success
     }
 
+    pub async fn resolve_at(&self, cwd: &Path, revision: &str) -> Result<String> {
+        let result = execute_git_command(&["rev-parse", revision], Some(cwd)).await;
+        if result.success {
+            Ok(result.stdout)
+        } else {
+            Err(handle_git_error(&result.stderr, "resolve revision"))
+        }
+    }
+
+    pub async fn is_ancestor(&self, cwd: &Path, ancestor: &str, descendant: &str) -> bool {
+        execute_git_command(
+            &["merge-base", "--is-ancestor", ancestor, descendant],
+            Some(cwd),
+        )
+        .await
+        .success
+    }
+
     pub async fn worktree_exists(&self, worktree_path: &str) -> Result<bool> {
         Ok(self
             .list_worktrees()
@@ -364,6 +382,18 @@ impl GitService {
     /// Run `git branch [-d|-D] -- <name>`. Refuses to delete the current
     /// branch or the default branch (matches upstream guard).
     pub async fn delete_branch(&self, branch_name: &str, force: bool) -> Result<()> {
+        self.validate_branch_deletion(branch_name).await?;
+
+        let flag = if force { "-D" } else { "-d" };
+        let args = ["branch", flag, "--", branch_name];
+        let result = execute_git_command(&args, Some(&self.git_root)).await;
+        if !result.success {
+            return Err(handle_git_error(&result.stderr, "delete branch"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn validate_branch_deletion(&self, branch_name: &str) -> Result<()> {
         let current = self.current_branch().await;
         let default = self.default_branch().await;
 
@@ -378,12 +408,6 @@ impl GitService {
             )));
         }
 
-        let flag = if force { "-D" } else { "-d" };
-        let args = ["branch", flag, "--", branch_name];
-        let result = execute_git_command(&args, Some(&self.git_root)).await;
-        if !result.success {
-            return Err(handle_git_error(&result.stderr, "delete branch"));
-        }
         Ok(())
     }
 

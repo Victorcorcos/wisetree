@@ -106,6 +106,10 @@ enum AppEvent {
     },
     DeleteLoaded(Result<Vec<GitWorktree>, String>),
     DeleteFinished(Result<ServiceDeleteOutcome, String>),
+    DeleteConfirmationRequired {
+        path: String,
+        branch: String,
+    },
     SetupInstalled(Result<ShellIntegrationStatus, String>),
     ClipboardCopyFinished {
         success_message: String,
@@ -395,7 +399,7 @@ impl App {
                     .delete
                     .as_ref()
                     .filter(|d| matches!(d.step(), DeleteStep::Confirm))
-                    .and_then(|d| d.overlay_modal().cloned());
+                    .and_then(|d| d.overlay_modal());
                 // While the worktree list is still loading for a single-path
                 // delete (Backspace shortcut), the confirm modal isn't built
                 // yet, so overlay_modal is None. Keep the dashboard visible
@@ -798,16 +802,25 @@ impl App {
                     .as_mut()
                     .map(|delete| delete.handle_mouse_click(position))
                     .unwrap_or(DeleteAction::Continue);
+                let delete_unmerged_branch =
+                    matches!(&action, DeleteAction::UnmergedConfirmed { .. });
                 match action {
                     DeleteAction::Continue => {}
                     DeleteAction::Cancelled => {
                         self.cancel_delete_screen(tx);
                     }
-                    DeleteAction::Confirmed { path, force } => {
+                    DeleteAction::Confirmed { path, force }
+                    | DeleteAction::UnmergedConfirmed { path, force } => {
                         if let Some(delete) = self.delete.as_mut() {
                             delete.start_deleting();
                         }
-                        kick_off_delete_worktree(self.git_root.clone(), path, force, tx.clone());
+                        kick_off_delete_worktree(
+                            self.git_root.clone(),
+                            path,
+                            force,
+                            delete_unmerged_branch,
+                            tx.clone(),
+                        );
                     }
                     DeleteAction::BulkConfirmed { items } => {
                         self.bulk_delete_queue = items;
@@ -1283,16 +1296,24 @@ impl App {
             None => return,
         };
 
+        let delete_unmerged_branch = matches!(&action, DeleteAction::UnmergedConfirmed { .. });
         match action {
             DeleteAction::Continue => {}
             DeleteAction::Cancelled => {
                 self.cancel_delete_screen(tx);
             }
-            DeleteAction::Confirmed { path, force } => {
+            DeleteAction::Confirmed { path, force }
+            | DeleteAction::UnmergedConfirmed { path, force } => {
                 if let Some(delete) = self.delete.as_mut() {
                     delete.start_deleting();
                 }
-                kick_off_delete_worktree(self.git_root.clone(), path, force, tx.clone());
+                kick_off_delete_worktree(
+                    self.git_root.clone(),
+                    path,
+                    force,
+                    delete_unmerged_branch,
+                    tx.clone(),
+                );
             }
             DeleteAction::BulkConfirmed { items } => {
                 self.bulk_delete_queue = items;
@@ -1336,7 +1357,7 @@ impl App {
             return;
         }
         let (path, force) = self.bulk_delete_queue.remove(0);
-        kick_off_delete_worktree(self.git_root.clone(), path, force, tx.clone());
+        kick_off_delete_worktree(self.git_root.clone(), path, force, false, tx.clone());
     }
 
     /// Exit the Delete screen back to wherever we came from. When the
@@ -1728,6 +1749,11 @@ impl App {
                         }
                         Err(message) => delete.set_error(message),
                     }
+                }
+            }
+            AppEvent::DeleteConfirmationRequired { path, branch } => {
+                if let Some(delete) = self.delete.as_mut() {
+                    delete.confirm_unmerged_branch(&path, &branch);
                 }
             }
             AppEvent::DeleteFinished(result) => {
@@ -2918,6 +2944,7 @@ fn kick_off_delete_worktree(
     git_root: Option<String>,
     path: String,
     force: bool,
+    delete_unmerged_branch: bool,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
@@ -2927,11 +2954,19 @@ fn kick_off_delete_worktree(
             return;
         }
 
-        let result = service
-            .delete_worktree(&path, force)
+        match service
+            .delete_worktree_with_branch_confirmation(&path, force, delete_unmerged_branch)
             .await
-            .map_err(|e| user_friendly_message(&e));
-        let _ = tx.send(AppEvent::DeleteFinished(result));
+        {
+            Err(crate::errors::WisetreeError::BranchDeletionNeedsConfirmation { branch }) => {
+                let _ = tx.send(AppEvent::DeleteConfirmationRequired { path, branch });
+            }
+            result => {
+                let _ = tx.send(AppEvent::DeleteFinished(
+                    result.map_err(|e| user_friendly_message(&e)),
+                ));
+            }
+        }
     });
 }
 
@@ -4289,6 +4324,212 @@ mod tests {
         assert!(dumped.contains("❌"));
         assert!(dumped.contains("None"));
     }
+    fn git(cwd: &std::path::Path, args: &[&str]) -> String {
+        use std::process::Command;
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git invocation");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed in {cwd:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn deletion_repo(home: &TempDir) -> std::path::PathBuf {
+        let repo = home.path().join("work");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        fs::write(repo.join("seed.txt"), "seed").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        repo
+    }
+
+    #[test]
+    fn unmerged_modal_overlay_buttons_accept_mouse_clicks() {
+        for (label, confirms) in [("Delete", true), ("Cancel", false)] {
+            let mut app = initialized_menu_app();
+            app.screen = Screen::Delete;
+            let mut screen = DeleteScreen::new(true);
+            screen.set_worktrees(vec![GitWorktree {
+                path: "/tmp/repo-feat".into(),
+                branch: "feat".into(),
+                commit: "deadbeef".into(),
+                is_main: false,
+                is_clean: true,
+                branch_status: None,
+            }]);
+            screen.confirm_unmerged_branch("/tmp/repo-feat", "feat");
+            app.delete = Some(screen);
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let position = (0..40)
+                .find_map(|y| {
+                    let line: String = (0..100).map(|x| buffer[(x, y)].symbol()).collect();
+                    if !line.contains("Delete") || !line.contains("Cancel") {
+                        return None;
+                    }
+                    let index = line.find(label)?;
+                    Some(Position::new(line[..index].chars().count() as u16, y))
+                })
+                .expect("visible confirmation buttons");
+            let action = app.delete.as_mut().unwrap().handle_mouse_click(position);
+            if confirms {
+                assert_eq!(
+                    action,
+                    DeleteAction::UnmergedConfirmed {
+                        path: "/tmp/repo-feat".into(),
+                        force: false
+                    }
+                );
+            } else {
+                assert_eq!(action, DeleteAction::Cancelled);
+            }
+        }
+    }
+
+    #[test]
+    fn unmerged_delete_worker_preserves_both_until_the_second_confirmation() {
+        with_home(|home| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let repo = deletion_repo(home).canonicalize().unwrap();
+                git(&repo, &["branch", "-M", "main"]);
+                let checkout = home.path().join("feature");
+                git(
+                    &repo,
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        "feature",
+                        checkout.to_str().unwrap(),
+                    ],
+                );
+                let checkout = checkout.canonicalize().unwrap();
+                fs::write(checkout.join("extra.txt"), "extra commits").unwrap();
+                git(&checkout, &["add", "."]);
+                git(&checkout, &["commit", "-qm", "extra commit"]);
+                let config = local_config_file(&repo);
+                fs::create_dir_all(config.parent().unwrap()).unwrap();
+                fs::write(
+                    config,
+                    r#"{"deleteBranchWithWorktree":true,"worktreeLinkPatterns":[]}"#,
+                )
+                .unwrap();
+
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                kick_off_delete_worktree(
+                    Some(repo.display().to_string()),
+                    checkout.display().to_string(),
+                    false,
+                    false,
+                    tx.clone(),
+                );
+                let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let AppEvent::DeleteConfirmationRequired { path, branch } = event else {
+                    panic!("expected commit confirmation before deleting anything");
+                };
+                assert!(checkout.join("extra.txt").exists());
+                assert!(!git(&repo, &["rev-parse", "refs/heads/feature"]).is_empty());
+
+                let mut screen = DeleteScreen::new(true);
+                screen.set_worktrees(
+                    GitService::new(Some(repo.clone()))
+                        .list_worktrees()
+                        .await
+                        .unwrap(),
+                );
+                screen.confirm_unmerged_branch(&path, &branch);
+                assert_eq!(
+                    screen.handle_key(key(KeyCode::Enter)),
+                    DeleteAction::Cancelled
+                );
+                assert!(checkout.exists());
+                assert!(!git(&repo, &["rev-parse", "refs/heads/feature"]).is_empty());
+
+                screen.confirm_unmerged_branch(&path, &branch);
+                screen.handle_key(key(KeyCode::Left));
+                let DeleteAction::UnmergedConfirmed { path, force } =
+                    screen.handle_key(key(KeyCode::Enter))
+                else {
+                    panic!("expected explicit authorization to discard the commits");
+                };
+                kick_off_delete_worktree(Some(repo.display().to_string()), path, force, true, tx);
+                let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let AppEvent::DeleteFinished(Ok(outcome)) = event else {
+                    panic!("expected worktree and branch deletion after confirmation");
+                };
+                assert!(outcome.worktree_deleted && outcome.branch_deleted);
+                assert!(!checkout.exists());
+                assert!(git(&repo, &["branch", "--list", "feature"]).is_empty());
+            });
+        });
+    }
+
+    #[test]
+    fn unmerged_branch_confirmation_pauses_bulk_and_cancel_stops_the_queue() {
+        with_home(|_| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut app = initialized_menu_app();
+                app.screen = Screen::Delete;
+                let mut delete = DeleteScreen::new(true);
+                delete.set_worktrees(vec![GitWorktree {
+                    path: "/tmp/repo-feat".into(),
+                    branch: "feat".into(),
+                    commit: "deadbeef".into(),
+                    is_main: false,
+                    is_clean: true,
+                    branch_status: None,
+                }]);
+                delete.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into()]);
+                delete.start_deleting();
+                app.delete = Some(delete);
+                app.bulk_delete_queue = vec![("/tmp/next-worktree".into(), false)];
+                app.handle_app_event(
+                    AppEvent::DeleteConfirmationRequired {
+                        path: "/tmp/repo-feat".into(),
+                        branch: "feat".into(),
+                    },
+                    &app_event_tx(),
+                );
+                let screen = app.delete.as_ref().unwrap();
+                assert_eq!(screen.step(), DeleteStep::Confirm);
+                assert_eq!(screen.bulk_progress(), Some((0, 1)));
+                assert_eq!(app.bulk_delete_queue.len(), 1);
+                assert!(app.toast.current().is_none());
+
+                app.handle_delete_key(key(KeyCode::Enter), &app_event_tx());
+                assert_eq!(app.screen, Screen::Dashboard);
+                assert!(app.bulk_delete_queue.is_empty());
+            });
+        });
+    }
+
     #[test]
     fn bulk_delete_esc_from_selection_returns_to_dashboard() {
         with_home(|_| {

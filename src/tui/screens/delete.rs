@@ -22,8 +22,8 @@ use ratatui::Frame;
 
 use crate::git::types::GitWorktree;
 use crate::messages::{
-    colors, DELETE_CONFIRM_TITLE, DELETE_DELETING, DELETE_SUCCESS, DELETE_WARNING,
-    LOADING_WORKTREES,
+    colors, DELETE_CONFIRM_TITLE, DELETE_DELETING, DELETE_SUCCESS, DELETE_UNMERGED_TITLE,
+    DELETE_UNMERGED_WARNING, DELETE_WARNING, LOADING_WORKTREES,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
@@ -56,6 +56,10 @@ pub enum DeleteAction {
         path: String,
         force: bool,
     },
+    UnmergedConfirmed {
+        path: String,
+        force: bool,
+    },
     /// User confirmed a bulk delete from the dashboard's status buttons.
     /// Items are pre-resolved to `(path, force)` so the caller can pipe
     /// them one-at-a-time through `kick_off_delete_worktree`.
@@ -73,6 +77,7 @@ pub struct DeleteScreen {
     loading: bool,
     error: Option<String>,
     confirm: Option<ConfirmationModal>,
+    confirming_unmerged_branch: bool,
     bulk_confirm: Option<BulkConfirmDialog>,
     outcome: Option<DeleteOutcome>,
     /// Paths queued for a bulk delete from the dashboard. Empty for
@@ -99,6 +104,7 @@ impl DeleteScreen {
             loading: true,
             error: None,
             confirm: None,
+            confirming_unmerged_branch: false,
             bulk_confirm: None,
             outcome: None,
             bulk_paths: Vec::new(),
@@ -193,6 +199,7 @@ impl DeleteScreen {
             return;
         }
         self.selected_path = Some(path.to_string());
+        self.confirming_unmerged_branch = false;
         self.confirm = self.build_confirm();
         if self.confirm.is_some() {
             self.step = DeleteStep::Confirm;
@@ -228,6 +235,42 @@ impl DeleteScreen {
 
     pub fn start_deleting(&mut self) {
         self.step = DeleteStep::Deleting;
+    }
+
+    pub fn confirm_unmerged_branch(&mut self, path: &str, branch: &str) {
+        if !self.delete_branch_with_worktree {
+            return;
+        }
+        self.selected_path = Some(path.to_string());
+        self.bulk_confirm = None;
+        self.confirming_unmerged_branch = true;
+        self.loading = false;
+        self.error = None;
+        self.step = DeleteStep::Confirm;
+        self.confirm = Some(
+            ConfirmationModal::new()
+                .with_title(DELETE_UNMERGED_TITLE)
+                .with_subtitle(format!(
+                    "Branch: '{branch}'\nWorktree: '{path}'\n\n{DELETE_UNMERGED_WARNING}"
+                ))
+                .with_confirm_text("Delete")
+                .with_cancel_text("Cancel")
+                .with_color_value(colors::ERROR)
+                .with_selected(ConfirmationChoice::Cancel),
+        );
+    }
+
+    fn confirmed_action(&self) -> DeleteAction {
+        let Some(wt) = self.selected() else {
+            return DeleteAction::Cancelled;
+        };
+        let path = wt.path.clone();
+        let force = !wt.is_clean;
+        if self.confirming_unmerged_branch {
+            DeleteAction::UnmergedConfirmed { path, force }
+        } else {
+            DeleteAction::Confirmed { path, force }
+        }
     }
 
     pub fn mark_complete(&mut self, outcome: DeleteOutcome) {
@@ -455,15 +498,7 @@ impl DeleteScreen {
                 .as_mut()
                 .map(|d| d.handle_mouse_click(position))
             {
-                Some(ConfirmationOutcome::Confirmed) => {
-                    let wt = match self.selected() {
-                        Some(w) => w,
-                        None => return DeleteAction::Cancelled,
-                    };
-                    let force = !wt.is_clean;
-                    let path = wt.path.clone();
-                    DeleteAction::Confirmed { path, force }
-                }
+                Some(ConfirmationOutcome::Confirmed) => self.confirmed_action(),
                 Some(ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled) => {
                     self.confirm = None;
                     DeleteAction::Cancelled
@@ -486,15 +521,7 @@ impl DeleteScreen {
             dialog.handle_key(key)
         };
         match outcome {
-            ConfirmationOutcome::Confirmed => {
-                let wt = match self.selected() {
-                    Some(w) => w,
-                    None => return DeleteAction::Cancelled,
-                };
-                let force = !wt.is_clean;
-                let path = wt.path.clone();
-                DeleteAction::Confirmed { path, force }
-            }
+            ConfirmationOutcome::Confirmed => self.confirmed_action(),
             ConfirmationOutcome::Declined | ConfirmationOutcome::Cancelled => {
                 self.confirm = None;
                 DeleteAction::Cancelled

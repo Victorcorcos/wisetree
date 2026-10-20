@@ -32,6 +32,8 @@ pub const CREATE_CREATING: &str = "Creating worktree...";
 // Delete flow
 pub const DELETE_CONFIRM_TITLE: &str = "Delete Worktree Confirmation";
 pub const DELETE_WARNING: &str = "This action cannot be undone.";
+pub const DELETE_UNMERGED_TITLE: &str = "Delete Worktree and Unmerged Branch?";
+pub const DELETE_UNMERGED_WARNING: &str = "There may be extra commits that have not been merged, or the merge could not be verified.\nDeleting will permanently remove this worktree and its branch, including these commits.\nDo you really want to delete both?";
 pub const DELETE_SUCCESS: &str = "Worktree deleted successfully!";
 pub const DELETE_DELETING: &str = "Deleting worktree...";
 

@@ -59,6 +59,8 @@ impl GitErrorCode {
 /// IO errors are wrapped on the way out.
 #[derive(Debug, Error)]
 pub enum WisetreeError {
+    #[error("Branch '{branch}' has commits that are not confirmed as merged. Explicit confirmation is required before deleting its worktree and branch.")]
+    BranchDeletionNeedsConfirmation { branch: String },
     #[error("{message}")]
     Git {
         message: String,
@@ -199,6 +201,7 @@ pub fn handle_git_error(stderr: &str, operation: &str) -> WisetreeError {
 /// Translate an internal error into the friendlier wording the UI shows.
 pub fn user_friendly_message(error: &WisetreeError) -> String {
     match error {
+        WisetreeError::BranchDeletionNeedsConfirmation { .. } => error.to_string(),
         WisetreeError::Git { code, message, .. } => code.user_message(message),
 
         WisetreeError::Validation { message, .. } => format!("Validation error: {message}"),

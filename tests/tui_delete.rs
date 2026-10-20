@@ -96,6 +96,82 @@ fn esc_in_confirm_cancels() {
 }
 
 #[test]
+fn unmerged_confirmation_defaults_to_cancel_and_explains_commit_loss() {
+    let mut screen = DeleteScreen::new(true);
+    screen.set_worktrees(worktrees());
+    screen.start_deleting();
+    screen.confirm_unmerged_branch("/tmp/repo-feat", "feat");
+
+    assert_eq!(screen.step(), DeleteStep::Confirm);
+    assert_eq!(
+        screen.overlay_modal().unwrap().selected(),
+        wisetree::tui::widgets::ConfirmationChoice::Cancel
+    );
+    let rendered = dump(90, 30, |f| screen.render(f, f.area()));
+    assert!(rendered.contains("extra commits"));
+    assert!(rendered.contains("Delete"));
+    assert!(rendered.contains("Cancel"));
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        DeleteAction::Cancelled
+    );
+}
+
+#[test]
+fn unmerged_confirmation_requires_explicit_delete_and_can_escape() {
+    for dirty in [false, true] {
+        let mut screen = DeleteScreen::new(true);
+        screen.set_worktrees(vec![wt("/tmp/repo-feat", "feat", false, !dirty)]);
+        screen.confirm_unmerged_branch("/tmp/repo-feat", "feat");
+        screen.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Enter)),
+            DeleteAction::UnmergedConfirmed {
+                path: "/tmp/repo-feat".into(),
+                force: dirty
+            }
+        );
+        screen.confirm_unmerged_branch("/tmp/repo-feat", "feat");
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Esc)),
+            DeleteAction::Cancelled
+        );
+    }
+}
+
+#[test]
+fn unmerged_confirmation_pauses_bulk_run_without_counting_a_deletion() {
+    let mut screen = DeleteScreen::new(true);
+    screen.set_worktrees(worktrees());
+    screen.jump_to_bulk_confirm(vec!["/tmp/repo-feat".into(), "/tmp/repo-bug".into()]);
+    screen.start_deleting();
+    screen.confirm_unmerged_branch("/tmp/repo-feat", "feat");
+    assert!(screen.is_bulk());
+    assert_eq!(screen.bulk_progress(), Some((0, 2)));
+    assert!(screen.overlay_modal().is_some());
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        DeleteAction::Cancelled
+    );
+}
+
+#[test]
+fn unmerged_confirmation_is_disabled_when_branch_deletion_is_disabled() {
+    let mut screen = DeleteScreen::new(false);
+    screen.set_worktrees(worktrees());
+    screen.jump_to_confirm_path("/tmp/repo-feat");
+    screen.confirm_unmerged_branch("/tmp/repo-feat", "feat");
+    screen.handle_key(key(KeyCode::Left));
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        DeleteAction::Confirmed {
+            path: "/tmp/repo-feat".into(),
+            force: false
+        }
+    );
+}
+
+#[test]
 fn confirm_yes_emits_confirmed_with_force_false_for_clean() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());

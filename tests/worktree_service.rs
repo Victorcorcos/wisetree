@@ -421,6 +421,10 @@ fn delete_worktree_removes_path_and_skips_branch_when_disabled() {
                 .expect("create");
             let path = outcome.worktree_path.to_string_lossy().into_owned();
 
+            fs::write(outcome.worktree_path.join("extra.txt"), "unmerged work").unwrap();
+            git(&outcome.worktree_path, &["add", "extra.txt"]);
+            git(&outcome.worktree_path, &["commit", "-m", "unmerged work"]);
+
             let result = svc
                 .delete_worktree(&path, false)
                 .await
@@ -460,6 +464,13 @@ fn delete_worktree_with_branch_deletion_when_enabled() {
                 .create_worktree(&opts, None, None)
                 .await
                 .expect("create");
+            fs::write(outcome.worktree_path.join("merged.txt"), "merged work").unwrap();
+            git(&outcome.worktree_path, &["add", "merged.txt"]);
+            git(&outcome.worktree_path, &["commit", "-qm", "feature work"]);
+            git(
+                &fx.repo,
+                &["merge", "--no-ff", "-m", "merge feature", "feat-e"],
+            );
             let path = outcome.worktree_path.to_string_lossy().into_owned();
 
             let result = svc
@@ -477,7 +488,7 @@ fn delete_worktree_with_branch_deletion_when_enabled() {
 }
 
 #[test]
-fn delete_worktree_keeps_unmerged_branch_and_returns_warning() {
+fn delete_worktree_preserves_unmerged_work_until_explicitly_confirmed() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
@@ -509,19 +520,63 @@ fn delete_worktree_keeps_unmerged_branch_and_returns_warning() {
             );
 
             let path = outcome.worktree_path.to_string_lossy().into_owned();
-            let result = svc
+            // A pushed branch is not necessarily merged into the base.
+            git(
+                &fx.repo,
+                &["remote", "add", "origin", fx.repo.to_str().unwrap()],
+            );
+            git(
+                &fx.repo,
+                &[
+                    "update-ref",
+                    "refs/remotes/origin/feat-unmerged",
+                    "feat-unmerged",
+                ],
+            );
+            git(
+                &fx.repo,
+                &[
+                    "branch",
+                    "--set-upstream-to=origin/feat-unmerged",
+                    "feat-unmerged",
+                ],
+            );
+            let err = svc
                 .delete_worktree(&path, false)
                 .await
-                .expect("delete worktree");
+                .expect_err("must confirm unmerged commits first");
+            assert!(matches!(
+                err,
+                wisetree::errors::WisetreeError::BranchDeletionNeedsConfirmation { .. }
+            ));
+            assert!(outcome.worktree_path.join("feature.txt").exists());
+            assert!(svc.git_service().branch_exists("feat-unmerged").await);
+            assert!(svc.git_service().worktree_exists(&path).await.unwrap());
+
+            // Confirming dirty-file removal does not authorize losing commits.
+            fs::write(outcome.worktree_path.join("scratch.txt"), "unsaved work").unwrap();
+            let err = svc
+                .delete_worktree_with_branch_confirmation(&path, true, false)
+                .await
+                .expect_err("must confirm commits independently");
+            assert!(matches!(
+                err,
+                wisetree::errors::WisetreeError::BranchDeletionNeedsConfirmation { .. }
+            ));
+            assert!(outcome.worktree_path.join("scratch.txt").exists());
+            assert!(svc.git_service().branch_exists("feat-unmerged").await);
+
+            let result = svc
+                .delete_worktree_with_branch_confirmation(&path, true, true)
+                .await
+                .expect("explicitly confirmed deletion");
 
             assert!(result.worktree_deleted);
-            assert!(!result.branch_deleted);
+            assert!(result.branch_deleted);
             assert_eq!(result.branch_name.as_deref(), Some("feat-unmerged"));
-            assert!(result
-                .branch_delete_error
-                .as_deref()
-                .is_some_and(|message| message.contains("not fully merged")));
-            assert!(svc.git_service().branch_exists("feat-unmerged").await);
+            assert!(result.branch_delete_error.is_none());
+            assert!(!outcome.worktree_path.exists());
+            assert!(!svc.git_service().branch_exists("feat-unmerged").await);
         };
         tokio::runtime::Runtime::new().unwrap().block_on(body);
     });

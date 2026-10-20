@@ -282,7 +282,8 @@ Press **Enter** on a row to open its action menu. **General Commands** is a sear
 Every deletion requires confirmation.
 
 - A **dirty** worktree has uncommitted changes. Its dialog is red and the button reads **Force Delete**. Its changes are discarded.
-- When [`deleteBranchWithWorktree`](#configuration-keys) is `true`, the dialog warns that the branch will be deleted too. A clean worktree's branch is deleted with `git branch -d`, so a branch with unmerged commits is **kept**, and Wisetree tells you why. A force-deleted worktree's branch is deleted with `git branch -D`.
+- When [`deleteBranchWithWorktree`](#configuration-keys) is `true`, Wisetree verifies the branch's merge status before changing the worktree or branch. Squash and rebase merges are verified through `gh` against merged PRs in the configured GitHub remotes, requiring an exact match with the local branch tip.
+- If there are extra commits or the merge cannot be verified, a second confirmation offers **Delete** and **Cancel**, with **Cancel** selected. **Delete** removes both the worktree and its branch; **Cancel** preserves both and stops any remaining bulk deletions. Confirming dirty-file removal does not bypass this commit confirmation. This extra confirmation only applies when `deleteBranchWithWorktree` is enabled.
 - Shared-cache symlinks are removed before the worktree, so cached dependencies are never deleted through a link.
 - If Git reports the worktree as corrupted, Wisetree removes the directory and runs `git worktree prune`.
 
@@ -638,7 +639,7 @@ Also make sure that `gh auth status` succeeds.
 - **The main worktree cannot be deleted.** Its row is labeled *Mother*, it has no delete action, and bulk delete never includes it.
 - **Destructive actions always ask first.** This covers single deletes, bulk deletes, closing a PR, merging a PR (default **No**), deleting a cache entry, and `cache clear` (requires `--force`).
 - **Dirty worktrees are flagged.** Deleting one is shown in red as a *Force Delete*.
-- **Unmerged branches are kept.** Unless the deletion was forced, a branch is deleted with `git branch -d`, which refuses to delete a branch with unmerged commits.
+- **Unverified commits require explicit confirmation.** With `deleteBranchWithWorktree` enabled, neither the worktree nor its branch is removed until their commits are verified as merged or you explicitly choose **Delete** in the extra confirmation. **Cancel** is selected by default.
 - **Unpushed commits are not lost on merge.** You are offered **Push & merge** before squash-merging.
 - **Input is validated.** Directory names, branch names, and refs are validated, and shell metacharacters are rejected. Template values are shell-quoted.
 - **Only web URLs are opened.** The browser opener accepts only `http` and `https` URLs.

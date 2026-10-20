@@ -21,6 +21,8 @@ use crate::utils::path::{
     get_worktree_path, repository_base_name, resolve_template, TemplateVariables,
 };
 
+use super::merged_branch::branch_is_merged;
+
 /// Result of `WorktreeService::create_worktree`. Carries the side-effect
 /// reports so callers (TUI / CLI / wrapper) can display them verbatim.
 #[derive(Debug, Default, Clone)]
@@ -252,6 +254,18 @@ impl WorktreeService {
     /// Delete a worktree, optionally its branch. Falls back to manual cleanup
     /// when git reports the worktree as corrupted.
     pub async fn delete_worktree(&self, worktree_path: &str, force: bool) -> Result<DeleteOutcome> {
+        self.delete_worktree_with_branch_confirmation(worktree_path, force, force)
+            .await
+    }
+
+    /// Keep permission to discard dirty files separate from permission to
+    /// discard commits: the TUI confirms these two risks independently.
+    pub async fn delete_worktree_with_branch_confirmation(
+        &self,
+        worktree_path: &str,
+        force: bool,
+        delete_unmerged_branch: bool,
+    ) -> Result<DeleteOutcome> {
         let config = self.config_service.config().clone();
         let mut branch_name: Option<String> = None;
         // Path of the main worktree, captured before deletion. Used as the git
@@ -280,6 +294,25 @@ impl WorktreeService {
                 return Err(WisetreeError::validation(
                     "Worktree has uncommitted changes. Use force to delete anyway.",
                 ));
+            }
+        }
+
+        let branch_git = GitService::new(main_worktree_path.or_else(|| self.git_root.clone()));
+        if let Some(name) = &branch_name {
+            branch_git.validate_branch_deletion(name).await?;
+            let head = branch_git
+                .resolve_at(branch_git.git_root(), &format!("refs/heads/{name}"))
+                .await?;
+            if !delete_unmerged_branch
+                && (!branch_is_merged(&branch_git, name, &head).await
+                    || branch_git
+                        .resolve_at(branch_git.git_root(), &format!("refs/heads/{name}"))
+                        .await?
+                        != head)
+            {
+                return Err(WisetreeError::BranchDeletionNeedsConfirmation {
+                    branch: name.clone(),
+                });
             }
         }
 
@@ -328,12 +361,9 @@ impl WorktreeService {
         let mut branch_deleted = false;
         let mut branch_delete_error = None;
         if let Some(name) = &branch_name {
-            let branch_git = GitService::new(main_worktree_path.or_else(|| self.git_root.clone()));
-            // `force` carries the user's explicit "delete it anyway" through to
-            // the branch: an ordinary delete uses `git branch -d`, so a branch
-            // holding unmerged commits is kept and reported instead of being
-            // destroyed along with the worktree.
-            match branch_git.delete_branch(name, force).await {
+            // Merge verification or explicit consent happened before any
+            // filesystem/cache changes, including squash/rebase merges.
+            match branch_git.delete_branch(name, true).await {
                 Ok(()) => branch_deleted = true,
                 Err(e) => {
                     branch_delete_error = Some(format!("Branch '{name}' was kept.\n{e}"));
