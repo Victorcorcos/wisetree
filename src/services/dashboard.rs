@@ -826,7 +826,7 @@ impl DashboardService {
 
     /// Base branch and repository of the PR cached for `branch`, so its row is
     /// measured against the PR's own base (see
-    /// [`resolve_pr_base_ref_with_binary`]).
+    /// [`resolve_pr_base_ref_from_source`]).
     fn cached_pr_base(&self, branch: &str) -> Option<PrBase> {
         let state = self.pr_state.lock().expect("pr_state poisoned");
         let pr = state.entries.get(branch)?.pull_request.as_ref()?;
@@ -904,17 +904,20 @@ impl DashboardService {
     /// `git diff --shortstat --merge-base <upstream>` so the "Diff" column
     /// renders the branch's own line-level changes (committed or not) since it
     /// was cut — never the inverse of commits the base gained in the meantime.
-    /// Returns `None` when no base ref is reachable.
+    /// The ref the branch was cut from rides along as `source_branch` (the
+    /// "From" column). Returns `None` when no base ref is reachable.
     async fn fetch_upstream_diff(
         &self,
         cwd: &Path,
         pr_base: Option<&PrBase>,
     ) -> Option<BranchStatus> {
-        let upstream = resolve_pr_base_ref_with_binary(
+        let source = branch_source_ref(&self.git_binary, cwd).await;
+        let upstream = resolve_pr_base_ref_from_source(
             &self.git_binary,
             cwd,
             pr_base.map(|base| base.name.as_str()),
             pr_base.and_then(|base| base.repository.as_deref()),
+            source.as_deref(),
         )
         .await?;
         let spec = format!("{upstream}...HEAD");
@@ -963,6 +966,7 @@ impl DashboardService {
             ahead,
             behind,
             upstream_branch: Some(upstream),
+            source_branch: source,
             insertions,
             deletions,
         })
@@ -2176,11 +2180,21 @@ pub(crate) async fn resolve_base_ref_with_binary(
     pr_base_ref: Option<&str>,
 ) -> Option<String> {
     let source = branch_source_ref(git_binary, cwd).await;
+    resolve_base_ref_from_source(git_binary, cwd, pr_base_ref, source.as_deref()).await
+}
 
+/// [`resolve_base_ref`] for a branch whose source ref ([`branch_source_ref`])
+/// is already known.
+async fn resolve_base_ref_from_source(
+    git_binary: &Path,
+    cwd: &Path,
+    pr_base_ref: Option<&str>,
+    source: Option<&str>,
+) -> Option<String> {
     // 1. Prefer GitHub's known base branch for the PR, mapped to whichever
     //    remote-tracking ref we actually have locally.
     if let Some(name) = pr_base_ref.map(str::trim).filter(|n| !n.is_empty()) {
-        let source_remote = source.as_deref().and_then(remote_name_from_ref);
+        let source_remote = source.and_then(remote_name_from_ref);
         for remote in base_remotes(source_remote) {
             let candidate = format!("{remote}/{name}");
             if ref_is_reachable(git_binary, cwd, &candidate).await {
@@ -2190,8 +2204,8 @@ pub(crate) async fn resolve_base_ref_with_binary(
     }
 
     // 2. The ref the branch was cut from.
-    if source.is_some() {
-        return source;
+    if let Some(source) = source {
+        return Some(source.to_string());
     }
 
     // 3. Fall back to the conventional priority list.
@@ -2380,12 +2394,14 @@ async fn reflog_source_ref(git_binary: &Path, cwd: &Path, branch: &str) -> Optio
 /// e.g. `kaefer-cit/dpms-api-norway` → `kaefer/main`), so it never lands on a
 /// same-named branch of an unrelated remote even when the worktree's own
 /// source is unknown (a `gh pr checkout`, an expired reflog). Falls back to
-/// [`resolve_base_ref`].
-pub(crate) async fn resolve_pr_base_ref_with_binary(
+/// [`resolve_base_ref`] from `source`, the ref the branch was cut from
+/// ([`branch_source_ref`]).
+async fn resolve_pr_base_ref_from_source(
     git_binary: &Path,
     cwd: &Path,
     pr_base_ref: Option<&str>,
     pr_repository: Option<&str>,
+    source: Option<&str>,
 ) -> Option<String> {
     let name = pr_base_ref.map(str::trim).filter(|name| !name.is_empty());
     if let (Some(name), Some(repository)) = (name, pr_repository) {
@@ -2395,7 +2411,7 @@ pub(crate) async fn resolve_pr_base_ref_with_binary(
             return Some(base_ref);
         }
     }
-    resolve_base_ref_with_binary(git_binary, cwd, pr_base_ref).await
+    resolve_base_ref_from_source(git_binary, cwd, pr_base_ref, source).await
 }
 
 /// Resolve a branch only through a remote that points at the repository which

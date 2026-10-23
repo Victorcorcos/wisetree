@@ -278,6 +278,7 @@ fn confirm_dialog_shows_branch_status_when_will_delete_branch() {
         ahead: 2,
         behind: 1,
         upstream_branch: Some("origin/feat-x".into()),
+        source_branch: None,
         insertions: None,
         deletions: None,
     });

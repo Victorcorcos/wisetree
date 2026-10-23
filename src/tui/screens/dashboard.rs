@@ -175,6 +175,7 @@ pub enum DashboardAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardColumn {
     Branch,
+    From,
     Status,
 
     AheadBehind,
@@ -1142,6 +1143,10 @@ impl DashboardScreen {
         // Ahead/Behind column text — match the rendered "+N -N" / "=0" form
         // and also raw "ahead N", "behind N" so either spelling filters.
         if let Some(branch_status) = &row.worktree.branch_status {
+            // From column text.
+            if let Some(source) = &branch_status.source_branch {
+                haystacks.push(source.to_ascii_lowercase());
+            }
             if branch_status.ahead == 0 && branch_status.behind == 0 {
                 haystacks.push("=0".into());
             } else {
@@ -2084,19 +2089,34 @@ impl DashboardScreen {
                 pr.state.style().add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(": ", muted));
-            spans.push(Span::styled(
-                truncate(
-                    &pr.title,
-                    if width >= 100 {
-                        52
-                    } else if width >= 80 {
-                        34
-                    } else {
-                        18
-                    },
-                ),
-                emphasis,
-            ));
+            let base_mismatch: Vec<Span<'static>> = pr_base_mismatch(row)
+                .map(|(base, source)| {
+                    let warning = Style::default().fg(colors::WARNING);
+                    let bold = warning.add_modifier(Modifier::BOLD);
+                    vec![
+                        Span::styled("  •  ", muted),
+                        Span::styled("PR compares against ", warning),
+                        Span::styled(base.to_string(), bold),
+                        Span::styled(" ≠ Branch created from ", warning),
+                        Span::styled(source.to_string(), bold),
+                    ]
+                })
+                .unwrap_or_default();
+            let mut title_budget = if width >= 100 {
+                52
+            } else if width >= 80 {
+                34
+            } else {
+                18
+            };
+            if !base_mismatch.is_empty() {
+                // The title gives way so the mismatch after it stays on
+                // screen; `truncate`'s "..." runs 2 chars past its budget.
+                let used: usize = spans.iter().chain(&base_mismatch).map(Span::width).sum();
+                title_budget = title_budget.min(usize::from(width).saturating_sub(used + 2));
+            }
+            spans.push(Span::styled(truncate(&pr.title, title_budget), emphasis));
+            spans.extend(base_mismatch);
         }
 
         for column in &layout.hidden_columns {
@@ -2117,6 +2137,7 @@ impl DashboardScreen {
                 }
                 DashboardColumn::PullRequest => {}
                 DashboardColumn::Branch
+                | DashboardColumn::From
                 | DashboardColumn::Status
                 | DashboardColumn::AheadBehind
                 | DashboardColumn::Diff => {}
@@ -2181,6 +2202,7 @@ impl DashboardColumn {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "branch" => Some(Self::Branch),
+            "from" => Some(Self::From),
             "status" => Some(Self::Status),
 
             "ahead_behind" => Some(Self::AheadBehind),
@@ -2194,6 +2216,7 @@ impl DashboardColumn {
     fn title(self, compact: bool) -> &'static str {
         match self {
             Self::Branch => "Branch",
+            Self::From => "From",
             Self::Status => "Status",
 
             Self::AheadBehind => {
@@ -2222,6 +2245,14 @@ impl DashboardColumn {
                     12
                 } else {
                     18
+                }
+            }
+            // Fits refs like `kaefer/release-v1.37` uncut.
+            Self::From => {
+                if compact {
+                    14
+                } else {
+                    20
                 }
             }
             Self::Status => {
@@ -2275,6 +2306,30 @@ impl DashboardColumn {
                 &row.worktree.branch,
                 width as usize,
             )))),
+            Self::From => match row
+                .worktree
+                .branch_status
+                .as_ref()
+                .and_then(|status| status.source_branch.as_deref())
+            {
+                // Yellow flags a PR that targets another base; the footer
+                // names it when the row is selected.
+                Some(source) => {
+                    let style = if pr_base_mismatch(row).is_some() {
+                        Style::default().fg(colors::WARNING)
+                    } else {
+                        Style::default()
+                    };
+                    Cell::from(Line::from(Span::styled(
+                        truncate(source, width as usize),
+                        style,
+                    )))
+                }
+                None => Cell::from(Line::from(Span::styled(
+                    "-",
+                    Style::default().fg(colors::MUTED),
+                ))),
+            },
             Self::Status => {
                 let (text, style) = status_label_and_style(row);
                 let mut spans: Vec<Span<'static>> = vec![Span::styled(text, style)];
@@ -2453,6 +2508,17 @@ fn build_close_pr_modal() -> ConfirmationModal {
         .with_cancel_text("Cancel")
         .with_color("#e05a4e")
         .with_selected(ConfirmationChoice::Cancel)
+}
+
+/// `(PR base, From)` when the row's PR targets a branch other than the one
+/// it was cut from. A row with a PR is measured against the PR's base, so
+/// the two refs differ exactly then.
+fn pr_base_mismatch(row: &DashboardRow) -> Option<(&str, &str)> {
+    row.pull_request.as_ref()?;
+    let status = row.worktree.branch_status.as_ref()?;
+    let base = status.upstream_branch.as_deref()?;
+    let source = status.source_branch.as_deref()?;
+    (base != source).then_some((base, source))
 }
 
 fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {

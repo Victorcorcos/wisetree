@@ -42,6 +42,7 @@ pub fn default_refresh_ms() -> u64 {
 pub fn default_columns() -> Vec<String> {
     vec![
         "branch".to_string(),
+        "from".to_string(),
         "status".to_string(),
         "ahead_behind".to_string(),
         "last_commit".to_string(),
@@ -64,7 +65,7 @@ pub fn normalize_dashboard_columns(columns: &[String]) -> (Vec<String>, Vec<Stri
         let normalized = column.trim().to_ascii_lowercase();
         let known = matches!(
             normalized.as_str(),
-            "branch" | "status" | "ahead_behind" | "diff" | "last_commit" | "pull_request"
+            "branch" | "from" | "status" | "ahead_behind" | "diff" | "last_commit" | "pull_request"
         );
 
         if !known {

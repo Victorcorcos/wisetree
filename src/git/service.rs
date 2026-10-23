@@ -438,6 +438,7 @@ impl GitService {
                     ahead,
                     behind,
                     upstream_branch: Some(compare),
+                    source_branch: None,
                     insertions: None,
                     deletions: None,
                 });
@@ -499,6 +500,7 @@ async fn compute_branch_status(
                 ahead,
                 behind,
                 upstream_branch: Some(compare.to_string()),
+                source_branch: None,
                 insertions: None,
                 deletions: None,
             });

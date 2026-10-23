@@ -949,7 +949,7 @@ impl DashboardField {
             DashboardField::ShowPullRequests => "Press Enter to toggle",
 
             DashboardField::Columns => {
-                "Comma-separated: branch, status, ahead_behind, diff, last_commit, pull_request"
+                "Comma-separated: branch, from, status, ahead_behind, diff, last_commit, pull_request"
             }
         }
     }
@@ -4335,7 +4335,9 @@ fn build_dashboard_input(field: DashboardField, value: &str) -> InputPrompt {
         DashboardField::RefreshIntervalMs => "Refresh interval in ms (5000..60000)",
         DashboardField::ShowPullRequests => "true or false",
 
-        DashboardField::Columns => "branch, status, ahead_behind, diff, last_commit, pull_request",
+        DashboardField::Columns => {
+            "branch, from, status, ahead_behind, diff, last_commit, pull_request"
+        }
     };
     InputPrompt::new("")
         .with_placeholder(placeholder)

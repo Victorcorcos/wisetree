@@ -279,6 +279,103 @@ async fn snapshot_compares_and_finds_pr_on_the_third_remote_a_branch_was_cut_fro
     assert_eq!(pr.state, PrState::Open);
 }
 
+/// The "From" column keeps naming the branch a worktree was cut from after a
+/// push with `-u` re-points its tracking to a fork, and once its PR is known to
+/// target another base the row is measured against that base while From stays.
+#[tokio::test]
+async fn snapshot_keeps_the_cut_from_branch_beside_a_differing_pr_base() {
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let repo = parent.path().join("repo");
+    let worktree = parent.path().join("repo-kaefer");
+    fs::create_dir_all(&repo).unwrap();
+    init_repo_with_main(&repo);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    for (remote, url) in [
+        ("upstream", "git@github.com:canonical/repo.git"),
+        ("kaefer", "git@github.com:kaefer/repo.git"),
+        ("kaefer-fork", "git@github.com:me/kaefer-repo.git"),
+    ] {
+        git(&repo, &["remote", "add", remote, url]);
+    }
+    git(&repo, &["update-ref", "refs/remotes/kaefer/main", "HEAD"]);
+    git(
+        &repo,
+        &["update-ref", "refs/remotes/kaefer/release-v1.37", "HEAD"],
+    );
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "kaefer-feature",
+            worktree.to_str().unwrap(),
+            "kaefer/main",
+        ],
+    );
+    git(
+        &worktree,
+        &[
+            "update-ref",
+            "refs/remotes/kaefer-fork/kaefer-feature",
+            "HEAD",
+        ],
+    );
+    git(
+        &worktree,
+        &["branch", "-q", "-u", "kaefer-fork/kaefer-feature"],
+    );
+
+    let log_path = parent.path().join("gh.log");
+    let gh_path = parent.path().join("fake-gh.sh");
+    fs::write(
+        &gh_path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "--version" ]; then
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  case "$*" in
+    *'owner: "kaefer"'*) printf '%s' '{{"data":{{"repository":{{"b0":{{"nodes":[{{"number":402,"state":"OPEN","url":"u","title":"t","isDraft":false,"baseRefName":"release-v1.37","baseRepository":{{"nameWithOwner":"kaefer/repo"}}}}]}}}}}}}}' ;;
+    *) printf '%s' '{{"data":{{"repository":{{}}}}}}' ;;
+  esac
+  exit 0
+fi
+printf '[]'
+"#,
+            log = log_path.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&gh_path);
+    let service = DashboardService::new(repo.clone(), config_with_prs())
+        .with_gh_binary(gh_path)
+        .with_cache_path(Some(parent.path().join("dashboard_pr_cache.json")));
+    let feature_status = |rows: &[wisetree::services::DashboardRow]| {
+        rows.iter()
+            .find(|row| row.worktree.branch == "kaefer-feature")
+            .and_then(|row| row.worktree.branch_status.clone())
+            .expect("kaefer-feature row is measured")
+    };
+
+    // The first refresh measures the row before its PR is known.
+    let status = feature_status(&service.snapshot().await.expect("snapshot"));
+    assert_eq!(status.source_branch.as_deref(), Some("kaefer/main"));
+    assert_eq!(status.upstream_branch.as_deref(), Some("kaefer/main"));
+
+    let status = feature_status(&service.snapshot().await.expect("snapshot"));
+    assert_eq!(status.source_branch.as_deref(), Some("kaefer/main"));
+    assert_eq!(
+        status.upstream_branch.as_deref(),
+        Some("kaefer/release-v1.37")
+    );
+}
+
 /// A branch behind its base shows only its own changes in the Diff column —
 /// not the inverse of the commits the base gained after the branch was cut.
 #[tokio::test]
