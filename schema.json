@@ -9,6 +9,7 @@
       "default": {
         "columns": [
           "branch",
+          "from",
           "status",
           "ahead_behind",
           "last_commit"
@@ -103,6 +104,7 @@
         "columns": {
           "default": [
             "branch",
+            "from",
             "status",
             "ahead_behind",
             "last_commit"

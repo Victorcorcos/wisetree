@@ -376,3 +376,21 @@ fn published_schema_contains_only_basic_config_keys() {
         BASIC_DASHBOARD_KEYS,
     );
 }
+
+#[test]
+fn from_column_loads_from_config() {
+    with_home(|_home| {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let raw = r#"{
+  "dashboard": {
+    "columns": ["branch", "from", "status"]
+  }
+}"#;
+        fs::write(project_config(project.path()), raw).unwrap();
+
+        let mut service = ConfigService::new();
+        let config = service.load(Some(project.path())).expect("load");
+        assert_eq!(config.dashboard.columns, vec!["branch", "from", "status"]);
+        assert!(service.warnings().is_empty());
+    });
+}

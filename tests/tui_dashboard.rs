@@ -68,6 +68,7 @@ fn row(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
                 ahead: if branch == "bug" { 1 } else { 0 },
                 behind: 0,
                 upstream_branch: Some("origin/main".into()),
+                source_branch: None,
                 insertions: None,
                 deletions: None,
             }),
@@ -1007,6 +1008,187 @@ fn wide_render_snapshot_includes_pr_footer_detail() {
         "dashboard_wide_pr_footer",
         dump_lines(110, 20, |f| screen.render(f, f.area()))
     );
+}
+
+/// `row` cut from `source` and measured against `base` — the PR's base once
+/// its PR is cached, else `source` itself.
+fn cut_from(mut row: DashboardRow, source: &str, base: &str) -> DashboardRow {
+    let status = row.worktree.branch_status.as_mut().expect("branch status");
+    status.source_branch = Some(source.into());
+    status.upstream_branch = Some(base.into());
+    row
+}
+
+fn from_screen(rows: Vec<DashboardRow>) -> DashboardScreen {
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "from".into(), "status".into()],
+        Vec::new(),
+        false,
+    );
+    screen.set_rows(rows);
+    screen
+}
+
+/// The From cell's foreground on the line showing `worktree`.
+fn from_cell_fg(
+    buffer: &ratatui::buffer::Buffer,
+    worktree: &str,
+    from: &str,
+) -> ratatui::style::Color {
+    let line = |y| {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
+    };
+    let y = (0..buffer.area.height)
+        .find(|y| line(*y).contains(worktree))
+        .expect("worktree row");
+    let x = (0..buffer.area.width)
+        .find(|x| {
+            line(y)
+                .chars()
+                .skip(usize::from(*x))
+                .collect::<String>()
+                .starts_with(from)
+        })
+        .expect("From cell");
+    buffer[(x, y)].fg
+}
+
+#[test]
+fn from_column_shows_the_branch_each_worktree_was_cut_from() {
+    let mut screen = from_screen(vec![
+        row("/tmp/repo", "main", true),
+        cut_from(
+            row("/tmp/repo-api", "api", true),
+            "upstream/main",
+            "upstream/main",
+        ),
+        cut_from(
+            row("/tmp/repo-v137", "v137", true),
+            "kaefer/release-v1.37",
+            "kaefer/release-v1.37",
+        ),
+    ]);
+
+    let dumped = dump_lines(120, 14, |f| screen.render(f, f.area()));
+    let lines: Vec<&str> = dumped.lines().collect();
+    let header = lines
+        .iter()
+        .find(|line| line.contains("Worktree"))
+        .expect("header");
+    let column = |title: &str| header.find(title).expect(title);
+    assert!(
+        column("Branch") < column("From") && column("From") < column("Status"),
+        "From sits between Branch and Status: {header}"
+    );
+    let cell = |worktree: &str| {
+        let line = lines
+            .iter()
+            .find(|line| line.ends_with(worktree) || line.contains(&format!("{worktree} ")))
+            .expect(worktree);
+        line.chars().skip(column("From")).collect::<String>()
+    };
+    assert!(cell("repo-api").starts_with("upstream/main"));
+    assert!(cell("repo-v137").starts_with("kaefer/release-v1.37"));
+    // The main checkout was not cut from any branch.
+    assert!(cell("repo").starts_with("- "));
+}
+
+#[test]
+fn pr_targeting_another_base_than_its_from_branch_is_flagged() {
+    let mut screen = from_screen(vec![
+        row("/tmp/repo", "main", true),
+        cut_from(
+            row_with_pr("/tmp/repo-bug", "bug", false),
+            "kaefer/main",
+            "kaefer/release-v1.37",
+        ),
+    ]);
+    screen.handle_key(key(KeyCode::Down));
+
+    let backend = TestBackend::new(110, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let dumped: String = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+
+    // The PR title gives way so the whole warning fits on the footer line.
+    let footer = dumped
+        .lines()
+        .find(|line| line.contains("PR #42 Open"))
+        .expect("PR footer detail");
+    assert!(
+        footer
+            .trim_end()
+            .ends_with("Base kaefer/release-v1.37 ≠ From kaefer/main"),
+        "{footer}"
+    );
+    assert!(footer.contains("Improve dashboard"), "{footer}");
+    assert_eq!(
+        from_cell_fg(&buffer, "repo-bug", "kaefer/main"),
+        colors::WARNING
+    );
+}
+
+#[test]
+fn pr_targeting_its_from_branch_shows_no_base_warning() {
+    let mut screen = from_screen(vec![
+        row("/tmp/repo", "main", true),
+        cut_from(
+            row_with_pr("/tmp/repo-bug", "bug", false),
+            "kaefer/main",
+            "kaefer/main",
+        ),
+    ]);
+    screen.handle_key(key(KeyCode::Down));
+
+    let backend = TestBackend::new(110, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let dumped: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+
+    assert!(dumped.contains("PR #42 Open"));
+    assert!(!dumped.contains("≠ From"));
+    assert_ne!(
+        from_cell_fg(&buffer, "repo-bug", "kaefer/main"),
+        colors::WARNING
+    );
+}
+
+#[test]
+fn search_matches_from_column_text() {
+    let mut screen = from_screen(vec![
+        row("/tmp/repo", "main", true),
+        cut_from(
+            row("/tmp/repo-api", "api", true),
+            "upstream/main",
+            "upstream/main",
+        ),
+        cut_from(
+            row("/tmp/repo-v137", "v137", true),
+            "kaefer/release-v1.37",
+            "kaefer/release-v1.37",
+        ),
+    ]);
+    for c in "kaefer".chars() {
+        screen.handle_key(key(KeyCode::Char(c)));
+    }
+
+    let filtered = dump(120, 12, |f| screen.render(f, f.area()));
+    assert!(filtered.contains("repo-v137"));
+    assert!(!filtered.contains("repo-api"));
 }
 
 #[test]

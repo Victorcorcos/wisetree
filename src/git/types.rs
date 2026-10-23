@@ -11,6 +11,17 @@ pub struct BranchStatus {
     pub behind: u64,
     #[serde(rename = "upstreamBranch")]
     pub upstream_branch: Option<String>,
+    /// The remote-tracking ref the branch was cut from (e.g.
+    /// `upstream/release-0.41`). Matches `upstream_branch` until the
+    /// branch's PR targets another base. `None` when unknown: the main
+    /// worktree, a branch cut from a local branch or commit, an expired
+    /// reflog.
+    #[serde(
+        rename = "sourceBranch",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_branch: Option<String>,
     /// Line insertions vs the resolved upstream ref. `None` when the
     /// producer didn't compute a `git diff --shortstat`, so consumers can
     /// distinguish "zero lines" from "unknown".
