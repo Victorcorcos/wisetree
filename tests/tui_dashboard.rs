@@ -1129,12 +1129,12 @@ fn pr_targeting_another_base_than_its_from_branch_is_flagged() {
         .find(|line| line.contains("PR #42 Open"))
         .expect("PR footer detail");
     assert!(
-        footer
-            .trim_end()
-            .ends_with("Base kaefer/release-v1.37 ≠ From kaefer/main"),
+        footer.trim_end().ends_with(
+            "PR compares against kaefer/release-v1.37 ≠ Branch created from kaefer/main"
+        ),
         "{footer}"
     );
-    assert!(footer.contains("Improve dashboard"), "{footer}");
+    assert!(footer.contains("PR #42 Open: Improve"), "{footer}");
     assert_eq!(
         from_cell_fg(&buffer, "repo-bug", "kaefer/main"),
         colors::WARNING
@@ -1160,7 +1160,7 @@ fn pr_targeting_its_from_branch_shows_no_base_warning() {
     let dumped: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
 
     assert!(dumped.contains("PR #42 Open"));
-    assert!(!dumped.contains("≠ From"));
+    assert!(!dumped.contains("PR compares against"));
     assert_ne!(
         from_cell_fg(&buffer, "repo-bug", "kaefer/main"),
         colors::WARNING

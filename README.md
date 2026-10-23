@@ -214,7 +214,7 @@ The *Worktree* column, which shows the directory name, is always visible. You ch
 | Column key | Header | Shows |
 | --- | --- | --- |
 | `branch` | Branch | Checked-out branch. |
-| `from` | From | Remote branch the worktree's branch was cut from (step 2 of the base ref order below), such as `upstream/main` or `kaefer/release-v1.37`. `-` when unknown: the main worktree, or a branch cut from a local branch or a commit. Turns yellow when the branch's PR targets a different base; selecting the row then adds `Base <PR base> ≠ From <branch>` after the PR title in the footer. |
+| `from` | From | Remote branch the worktree's branch was cut from (step 2 of the base ref order below), such as `upstream/main` or `kaefer/release-v1.37`. `-` when unknown: the main worktree, or a branch cut from a local branch or a commit. Turns yellow when the branch's PR targets a different base; selecting the row then adds `PR compares against <PR base> ≠ Branch created from <From branch>` after the PR title in the footer. |
 | `status` | Status | Status label, plus pull request indicators (see below). |
 | `ahead_behind` | Ahead/Behind | `+N` commits ahead and `-N` commits behind the base ref. `=0` means the worktree is in sync. |
 | `diff` | Diff | `+N -N` lines inserted and deleted since the worktree left the base ref (its merge-base), uncommitted edits included. Commits the base gained afterwards are not counted. |

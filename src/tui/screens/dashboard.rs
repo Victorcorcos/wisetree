@@ -2095,9 +2095,9 @@ impl DashboardScreen {
                     let bold = warning.add_modifier(Modifier::BOLD);
                     vec![
                         Span::styled("  •  ", muted),
-                        Span::styled("Base ", warning),
+                        Span::styled("PR compares against ", warning),
                         Span::styled(base.to_string(), bold),
-                        Span::styled(" ≠ From ", warning),
+                        Span::styled(" ≠ Branch created from ", warning),
                         Span::styled(source.to_string(), bold),
                     ]
                 })
