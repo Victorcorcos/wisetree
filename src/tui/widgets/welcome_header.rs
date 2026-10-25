@@ -41,6 +41,7 @@ impl<'a> WelcomeHeader<'a> {
             Screen::Menu => None,
             Screen::Create => Some("Create"),
             Screen::Dashboard => Some("Dashboard"),
+            Screen::GlobalAccounts => Some(crate::messages::GLOBAL_DASHBOARD_TITLE),
             Screen::Delete => Some("Delete"),
             Screen::Cache => Some("Cache"),
             Screen::MergePullRequest => Some("Merge Pull Request"),

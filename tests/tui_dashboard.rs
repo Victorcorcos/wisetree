@@ -58,6 +58,7 @@ where
 
 fn row(path: &str, branch: &str, is_clean: bool) -> DashboardRow {
     DashboardRow {
+        repository: None,
         worktree: GitWorktree {
             path: path.into(),
             branch: branch.into(),
@@ -1461,4 +1462,418 @@ fn action_menu_hides_merge_option_when_no_pr_present() {
     let labels = open_action_menu_for_second_row(&mut screen);
     assert!(!labels.iter().any(|l| l == "Merge"));
     assert!(!labels.iter().any(|l| l == "Open"));
+}
+
+// Global scope reuses the same screen and existing row/action payloads.
+fn global_row(mut row: DashboardRow, owner: &str, name: &str, local: bool) -> DashboardRow {
+    row.repository = Some(wisetree::services::DashboardRepository {
+        owner: owner.into(),
+        name: name.into(),
+        local_root: local.then(|| std::path::PathBuf::from(format!("/tmp/{owner}/{name}"))),
+    });
+    if !local {
+        row.worktree.path.clear();
+        row.worktree.branch_status = None;
+        row.last_commit = None;
+    }
+    row
+}
+
+fn global_screen(rows: Vec<DashboardRow>) -> DashboardScreen {
+    use wisetree::tui::screens::dashboard::DashboardScope;
+    let mut screen = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec![
+            "branch",
+            "status",
+            "ahead_behind",
+            "diff",
+            "last_commit",
+            "pull_request",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        Vec::new(),
+        true,
+    )
+    .with_scope(DashboardScope::Global);
+    screen.set_rows(rows);
+    screen
+}
+
+#[test]
+fn global_columns_precede_configured_columns_and_survive_narrow_layouts() {
+    let mut screen = global_screen(vec![global_row(
+        row("/tmp/alpha/api/bug", "bug", false),
+        "alpha",
+        "api",
+        true,
+    )]);
+    for width in [240, 72, 50] {
+        let rendered = dump_lines(width, 24, |f| screen.render(f, f.area()));
+        let header = rendered
+            .lines()
+            .find(|line| line.contains("Worktree"))
+            .unwrap();
+        assert!(
+            header.find("Profile").unwrap() < header.find("Repository").unwrap(),
+            "{header}"
+        );
+        if width == 240 {
+            assert!(header.find("Repository").unwrap() < header.find("Branch").unwrap());
+            assert!(header.contains("Last Commit"));
+        } else {
+            assert!(!header.contains("Last Commit"));
+        }
+        let data = rendered
+            .lines()
+            .find(|line| line.contains("alpha") && line.contains("api"))
+            .unwrap();
+        assert!(data.contains("bug"), "{data}");
+    }
+}
+
+#[test]
+fn global_search_matches_repository_identity_with_every_word_fuzzy() {
+    for query in ["alpha", "api", "alpha/api", "alh/ap bug", "alpha dirty"] {
+        let mut screen = global_screen(vec![
+            global_row(row("/tmp/one/bug", "bug", false), "alpha", "api", true),
+            global_row(row("/tmp/two/bug", "bug", false), "beta", "web", true),
+        ]);
+        for c in query.chars() {
+            screen.handle_scoped_key(key(KeyCode::Char(c)));
+        }
+        let rendered = dump_lines(160, 24, |f| screen.render(f, f.area()));
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.contains("alpha") && line.contains("api")),
+            "{query}: {rendered}"
+        );
+        assert!(!rendered.contains("beta"), "{query}: {rendered}");
+    }
+    let mut screen = global_screen(vec![global_row(
+        row("/tmp/one/bug", "bug", false),
+        "alpha",
+        "api",
+        true,
+    )]);
+    for c in "alpha nonexistent".chars() {
+        screen.handle_scoped_key(key(KeyCode::Char(c)));
+    }
+    assert!(dump(160, 24, |f| screen.render(f, f.area()))
+        .contains(wisetree::messages::GLOBAL_DASHBOARD_NO_MATCHES));
+}
+
+#[test]
+fn remote_row_renders_pr_metadata_and_unavailable_local_columns() {
+    use wisetree::services::MergeStatus;
+    let mut remote = global_row(row_with_pr("", "feature-api", true), "alpha", "api", false);
+    // Ignore local-looking data even if a stale row happens to carry it.
+    remote.worktree.branch_status = row("/tmp/local", "local", true).worktree.branch_status;
+    remote.last_commit = row("/tmp/local", "local", true).last_commit;
+    let pr = remote.pull_request.as_mut().unwrap();
+    pr.checks_status = Some(CheckStatus::Passed);
+    pr.review_status = Some(ReviewStatus::Approved);
+    pr.merge_status = Some(MergeStatus::Clean);
+    let mut screen = global_screen(vec![remote]);
+    let rendered = dump_lines(240, 24, |f| screen.render(f, f.area()));
+    let header = rendered
+        .lines()
+        .find(|line| line.contains("Worktree"))
+        .unwrap();
+    let data = rendered
+        .lines()
+        .find(|line| line.contains("Not cloned locally"))
+        .unwrap();
+    for text in [
+        "alpha",
+        "api",
+        "feature-api",
+        "Opened",
+        "🟢",
+        "👍",
+        "✅",
+        "#42 Open",
+    ] {
+        assert!(data.contains(text), "missing {text}: {data}");
+    }
+    for title in ["Ahead/Behind", "Diff", "Last Commit"] {
+        let start = header.find(title).unwrap();
+        // All characters preceding these cells are ASCII in the header;
+        // the backend includes continuation spaces for emoji in the data.
+        assert_eq!(data.chars().nth(start), Some('-'), "{title}: {data}");
+    }
+    assert!(!data.contains("=0"));
+    assert!(rendered.contains("0 worktrees, 0 dirty, 1 PR open"));
+}
+
+#[test]
+fn remote_action_menu_only_offers_open_and_focuses_it_immediately() {
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    for state in [
+        PrState::Open,
+        PrState::Draft,
+        PrState::Merged,
+        PrState::Closed,
+    ] {
+        let mut screen = global_screen(vec![global_row(
+            row_with_pr_state("", "bug", true, state),
+            "alpha",
+            "api",
+            false,
+        )]);
+        screen.handle_scoped_key(key(KeyCode::Enter));
+        assert!(screen.general_command_labels().is_empty());
+        assert_eq!(screen.pr_command_labels(), vec!["Open"]);
+        let rendered = dump(120, 20, |f| screen.render(f, f.area()));
+        assert!(!rendered.contains("General Commands"));
+        assert!(rendered.contains("Not cloned locally"));
+        for shortcut in ['m', 'c', 'd', 'x'] {
+            assert_eq!(
+                screen.handle_scoped_key(key(KeyCode::Char(shortcut))),
+                ScopedDashboardAction::Dashboard(DashboardAction::Continue)
+            );
+        }
+        screen.handle_scoped_key(key(KeyCode::Tab));
+        match screen.handle_scoped_key(key(KeyCode::Enter)) {
+            ScopedDashboardAction::Row {
+                repository,
+                action: DashboardAction::OpenPullRequest(url),
+            } => {
+                assert_eq!(repository.owner, "alpha");
+                assert_eq!(repository.name, "api");
+                assert!(url.ends_with("/pull/42"));
+            }
+            other => panic!("expected repository-scoped Open, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn remote_backspace_reports_no_local_worktree_but_still_edits_search() {
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    let mut screen = global_screen(vec![global_row(
+        row_with_pr("", "bug", true),
+        "alpha",
+        "api",
+        false,
+    )]);
+    for code in [KeyCode::Backspace, KeyCode::Delete] {
+        assert_eq!(
+            screen.handle_scoped_key(key(code)),
+            ScopedDashboardAction::NoLocalWorktree
+        );
+        // Even the legacy entry point cannot issue a delete for a remote row.
+        assert_eq!(screen.handle_key(key(code)), DashboardAction::Continue);
+    }
+    screen.handle_scoped_key(key(KeyCode::Char('b')));
+    assert_eq!(
+        screen.handle_scoped_key(key(KeyCode::Backspace)),
+        ScopedDashboardAction::Dashboard(DashboardAction::Continue)
+    );
+}
+
+#[test]
+fn global_rows_with_same_names_keep_distinct_paths_and_protect_each_mother() {
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    let mut screen = global_screen(vec![
+        global_row(row("/tmp/alpha/api", "main", true), "alpha", "api", true),
+        global_row(row("/tmp/beta/web", "main", true), "beta", "web", true),
+        global_row(row("/tmp/alpha/bug", "bug", false), "alpha", "api", true),
+        global_row(row("/tmp/beta/bug", "bug", false), "beta", "web", true),
+    ]);
+    for (owner, name) in [("alpha", "api"), ("beta", "web")] {
+        match screen.handle_scoped_key(key(KeyCode::Backspace)) {
+            ScopedDashboardAction::Row {
+                repository,
+                action: DashboardAction::MotherWorktreeProtected,
+            } => {
+                assert_eq!(
+                    (repository.owner.as_str(), repository.name.as_str()),
+                    (owner, name)
+                );
+            }
+            other => panic!("expected protected mother, got {other:?}"),
+        }
+        screen.handle_scoped_key(key(KeyCode::Down));
+    }
+    for owner in ["alpha", "beta"] {
+        match screen.handle_scoped_key(key(KeyCode::Backspace)) {
+            ScopedDashboardAction::Row {
+                repository,
+                action: DashboardAction::JumpToDelete(path),
+            } => {
+                assert_eq!(repository.owner, owner);
+                assert_eq!(path, format!("/tmp/{owner}/bug"));
+                assert!(std::path::Path::new(&path).is_absolute());
+            }
+            other => panic!("expected scoped delete, got {other:?}"),
+        }
+        screen.handle_scoped_key(key(KeyCode::Down));
+    }
+}
+
+#[test]
+fn global_local_row_without_pr_keeps_status_metadata_and_general_commands() {
+    let mut screen = global_screen(vec![global_row(
+        row("/tmp/alpha/bug", "bug", false),
+        "alpha",
+        "api",
+        true,
+    )]);
+    let rendered = dump_lines(240, 24, |f| screen.render(f, f.area()));
+    let data = rendered
+        .lines()
+        .find(|line| line.contains("alpha") && line.contains("api"))
+        .unwrap();
+    for text in ["bug", "Dirty", "+1", "deadbee"] {
+        assert!(data.contains(text), "{data}");
+    }
+    screen.handle_scoped_key(key(KeyCode::Enter));
+    for label in [
+        "Open with Command",
+        "Copy path to clipboard",
+        "Delete worktree",
+    ] {
+        assert!(screen.general_command_labels().contains(&label.to_string()));
+    }
+}
+
+#[test]
+fn global_bulk_delete_targets_exclude_remote_rows_and_all_mothers() {
+    let mut local = global_row(
+        row_with_pr_state("/tmp/alpha/bug", "bug", true, PrState::Open),
+        "alpha",
+        "api",
+        true,
+    );
+    local.worktree.is_main = false;
+    let remote = global_row(
+        row_with_pr_state("", "remote", true, PrState::Open),
+        "beta",
+        "web",
+        false,
+    );
+    let mother = global_row(
+        row_with_pr_state("/tmp/alpha/api", "main", true, PrState::Open),
+        "alpha",
+        "api",
+        true,
+    );
+    let mut screen = global_screen(vec![mother, local, remote]);
+    screen.handle_key(key(KeyCode::Tab));
+    // Merged → Closed → Drafted → Opened.
+    for _ in 0..3 {
+        screen.handle_key(key(KeyCode::Right));
+    }
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        DashboardAction::BulkDelete(BulkDeleteStatus::Opened, vec!["/tmp/alpha/bug".into()])
+    );
+}
+
+#[test]
+fn global_bulk_delete_targets_respect_the_search_filter() {
+    let rows = ["first", "second"]
+        .into_iter()
+        .map(|name| {
+            global_row(
+                row_with_pr_state(
+                    &format!("/tmp/{name}/feature"),
+                    "feature",
+                    true,
+                    PrState::Open,
+                ),
+                "owner",
+                name,
+                true,
+            )
+        })
+        .collect();
+    let mut screen = global_screen(rows);
+    for c in "second".chars() {
+        screen.handle_key(key(KeyCode::Char(c)));
+    }
+    screen.handle_key(key(KeyCode::Tab));
+    for _ in 0..3 {
+        screen.handle_key(key(KeyCode::Right));
+    }
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        DashboardAction::BulkDelete(BulkDeleteStatus::Opened, vec!["/tmp/second/feature".into()])
+    );
+}
+
+#[test]
+fn global_empty_state_names_selected_accounts_and_counts_no_local_worktrees() {
+    let mut screen = global_screen(vec![]);
+    let rendered = dump(120, 24, |f| screen.render(f, f.area()));
+    assert!(rendered.contains(wisetree::messages::GLOBAL_DASHBOARD_EMPTY));
+    assert!(rendered.contains("0 worktrees, 0 dirty, 0 PRs open"));
+}
+
+#[test]
+fn remote_open_mouse_click_preserves_repository_context() {
+    use ratatui::layout::Position;
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    let mut screen = global_screen(vec![global_row(
+        row_with_pr("", "bug", true),
+        "alpha",
+        "api",
+        false,
+    )]);
+    screen.handle_scoped_key(key(KeyCode::Enter));
+    let backend = TestBackend::new(120, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let buffer = terminal.backend().buffer();
+    let open = (0..buffer.area.height)
+        .find_map(|y| {
+            (0..buffer.area.width.saturating_sub(4)).find_map(|x| {
+                let text = (x..x + 4)
+                    .map(|column| buffer[(column, y)].symbol())
+                    .collect::<String>();
+                (text == "Open").then_some(Position::new(x, y))
+            })
+        })
+        .expect("Open button rendered");
+    match screen.handle_scoped_mouse_click(open) {
+        ScopedDashboardAction::Row {
+            repository,
+            action: DashboardAction::OpenPullRequest(_),
+        } => {
+            assert_eq!(repository.owner, "alpha");
+            assert_eq!(repository.name, "api");
+        }
+        other => panic!("expected scoped Open action, got {other:?}"),
+    }
+}
+
+#[test]
+fn global_checkout_dependent_pr_action_keeps_its_repository() {
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    let mut screen = global_screen(vec![global_row(
+        row_with_pr("/tmp/beta/bug", "bug", true),
+        "beta",
+        "web",
+        true,
+    )]);
+    screen.handle_scoped_key(key(KeyCode::Enter));
+    screen.handle_scoped_key(key(KeyCode::Tab));
+    match screen.handle_scoped_key(key(KeyCode::Char('m'))) {
+        ScopedDashboardAction::Row {
+            repository,
+            action: DashboardAction::MergePullRequest(request),
+        } => {
+            assert_eq!(repository.owner, "beta");
+            assert_eq!(repository.name, "web");
+            assert_eq!(request.worktree_path, "/tmp/beta/bug");
+            assert_eq!(request.number, 42);
+        }
+        other => panic!("expected scoped Merge action, got {other:?}"),
+    }
 }

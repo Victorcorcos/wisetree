@@ -176,3 +176,32 @@ pub mod colors {
     /// Status bar foreground.
     pub const STATUS_TEXT: Color = GRAY_LIGHT;
 }
+
+// Global Dashboard GitHub setup
+pub const GLOBAL_GH_INSTALL: &str = "Install gh (GitHub CLI) to use Global Dashboard.";
+pub const GLOBAL_GH_AUTH: &str = "GitHub authentication failed; run gh auth login";
+
+// Shared Dashboard in global scope
+pub const GLOBAL_PROFILE_COLUMN: &str = "Profile";
+pub const GLOBAL_REPOSITORY_COLUMN: &str = "Repository";
+pub const GLOBAL_NOT_CLONED: &str = "Not cloned locally";
+pub const GLOBAL_UNAVAILABLE: &str = "-";
+pub const GLOBAL_NO_LOCAL_WORKTREE: &str = "No local worktree is available for this pull request.";
+pub const GLOBAL_DASHBOARD_EMPTY: &str =
+    "No worktrees or pull requests found for the selected accounts.";
+pub const GLOBAL_DASHBOARD_NO_MATCHES: &str =
+    "No worktrees or pull requests match the current filter.";
+
+// Global Dashboard repository context
+pub const GLOBAL_DASHBOARD_TITLE: &str = "Global Dashboard";
+pub const GLOBAL_CONTEXT_FAILED: &str = "Could not open the row's local repository";
+pub const GLOBAL_CONTEXT_RESTORE_FAILED: &str = "Could not restore the launch directory";
+
+// Global Dashboard account selection
+pub const MENU_GLOBAL_DASHBOARD: &str = "Global Dashboard";
+pub const GLOBAL_ACCOUNTS_TITLE: &str = "Select GitHub Organizations / Accounts";
+pub const GLOBAL_ACCOUNTS_LOADING: &str = "Discovering GitHub accounts…";
+pub const GLOBAL_ACCOUNTS_REQUIRED: &str = "Select at least one account to open Global Dashboard.";
+pub const GLOBAL_ACCOUNTS_HINT: &str =
+    "Space toggle · ↑↓ navigate · Enter open · Esc back · Ctrl+R retry";
+pub const GLOBAL_ACCOUNTS_SAVE_FAILED: &str = "Could not save selected accounts";

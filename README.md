@@ -27,6 +27,7 @@ With Wisetree you can:
   - [Main menu](#main-menu)
   - [Create a worktree](#create-a-worktree)
   - [Dashboard](#dashboard)
+  - [Global Dashboard](#global-dashboard)
   - [Deleting worktrees](#deleting-worktrees)
   - [Pull request actions](#pull-request-actions)
   - [Shared cache screen](#shared-cache-screen)
@@ -154,6 +155,7 @@ The header shows the Wisetree version and the active repository.
 | **Setup Shell Integration** | When the integration is not installed for zsh or bash | Installs the [shell wrapper](#shell-integration). |
 | **Create** | Always | Creates a new worktree. |
 | **Dashboard** | Always | Opens the live worktree overview. |
+| **Global Dashboard** | Always | Opens the [Dashboard across GitHub accounts](#global-dashboard) and their local repositories. |
 | **Shared cache** | When `worktreeLinkPatterns` is not empty | Inspects and cleans the [shared dependency cache](#shared-dependency-cache-worktreelinkpatterns). |
 | **Settings** | Always | Views and edits the configuration. |
 | **Exit** | Always | Quits. `Ctrl+C` quits from any screen. |
@@ -277,6 +279,31 @@ Press **Enter** on a row to open its action menu. **General Commands** is a sear
 
 - With the search box empty, **Backspace** or **Delete** on a row jumps straight to the delete confirmation for that worktree.
 - Press **Tab** to focus the footer row **Delete worktrees with status: Merged · Closed · Drafted · Opened · Clean · Dirty**. Use **← / →** to pick a status and press **Enter**. Wisetree lists every worktree with that status and asks you to confirm. The main worktree is never included.
+
+### Global Dashboard
+
+**Global Dashboard** shows the Dashboard for several repositories at once, grouped by the GitHub organizations and users you select. It needs the GitHub CLI (`gh`), authenticated with `gh auth login`. Listing organizations requires the `read:org` scope.
+
+**Choosing accounts.** The selection screen lists your GitHub account, your organizations, the owners of repositories where you have open pull requests, the owners of your remembered local repositories, and accounts you selected before.
+
+| Key | Action |
+| --- | --- |
+| Type | Filters the list. Selections hidden by the filter are kept. |
+| `↑` / `↓` | Moves between accounts. |
+| `Space` | Toggles `☒` / `☐`. |
+| `Enter` | Saves the selection and opens the dashboard. At least one account is required. |
+| `Esc` | Clears the filter, then returns to the menu without saving. |
+| `Ctrl+R` | Discovers accounts again. |
+
+The selection is saved as `globalDashboard.selectedAccounts` in the global `~/.wisetree/config.json`, even when a project config is active. The list opens instantly from `gh`'s response cache and refreshes in the background; `Ctrl+R` fetches it fresh.
+
+**The table.** Rows are the local worktrees of every remembered repository owned by a selected account, plus your own open pull requests in those accounts' repositories (pull requests by other people are not listed). Two extra columns, **Profile** (the owning account) and **Repository**, identify each row, and search matches them too. After the first visit, the table opens on the rows it showed last time and refreshes them in place.
+
+Row actions, quick delete, and bulk delete run in the row's own repository with that repository's configuration. `Esc` returns to the account selection.
+
+**Pull requests without a local checkout** appear as rows marked **Not cloned locally**, with their pull request status. Their local columns show `-`. **Enter** only offers opening the pull request in the browser; Wisetree never clones a repository.
+
+**How repositories are found.** Wisetree remembers each repository it is launched in, in `~/.wisetree/repositories.json`. It also checks the folders next to remembered repositories, one level deep, for other GitHub clones. Repositories are matched to GitHub through their `upstream` or `origin` remote. To include a clone stored elsewhere, launch Wisetree in it once. Moved or deleted repositories are forgotten automatically.
 
 ### Deleting worktrees
 
@@ -489,6 +516,8 @@ Other files in `~/.wisetree/`:
 | --- | --- |
 | `cache/<repo-id>/` | Default shared dependency cache for each repository. `<repo-id>` is a hash of the repository path. |
 | `dashboard_pr_cache.json` | Cached pull request data for the Dashboard. |
+| `repositories.json` | Local repositories remembered for the [Global Dashboard](#global-dashboard). |
+| `global_dashboard_rows.json` | The Global Dashboard's last local rows, shown while it refreshes. |
 
 A JSON Schema for the configuration is in [`schema.json`](schema.json). Keys use camelCase. Unknown keys are ignored when the file is loaded and are dropped when Settings saves it.
 
@@ -529,6 +558,7 @@ A JSON Schema for the configuration is in [`schema.json`](schema.json). Keys use
 | `dashboard.refreshIntervalMs` | integer | `5000` | Git polling interval, clamped to 5000–60000. |
 | `dashboard.showPullRequests` | boolean | `false` | Fetches PR data through `gh`. Required for PR columns, status indicators, and PR actions. |
 | `dashboard.columns` | string[] | `["branch", "from", "status", "ahead_behind", "last_commit"]` | Any of `branch`, `from`, `status`, `ahead_behind`, `diff`, `last_commit`, `pull_request`. Unknown names are ignored. If no valid name remains, the defaults are used. |
+| `globalDashboard.selectedAccounts` | string[] | `[]` | GitHub accounts shown in the [Global Dashboard](#global-dashboard). Only read from the global config; written by the account selection screen. |
 
 ### Template variables
 

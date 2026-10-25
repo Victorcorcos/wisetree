@@ -20,6 +20,8 @@ Rust + Ratatui manager for creating, listing, navigating, and deleting Git workt
 - `src/tui/`: App, event loop, screens, and widgets.
 - `src/git/`, `src/worktree/`, `src/files/`: Git operations and worktree creation/deletion.
 - `src/services/dashboard.rs`: Git polling and GitHub pull request operations.
+- `src/services/global_dashboard/`: Global Dashboard aggregation across repositories, GitHub account discovery, and the local repository registry.
+- `src/tui/screens/global_accounts.rs`: Global Dashboard account selection.
 - `src/services/presets/`: project setup defaults.
 - `src/config/`: configuration loading, saving, and defaults.
 - `tests/`: integration tests and TUI snapshots.

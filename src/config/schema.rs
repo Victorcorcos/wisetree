@@ -119,6 +119,23 @@ impl DashboardConfig {
     }
 }
 
+/// Global Dashboard account selection, independent of project configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GlobalDashboardConfig {
+    #[serde(default)]
+    pub selected_accounts: Vec<String>,
+}
+
+impl GlobalDashboardConfig {
+    /// Keep the first spelling and order of each GitHub account.
+    pub fn deduplicate(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.selected_accounts
+            .retain(|account| seen.insert(account.to_ascii_lowercase()));
+    }
+}
+
 /// Configuration for the worktree manager.
 ///
 /// JSON keys use camelCase. Unknown legacy fields are ignored when loading
@@ -166,6 +183,14 @@ pub struct WorktreeConfig {
     /// Live dashboard preferences.
     #[serde(rename = "dashboard", default)]
     pub dashboard: DashboardConfig,
+
+    /// Stored only in the global config; project saves omit this field.
+    #[serde(
+        rename = "globalDashboard",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub global_dashboard: Option<GlobalDashboardConfig>,
 }
 
 impl Default for WorktreeConfig {
@@ -181,6 +206,7 @@ impl Default for WorktreeConfig {
             terminal_command: String::new(),
             delete_branch_with_worktree: false,
             dashboard: DashboardConfig::default(),
+            global_dashboard: None,
         }
     }
 }

@@ -28,6 +28,17 @@
       "default": false,
       "type": "boolean"
     },
+    "globalDashboard": {
+      "description": "Stored only in the global config; project saves omit this field.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/GlobalDashboardConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "postCreateCmd": {
       "description": "Commands to run after creating a worktree. Variables: $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH.",
       "default": [],
@@ -125,6 +136,20 @@
           "type": "boolean"
         }
       }
+    },
+    "GlobalDashboardConfig": {
+      "description": "Global Dashboard account selection, independent of project configuration.",
+      "type": "object",
+      "properties": {
+        "selectedAccounts": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "LinkStrategy": {
       "oneOf": [

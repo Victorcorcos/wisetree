@@ -13,6 +13,8 @@
 //! by invoking `WorktreeService::delete_worktree`, then calls
 //! `mark_complete(outcome)` (or `set_error`) when done.
 
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -25,6 +27,7 @@ use crate::messages::{
     colors, DELETE_CONFIRM_TITLE, DELETE_DELETING, DELETE_SUCCESS, DELETE_UNMERGED_TITLE,
     DELETE_UNMERGED_WARNING, DELETE_WARNING, LOADING_WORKTREES,
 };
+use crate::services::DashboardRepository;
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
     branded_line, BulkConfirmDialog, BulkConfirmItem, BulkConfirmOutcome, ConfirmVariant,
@@ -72,6 +75,7 @@ pub enum DeleteAction {
 pub struct DeleteScreen {
     step: DeleteStep,
     worktrees: Vec<GitWorktree>,
+    repositories: HashMap<String, DashboardRepository>,
     selected_path: Option<String>,
     delete_branch_with_worktree: bool,
     loading: bool,
@@ -99,6 +103,7 @@ impl DeleteScreen {
         Self {
             step: DeleteStep::Confirm,
             worktrees: Vec::new(),
+            repositories: HashMap::new(),
             selected_path: None,
             delete_branch_with_worktree,
             loading: true,
@@ -185,6 +190,31 @@ impl DeleteScreen {
         self.worktrees = worktrees.into_iter().filter(|w| !w.is_main).collect();
         self.loading = false;
         self.error = None;
+    }
+
+    /// Preserve each local row's repository through confirmation and execution.
+    pub fn set_repository_worktrees(&mut self, rows: Vec<(DashboardRepository, GitWorktree)>) {
+        self.repositories = rows
+            .iter()
+            .map(|(repository, worktree)| (worktree.path.clone(), repository.clone()))
+            .collect();
+        self.set_worktrees(rows.into_iter().map(|(_, worktree)| worktree).collect());
+    }
+
+    pub fn repository(&self, path: &str) -> Option<&DashboardRepository> {
+        self.repositories.get(path)
+    }
+
+    pub fn bulk_current_path(&self) -> Option<&str> {
+        self.bulk_paths.get(self.bulk_completed).map(String::as_str)
+    }
+
+    pub fn bulk_item_label(&self) -> String {
+        let path = self.bulk_current_path().unwrap_or_default();
+        match self.repository(path) {
+            Some(repository) => format!("{}/{}: {}", repository.owner, repository.name, path),
+            None => path.to_string(),
+        }
     }
 
     pub fn preselect_path(&mut self, _path: &str) {
@@ -390,6 +420,12 @@ impl DeleteScreen {
                     .find(|w| &w.path == path)
                     .map(|w| format!("{} [{}]", fold_home(&w.path), w.branch))
                     .unwrap_or_else(|| fold_home(path));
+                let label = match self.repository(path) {
+                    Some(repository) => {
+                        format!("{}/{}: {label}", repository.owner, repository.name)
+                    }
+                    None => label,
+                };
                 BulkConfirmItem::new(label)
             })
             .collect();

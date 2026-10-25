@@ -471,3 +471,48 @@ fn bulk_success_message() {
     let dumped = dump(80, 4, |f| s.render(f, f.area()));
     assert!(dumped.contains("2 worktrees deleted successfully"));
 }
+
+#[test]
+fn global_bulk_confirmation_labels_repositories_and_defaults_to_no() {
+    use wisetree::services::DashboardRepository;
+
+    let mut screen = DeleteScreen::new(false);
+    screen.set_repository_worktrees(
+        ["first", "second"]
+            .into_iter()
+            .flat_map(|name| {
+                let repository = DashboardRepository {
+                    owner: "owner".into(),
+                    name: name.into(),
+                    local_root: Some(format!("/tmp/{name}").into()),
+                };
+                [
+                    (
+                        repository.clone(),
+                        wt(&format!("/tmp/{name}"), "main", true, true),
+                    ),
+                    (
+                        repository,
+                        wt(&format!("/tmp/{name}/feature"), "feature", false, true),
+                    ),
+                ]
+            })
+            .collect(),
+    );
+    screen.jump_to_bulk_confirm(vec![
+        "/tmp/first/feature".into(),
+        "/tmp/second/feature".into(),
+    ]);
+    assert_eq!(screen.worktrees().len(), 2);
+    let rendered = dump(120, 24, |frame| screen.render(frame, frame.area()));
+    assert!(rendered.contains("owner/first"));
+    assert!(rendered.contains("owner/second"));
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        DeleteAction::Continue
+    );
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        DeleteAction::Cancelled
+    );
+}

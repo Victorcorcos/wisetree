@@ -21,6 +21,15 @@ pub const CACHE_DIR_NAME: &str = "cache";
 /// Filename of the dashboard pull-request cache.
 pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 
+/// Filename of the Global Dashboard's last painted local rows, stored beside
+/// the dashboard pull-request cache.
+pub const GLOBAL_DASHBOARD_ROWS_FILE_NAME: &str = "global_dashboard_rows.json";
+
+/// Path to the local repository registry (`~/.wisetree/repositories.json`).
+pub fn global_repository_registry_file() -> PathBuf {
+    global_config_dir().join("repositories.json")
+}
+
 /// Resolve the global config directory (`~/.wisetree/`).
 ///
 /// Mirrors the upstream behaviour of synthesising the path from `$HOME`. We

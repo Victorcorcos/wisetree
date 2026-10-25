@@ -10,10 +10,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::messages::colors;
+use crate::messages::{self, colors};
 use crate::services::{
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
-    PrState, ReviewStatus,
+    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRepository,
+    DashboardRow, MergeStatus, PrState, ReviewStatus,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
@@ -24,6 +24,20 @@ use crate::tui::widgets::{
 
 const SELECT_MARKER: &str = " ➤ ";
 const BLANK_SELECT_MARKER: &str = "   ";
+
+fn remote_only(row: &DashboardRow) -> bool {
+    row.repository
+        .as_ref()
+        .is_some_and(|repository| repository.local_root.is_none())
+}
+
+fn dashboard_worktree_name(row: &DashboardRow) -> String {
+    if remote_only(row) {
+        messages::GLOBAL_NOT_CLONED.to_string()
+    } else {
+        worktree_display_name(&row.worktree.path)
+    }
+}
 
 fn worktree_display_name(path: &str) -> String {
     Path::new(path)
@@ -172,8 +186,31 @@ pub enum DashboardAction {
     MotherWorktreeProtected,
 }
 
+/// Scope of the shared dashboard table. Repository scope preserves the original layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DashboardScope {
+    #[default]
+    Repository,
+    Global,
+}
+
+/// Global callers consume this envelope to route row actions to their repository.
+/// Screen-wide and batch actions retain their existing payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopedDashboardAction {
+    Dashboard(DashboardAction),
+    Row {
+        repository: DashboardRepository,
+        action: DashboardAction,
+    },
+    /// The App should show `messages::GLOBAL_NO_LOCAL_WORKTREE` as a toast.
+    NoLocalWorktree,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardColumn {
+    Profile,
+    Repository,
     Branch,
     From,
     Status,
@@ -243,6 +280,7 @@ impl DashboardTableLayout {
 }
 
 pub struct DashboardScreen {
+    scope: DashboardScope,
     rows: Vec<DashboardRow>,
     selected: usize,
     loading: bool,
@@ -308,6 +346,7 @@ impl DashboardScreen {
         pr_enrichment_enabled: bool,
     ) -> Self {
         Self {
+            scope: DashboardScope::Repository,
             rows: Vec::new(),
             selected: 0,
             loading: true,
@@ -341,6 +380,77 @@ impl DashboardScreen {
             close_pr_modal: None,
             tick: 0,
         }
+    }
+
+    pub fn with_scope(mut self, scope: DashboardScope) -> Self {
+        self.scope = scope;
+        self.columns.retain(|column| {
+            !matches!(
+                column,
+                DashboardColumn::Profile | DashboardColumn::Repository
+            )
+        });
+        if scope == DashboardScope::Global {
+            self.columns.splice(
+                0..0,
+                [DashboardColumn::Profile, DashboardColumn::Repository],
+            );
+        }
+        self
+    }
+
+    /// Use this entry point for global scope so actions retain repository identity.
+    pub fn handle_scoped_key(&mut self, key: KeyEvent) -> ScopedDashboardAction {
+        if !self.loading
+            && self.mode == DashboardMode::Table
+            && self.footer_focus.is_none()
+            && self.query().is_empty()
+            && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+            && self.selected_row().is_some_and(remote_only)
+        {
+            return ScopedDashboardAction::NoLocalWorktree;
+        }
+        let repository = self.action_repository();
+        let action = self.handle_key(key);
+        self.scope_action(repository, action)
+    }
+
+    pub fn handle_scoped_mouse_click(&mut self, position: Position) -> ScopedDashboardAction {
+        let repository = self.action_repository();
+        let action = self.handle_mouse_click(position);
+        self.scope_action(repository, action)
+    }
+
+    fn action_repository(&self) -> Option<DashboardRepository> {
+        self.action_target
+            .or_else(|| self.selected_row_index())
+            .and_then(|index| self.rows.get(index))
+            .and_then(|row| row.repository.clone())
+    }
+
+    fn scope_action(
+        &self,
+        repository: Option<DashboardRepository>,
+        action: DashboardAction,
+    ) -> ScopedDashboardAction {
+        if self.scope == DashboardScope::Global
+            && !matches!(
+                action,
+                DashboardAction::Continue
+                    | DashboardAction::Back
+                    | DashboardAction::Refresh
+                    | DashboardAction::BulkDelete(..)
+            )
+        {
+            if let Some(repository) = repository {
+                return ScopedDashboardAction::Row { repository, action };
+            }
+        }
+        ScopedDashboardAction::Dashboard(action)
+    }
+
+    pub fn rows(&self) -> &[DashboardRow] {
+        &self.rows
     }
 
     pub fn set_rows(&mut self, rows: Vec<DashboardRow>) {
@@ -491,6 +601,9 @@ impl DashboardScreen {
             KeyCode::Backspace | KeyCode::Delete if self.query().is_empty() => {
                 if let Some(index) = self.selected_row_index() {
                     let row = &self.rows[index];
+                    if remote_only(row) {
+                        return DashboardAction::Continue;
+                    }
                     if row.worktree.is_main {
                         return DashboardAction::MotherWorktreeProtected;
                     }
@@ -657,9 +770,17 @@ impl DashboardScreen {
     /// Returns the worktree paths whose live status matches `status`,
     /// excluding the main repository checkout (never deletable).
     fn bulk_target_paths(&self, status: BulkDeleteStatus) -> Vec<String> {
+        let filtered = (self.scope == DashboardScope::Global).then(|| self.filtered_indices());
         self.rows
             .iter()
-            .filter(|row| !row.worktree.is_main)
+            .enumerate()
+            .filter(|(index, _)| {
+                filtered
+                    .as_ref()
+                    .map_or(true, |indices| indices.contains(index))
+            })
+            .map(|(_, row)| row)
+            .filter(|row| !remote_only(row) && !row.worktree.is_main)
             .filter(|row| row_matches_bulk_status(row, status))
             .map(|row| row.worktree.path.clone())
             .collect()
@@ -753,6 +874,9 @@ impl DashboardScreen {
     /// button row built by [`Self::build_pr_commands`].
     fn build_action_select(&self, row: &DashboardRow) -> SelectPrompt<ActionChoice> {
         let mut options = Vec::new();
+        if remote_only(row) {
+            return SelectPrompt::new("General Commands", options).without_hint();
+        }
         if self.is_from_wrapper {
             options.push(SelectOption::new(
                 "Navigate to Directory",
@@ -797,6 +921,10 @@ impl DashboardScreen {
                 choice: ActionChoice::OpenPullRequest,
                 color: colors::PRIMARY,
             });
+            // Remote-only rows have no checkout for any other PR command.
+            if remote_only(row) {
+                return commands;
+            }
             if pr.state == PrState::Open {
                 commands.push(PrCommand {
                     label: "Merge",
@@ -852,7 +980,9 @@ impl DashboardScreen {
         let row = self.rows[index].clone();
         self.action_select = Some(self.build_action_select(&row));
         self.pr_commands = self.build_pr_commands(&row);
-        self.action_pr_focus = None;
+        self.action_pr_focus = remote_only(&row)
+            .then_some(0)
+            .filter(|_| !self.pr_commands.is_empty());
         self.last_pr_focus = 0;
         self.action_target = Some(index);
         self.mode = DashboardMode::ActionMenu;
@@ -890,6 +1020,10 @@ impl DashboardScreen {
     fn toggle_action_focus(&mut self) {
         if self.pr_commands.is_empty() {
             self.action_pr_focus = None;
+            return;
+        }
+        if self.general_command_labels().is_empty() {
+            self.action_pr_focus = Some(0);
             return;
         }
         self.action_pr_focus = match self.action_pr_focus {
@@ -1014,6 +1148,9 @@ impl DashboardScreen {
     /// buttons, and mouse clicks so every path dispatches identically.
     fn dispatch_action_choice(&mut self, choice: ActionChoice, index: usize) -> DashboardAction {
         let row = &self.rows[index];
+        if remote_only(row) && choice != ActionChoice::OpenPullRequest {
+            return DashboardAction::Continue;
+        }
         let path = row.worktree.path.clone();
         let branch = row.worktree.branch.clone();
         let is_main = row.worktree.is_main;
@@ -1140,6 +1277,14 @@ impl DashboardScreen {
             // (`clean`/`dirty`/`opened`/`merged`).
             status_label_and_style(row).0.to_ascii_lowercase(),
         ];
+        if self.scope == DashboardScope::Global {
+            if let Some(repository) = &row.repository {
+                haystacks.push(repository.owner.to_ascii_lowercase());
+                haystacks.push(repository.name.to_ascii_lowercase());
+                haystacks
+                    .push(format!("{}/{}", repository.owner, repository.name).to_ascii_lowercase());
+            }
+        }
         // Ahead/Behind column text — match the rendered "+N -N" / "=0" form
         // and also raw "ahead N", "behind N" so either spelling filters.
         if let Some(branch_status) = &row.worktree.branch_status {
@@ -1222,7 +1367,7 @@ impl DashboardScreen {
             Span::styled(" - ", Style::default().fg(colors::MUTED)),
             Span::raw(format!(
                 "{} worktrees, {} dirty, {} {} open",
-                self.rows.len(),
+                self.rows.iter().filter(|row| !remote_only(row)).count(),
                 dirty,
                 open_prs,
                 if open_prs == 1 { "PR" } else { "PRs" }
@@ -1253,7 +1398,13 @@ impl DashboardScreen {
     fn render_table(&mut self, frame: &mut Frame, area: Rect, layout: &DashboardTableLayout) {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
-            let message = if self.rows.is_empty() {
+            let message = if self.scope == DashboardScope::Global {
+                if self.rows.is_empty() {
+                    messages::GLOBAL_DASHBOARD_EMPTY
+                } else {
+                    messages::GLOBAL_DASHBOARD_NO_MATCHES
+                }
+            } else if self.rows.is_empty() {
                 "No worktrees found."
             } else {
                 "No worktrees match the current filter."
@@ -1371,7 +1522,7 @@ impl DashboardScreen {
             Span::raw(marker),
             Span::styled(
                 truncate(
-                    &worktree_display_name(&row.worktree.path),
+                    &dashboard_worktree_name(row),
                     layout
                         .worktree_width
                         .saturating_sub(marker.chars().count() as u16) as usize,
@@ -1890,7 +2041,11 @@ impl DashboardScreen {
             let header = Line::from(vec![
                 Span::raw("Selected: "),
                 Span::styled(
-                    fold_home(&row.worktree.path),
+                    if remote_only(row) {
+                        messages::GLOBAL_NOT_CLONED.to_string()
+                    } else {
+                        fold_home(&row.worktree.path)
+                    },
                     Style::default().fg(colors::PRIMARY),
                 ),
                 Span::raw(" "),
@@ -1902,8 +2057,10 @@ impl DashboardScreen {
             frame.render_widget(Paragraph::new(header), chunks[0]);
         }
 
-        if let Some(select) = &self.action_select {
-            select.render(frame, chunks[1]);
+        if !self.general_command_labels().is_empty() {
+            if let Some(select) = &self.action_select {
+                select.render(frame, chunks[1]);
+            }
         }
 
         if pr_section_height > 0 {
@@ -2025,7 +2182,7 @@ impl DashboardScreen {
         let longest_path = self
             .rows
             .iter()
-            .map(|row| worktree_display_name(&row.worktree.path).chars().count() as u16)
+            .map(|row| dashboard_worktree_name(row).chars().count() as u16)
             .max()
             .unwrap_or(0);
         let header_min = "Worktree".chars().count() as u16;
@@ -2122,7 +2279,7 @@ impl DashboardScreen {
         for column in &layout.hidden_columns {
             match column {
                 DashboardColumn::LastCommit => {
-                    if let Some(commit) = &row.last_commit {
+                    if let Some(commit) = row.last_commit.as_ref().filter(|_| !remote_only(row)) {
                         if !spans.is_empty() {
                             spans.push(Span::styled("  •  ", muted));
                         }
@@ -2136,7 +2293,9 @@ impl DashboardScreen {
                     }
                 }
                 DashboardColumn::PullRequest => {}
-                DashboardColumn::Branch
+                DashboardColumn::Profile
+                | DashboardColumn::Repository
+                | DashboardColumn::Branch
                 | DashboardColumn::From
                 | DashboardColumn::Status
                 | DashboardColumn::AheadBehind
@@ -2215,6 +2374,8 @@ impl DashboardColumn {
 
     fn title(self, compact: bool) -> &'static str {
         match self {
+            Self::Profile => messages::GLOBAL_PROFILE_COLUMN,
+            Self::Repository => messages::GLOBAL_REPOSITORY_COLUMN,
             Self::Branch => "Branch",
             Self::From => "From",
             Self::Status => "Status",
@@ -2240,6 +2401,20 @@ impl DashboardColumn {
 
     fn width(self, compact: bool) -> u16 {
         match self {
+            Self::Profile => {
+                if compact {
+                    12
+                } else {
+                    18
+                }
+            }
+            Self::Repository => {
+                if compact {
+                    16
+                } else {
+                    24
+                }
+            }
             Self::Branch => {
                 if compact {
                     12
@@ -2301,7 +2476,32 @@ impl DashboardColumn {
     }
 
     fn cell(self, row: &DashboardRow, compact: bool, width: u16) -> Cell<'static> {
+        if remote_only(row)
+            && matches!(
+                self,
+                Self::From | Self::AheadBehind | Self::Diff | Self::LastCommit
+            )
+        {
+            return Cell::from(Span::styled(
+                messages::GLOBAL_UNAVAILABLE,
+                Style::default().fg(colors::MUTED),
+            ));
+        }
         match self {
+            Self::Profile | Self::Repository => {
+                let value = row
+                    .repository
+                    .as_ref()
+                    .map(|repository| {
+                        if self == Self::Profile {
+                            repository.owner.as_str()
+                        } else {
+                            repository.name.as_str()
+                        }
+                    })
+                    .unwrap_or(messages::GLOBAL_UNAVAILABLE);
+                Cell::from(truncate(value, width as usize))
+            }
             Self::Branch => Cell::from(Line::from(Span::raw(truncate(
                 &row.worktree.branch,
                 width as usize,
@@ -2465,6 +2665,9 @@ impl PrState {
 /// matches the guard in `build_action_select` so the menu and the dispatch
 /// stay in lockstep.
 fn build_merge_request(row: &DashboardRow) -> Option<MergePullRequestRequest> {
+    if remote_only(row) {
+        return None;
+    }
     let pr = row.pull_request.as_ref()?;
     if !matches!(pr.state, PrState::Open) {
         return None;
@@ -2487,6 +2690,9 @@ fn build_merge_request(row: &DashboardRow) -> Option<MergePullRequestRequest> {
 }
 
 fn build_close_request(row: &DashboardRow) -> Option<ClosePullRequestRequest> {
+    if remote_only(row) {
+        return None;
+    }
     let pr = row.pull_request.as_ref()?;
     if !matches!(pr.state, PrState::Open | PrState::Draft) {
         return None;
