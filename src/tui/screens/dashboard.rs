@@ -10,7 +10,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Padding, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use super::dashboard_filter::{DashboardFilterEditor, FilterEditorOutcome};
+use super::dashboard_filter::{
+    button_width as filter_button_width, render_button as render_filter_button,
+    summary_line as filter_summary_line, DashboardFilterEditor, FilterEditorOutcome,
+};
 use crate::config::schema::DashboardFilter;
 
 use crate::messages::{self, colors};
@@ -774,7 +777,7 @@ impl DashboardScreen {
                 self.render_status_banner(
                     frame,
                     Rect {
-                        height: area.height.min(1),
+                        height: area.height.min(3),
                         ..area
                     },
                 );
@@ -806,8 +809,15 @@ impl DashboardScreen {
             ])
             .split(area);
 
-        self.render_status_banner(frame, chunks[0]);
-        frame.render_widget(Paragraph::new(self.search_line()), chunks[2]);
+        self.render_status_banner(frame, chunks[0].union(chunks[2]));
+        // The Filter button spans the banner and search rows at the right.
+        let search = Rect {
+            width: self.filter_button_rect.map_or(chunks[2].width, |button| {
+                button.x.saturating_sub(chunks[2].x + 1)
+            }),
+            ..chunks[2]
+        };
+        frame.render_widget(Paragraph::new(self.search_line()), search);
         let layout = self.table_layout(chunks[4].width);
         self.render_table(frame, chunks[4], &layout);
         self.render_footer(frame, chunks[5], chunks[4].width, &layout);
@@ -1529,14 +1539,23 @@ impl DashboardScreen {
         ])
     }
 
+    /// `area` is the header band: the banner sits on its first row and, in
+    /// global scope, the bordered Filter button spans its full height.
     fn render_status_banner(&mut self, frame: &mut Frame, area: Rect) {
+        let banner = Rect {
+            height: area.height.min(1),
+            ..area
+        };
         if self.scope != DashboardScope::Global {
-            frame.render_widget(Paragraph::new(self.status_banner()), area);
+            frame.render_widget(Paragraph::new(self.status_banner()), banner);
             return;
         }
-        let count = self.filter.rule_count();
-        let label = format!("[ {} ({count}) ]", messages::GLOBAL_FILTER_BUTTON);
-        let width = (label.chars().count() as u16).min(area.width);
+        let label = format!(
+            "{} ({})",
+            messages::GLOBAL_FILTER_BUTTON,
+            self.filter.rule_count()
+        );
+        let width = filter_button_width(&label).min(area.width);
         let button = Rect {
             x: area.right().saturating_sub(width),
             width,
@@ -1544,17 +1563,10 @@ impl DashboardScreen {
         };
         let text = Rect {
             width: area.width.saturating_sub(width + 1),
-            ..area
+            ..banner
         };
         frame.render_widget(Paragraph::new(self.status_banner()), text);
-        frame.render_widget(
-            Paragraph::new(label).style(Style::default().fg(if count > 0 {
-                colors::PRIMARY
-            } else {
-                colors::MUTED
-            })),
-            button,
-        );
+        render_filter_button(frame, button, &label, colors::GRAY_LIGHT, false);
         self.filter_button_rect = Some(button);
     }
 
@@ -1569,14 +1581,14 @@ impl DashboardScreen {
             return;
         }
         let width = panel.width.min(78);
-        let available_height = panel.height.saturating_sub(1);
+        let available_height = panel.bottom().saturating_sub(button.bottom());
         if width < 4 || available_height < 3 {
             return;
         }
         let mut lines = self.filter.tooltip_lines(width.saturating_sub(4) as usize);
         if self.filter.rule_count() > 0 {
-            lines.push(String::new());
-            lines.push(messages::global_filter_summary(
+            lines.push(Line::default());
+            lines.push(filter_summary_line(
                 self.filtered_indices().len(),
                 self.rows.len(),
             ));
@@ -1590,13 +1602,13 @@ impl DashboardScreen {
         }
         let tooltip = Rect::new(
             panel.right().saturating_sub(width),
-            panel.y.saturating_add(1),
+            button.bottom(),
             width,
             height,
         );
         frame.render_widget(Clear, tooltip);
         frame.render_widget(
-            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+            Paragraph::new(lines)
                 .style(Style::default().fg(colors::EMPHASIS).bg(colors::BG))
                 .block(
                     Block::default()

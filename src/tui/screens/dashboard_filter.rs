@@ -1,12 +1,17 @@
 //! Global Dashboard filter evaluation. The editor and dashboard share this model.
 
-use ratatui::text::Line;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::config::schema::{
     DashboardFilter, DashboardFilterField, DashboardFilterKind, DashboardFilterOperator,
     DashboardFilterRule,
 };
+use crate::messages::{self, colors};
 use crate::services::DashboardRow;
+use crate::tui::widgets::branded_line;
 
 use super::dashboard::{dashboard_worktree_name, remote_only, status_label_and_style};
 
@@ -16,54 +21,40 @@ impl DashboardFilter {
     }
 
     /// Compact rule descriptions shared with the dashboard's hover preview.
-    pub fn tooltip_lines(&self, width: usize) -> Vec<String> {
+    pub fn tooltip_lines(&self, width: usize) -> Vec<Line<'static>> {
         if self.rule_count() == 0 {
-            return vec![crate::messages::GLOBAL_FILTER_NONE.to_string()];
+            return vec![Line::styled(messages::GLOBAL_FILTER_NONE, muted())];
         }
         let mut lines = Vec::new();
         for (group_index, group) in self.groups.iter().enumerate() {
             if group_index > 0 {
-                lines.push("── OR ──".into());
+                lines.push(or_line());
             }
             for (rule_index, rule) in group.rules.iter().enumerate() {
                 if rule_index > 0 {
-                    lines.push("AND".into());
+                    lines.push(Line::styled("AND", keyword()));
                 }
-                let prefix = format!("{}  {}  ", rule.field.label(), rule.operator.label());
-                let mut values = Vec::new();
-                for (index, value) in rule.values.iter().enumerate() {
-                    let remaining = rule.values.len() - index - 1;
-                    let suffix = if remaining == 0 {
-                        String::new()
-                    } else {
-                        format!(", +{remaining} more")
-                    };
-                    let candidate = format!(
-                        "{prefix}{}{value}{suffix}",
-                        if values.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{}, ", values.join(", "))
-                        }
-                    );
-                    if Line::from(candidate).width() > width {
-                        break;
-                    }
-                    values.push(value.as_str());
-                }
-                let remaining = rule.values.len() - values.len();
-                let mut text = values.join(", ");
-                if remaining > 0 {
-                    if !text.is_empty() {
-                        text.push_str(", ");
-                    }
-                    text.push_str(&format!("+{remaining} more"));
-                }
-                if Line::from(format!("{prefix}{text}")).width() > width && remaining > 0 {
-                    lines.push(prefix.trim_end().to_string());
-                    lines.push(text);
+                let prefix = rule_prefix(rule);
+                let prefix_width = Line::from(prefix.clone()).width() + 1;
+                let fits = |shown: usize| {
+                    prefix_width
+                        + Line::from(value_spans(
+                            &rule.values[..shown],
+                            rule.values.len() - shown,
+                        ))
+                        .width()
+                        <= width
+                };
+                let shown = (1..=rule.values.len())
+                    .take_while(|shown| fits(*shown))
+                    .last()
+                    .unwrap_or(0);
+                let values = value_spans(&rule.values[..shown], rule.values.len() - shown);
+                if !fits(shown) && shown < rule.values.len() {
+                    lines.push(Line::from(prefix));
+                    lines.push(Line::from(values));
                 } else {
-                    lines.push(format!("{prefix}{text}"));
+                    lines.push(Line::from([prefix, vec![Span::raw(" ")], values].concat()));
                 }
             }
         }
@@ -185,6 +176,7 @@ fn field_values(field: DashboardFilterField, row: &DashboardRow) -> Vec<String> 
 pub struct DashboardFilterEditor {
     draft: DashboardFilter,
     focus: usize,
+    rule_focus: usize,
     step: EditorStep,
     target: (usize, Option<usize>),
     field: DashboardFilterField,
@@ -223,6 +215,7 @@ impl DashboardFilterEditor {
         Self {
             draft: filter,
             focus: 0,
+            rule_focus: 0,
             step: EditorStep::Overview,
             target: (0, None),
             field: DashboardFilterField::Status,
@@ -514,17 +507,27 @@ impl DashboardFilterEditor {
                 self.target.0 = group;
             }
             let count = self.draft.rule_count();
+            // Arrows move inside the focused section (rules or buttons);
+            // Tab switches sections, returning to the rule it left.
+            let in_rules = self.focus < count;
+            let (start, len) = if in_rules {
+                (0, count)
+            } else {
+                (count, messages::GLOBAL_FILTER_BUTTONS.len())
+            };
+            let previous = start + (self.focus - start + len - 1) % len;
+            let next = start + (self.focus - start + 1) % len;
             match key.code {
-                KeyCode::Up | KeyCode::BackTab => {
-                    self.focus = (self.focus + count + 5) % (count + 6)
+                KeyCode::Up => self.focus = previous,
+                KeyCode::Down => self.focus = next,
+                KeyCode::Left if !in_rules => self.focus = previous,
+                KeyCode::Right if !in_rules => self.focus = next,
+                KeyCode::Tab | KeyCode::BackTab if in_rules => {
+                    self.rule_focus = self.focus;
+                    self.focus = count;
                 }
-                KeyCode::Down => self.focus = (self.focus + 1) % (count + 6),
-                KeyCode::Tab => {
-                    self.focus = if self.focus < count {
-                        count
-                    } else {
-                        (self.focus + 1) % (count + 6)
-                    }
+                KeyCode::Tab | KeyCode::BackTab if count > 0 => {
+                    self.focus = self.rule_focus.min(count - 1)
                 }
                 KeyCode::Enter => return self.activate(),
                 KeyCode::Char('a') => self.start_rule(self.focused_group(), None),
@@ -609,18 +612,8 @@ impl DashboardFilterEditor {
         FilterEditorOutcome::Pending
     }
 
-    pub fn render(
-        &mut self,
-        frame: &mut ratatui::Frame,
-        area: ratatui::layout::Rect,
-        rows: &[DashboardRow],
-    ) {
-        use crate::messages::{self, colors};
-        use ratatui::{
-            layout::{Constraint, Layout, Rect},
-            style::{Modifier, Style},
-            widgets::{Block, Borders, Paragraph},
-        };
+    pub fn render(&mut self, frame: &mut ratatui::Frame, area: Rect, rows: &[DashboardRow]) {
+        use ratatui::layout::{Constraint, Layout};
         self.hits.clear();
         let mut preview = self.draft.clone();
         if self.step == EditorStep::Value {
@@ -628,11 +621,55 @@ impl DashboardFilterEditor {
                 Self::put_rule(&mut preview, self.target, rule);
             }
         }
+        let count = self.draft.rule_count();
+        let overview = self.step == EditorStep::Overview;
+        let confirm = if self.step == EditorStep::Value {
+            messages::GLOBAL_FILTER_SAVE
+        } else {
+            messages::GLOBAL_FILTER_NEXT
+        };
+        let buttons: Vec<(&str, Color, bool, EditorHit)> = if overview {
+            let roles = [
+                colors::INFO,
+                colors::FILTER_KEYWORD,
+                colors::WARNING,
+                colors::ERROR,
+                colors::SUCCESS,
+                colors::GRAY_LIGHT,
+            ];
+            messages::GLOBAL_FILTER_BUTTONS
+                .iter()
+                .zip(roles)
+                .enumerate()
+                .map(|(index, (label, color))| {
+                    let focus = count + index;
+                    (*label, color, self.focus == focus, EditorHit::Focus(focus))
+                })
+                .collect()
+        } else {
+            vec![
+                (confirm, colors::SUCCESS, false, EditorHit::Confirm),
+                (
+                    messages::GLOBAL_FILTER_BACK,
+                    colors::GRAY_LIGHT,
+                    false,
+                    EditorHit::Back,
+                ),
+            ]
+        };
+        // Commit actions (Apply/Cancel, Next/Back) hug the right edge.
+        let labels: Vec<&str> = buttons.iter().map(|(label, ..)| *label).collect();
+        let grid = button_grid(area.width, &labels, 2);
+        let button_rows = grid.iter().map(|(_, row, _)| row + 1).max().unwrap_or(0);
         let chunks = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(button_rows * 3),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
@@ -645,233 +682,467 @@ impl DashboardFilterEditor {
             chunks[0],
         );
         frame.render_widget(
-            Paragraph::new(messages::global_filter_summary(
+            Paragraph::new(summary_line(
                 rows.iter().filter(|r| preview.matches(r)).count(),
                 rows.len(),
             )),
-            chunks[1],
+            chunks[2],
         );
-        let body = chunks[2];
-        if self.step == EditorStep::Overview {
-            // Scroll whole card lines together; focus remains visible for arbitrarily many rules.
-            let mut lines = Vec::new();
-            let mut rule_lines = Vec::new();
-            let mut index = 0;
-            for (g, group) in self.draft.groups.iter().enumerate() {
-                if g > 0 {
-                    lines.push(Line::from("                OR"));
-                }
-                let width = body.width.saturating_sub(2) as usize;
-                lines.push(Line::from(format!(
-                    "┌─ {} {}┐",
-                    messages::GLOBAL_FILTER_ALL,
-                    "─".repeat(width.saturating_sub(messages::GLOBAL_FILTER_ALL.len() + 3))
-                )));
-                for rule in &group.rules {
-                    rule_lines.push((index, lines.len()));
-                    let style = if self.focus == index {
-                        Style::default()
-                            .fg(colors::BRAND)
-                            .add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
-                    let text = format!(
-                        "{}  {}  {}",
-                        rule.field.label(),
-                        rule.operator.label(),
-                        rule.values.join(", ")
-                    );
-                    let available = width.saturating_sub(2);
-                    let text = if Line::from(text.clone()).width() > available {
-                        let mut shortened = String::new();
-                        for c in text.chars() {
-                            if Line::from(format!("{shortened}{c}…")).width() > available {
-                                break;
-                            }
-                            shortened.push(c);
-                        }
-                        format!("{shortened}…")
-                    } else {
-                        text
-                    };
-                    let padding =
-                        " ".repeat(available.saturating_sub(Line::from(text.clone()).width()));
-                    lines.push(Line::styled(format!("│ {text}{padding} │"), style));
-                    index += 1;
-                }
-                lines.push(Line::from(format!("└{}┘", "─".repeat(width))));
-            }
-            if lines.is_empty() {
-                lines.push(Line::from(messages::GLOBAL_FILTER_NONE));
-            }
-            let selected_line = rule_lines
-                .iter()
-                .find(|(i, _)| *i == self.focus)
-                .map(|(_, l)| *l)
-                .unwrap_or(0);
-            let offset = selected_line.saturating_sub(body.height.saturating_sub(2) as usize);
-            frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), body);
-            for (index, line) in rule_lines {
-                if line >= offset && line - offset < body.height as usize {
-                    self.hits.push((
-                        Rect::new(body.x, body.y + (line - offset) as u16, body.width, 1),
-                        EditorHit::Focus(index),
-                    ));
-                }
-            }
-            for (index, label) in messages::GLOBAL_FILTER_BUTTONS.iter().enumerate() {
-                let rect = Rect::new(chunks[3].x, chunks[3].y + index as u16, chunks[3].width, 1)
-                    .intersection(chunks[3]);
-                let style = if self.focus == self.draft.rule_count() + index {
-                    Style::default()
-                        .fg(colors::BRAND)
-                        .add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::default().fg(colors::INFO)
-                };
-                frame.render_widget(Paragraph::new(format!("[ {label} ]")).style(style), rect);
-                self.hits
-                    .push((rect, EditorHit::Focus(self.draft.rule_count() + index)));
-            }
-            frame.render_widget(
-                Paragraph::new(messages::GLOBAL_FILTER_OVERVIEW_HINT),
-                chunks[4],
-            );
+        if overview {
+            self.render_rules(frame, chunks[4]);
         } else {
-            let title = match self.step {
-                EditorStep::Field => messages::GLOBAL_FILTER_FIELD_STEP.to_string(),
-                EditorStep::Operator => format!(
-                    "{} · {}",
-                    messages::GLOBAL_FILTER_OPERATOR_STEP,
-                    self.field.label()
-                ),
-                _ => format!(
-                    "{} · {} {}",
-                    messages::GLOBAL_FILTER_VALUE_STEP,
-                    self.field.label(),
-                    self.operator.label()
-                ),
-            };
-            let inner = Block::default().borders(Borders::ALL).title(title);
-            let content = inner.inner(body);
-            frame.render_widget(inner, body);
-            if self.step != EditorStep::Operator {
-                frame.render_widget(
-                    Paragraph::new(self.input.inline_line()),
-                    Rect::new(content.x, content.y, content.width, content.height.min(1)),
-                );
-            }
-            let top = u16::from(self.step != EditorStep::Operator).min(content.height);
-            let list = Rect::new(
-                content.x,
-                content.y + top,
-                content.width,
-                content.height.saturating_sub(top),
-            );
-            let labels: Vec<String> = match self.step {
-                EditorStep::Field => self
-                    .fields()
-                    .iter()
-                    .map(|f| format!("{} — {}", f.label(), field_description(*f)))
-                    .collect(),
-                EditorStep::Operator => DashboardFilterOperator::for_kind(self.field.kind())
-                    .iter()
-                    .map(|o| o.label().to_string())
-                    .collect(),
-                _ => self
-                    .values(rows)
-                    .iter()
-                    .map(|v| {
-                        if self.field.kind() == DashboardFilterKind::Enum {
-                            let count = rows
-                                .iter()
-                                .filter(|r| {
-                                    field_values(self.field, r)
-                                        .iter()
-                                        .any(|a| a.eq_ignore_ascii_case(v))
-                                })
-                                .count();
-                            format!(
-                                "{} {v} ({count})",
-                                if self.selected_values.contains(v) {
-                                    "☒"
-                                } else {
-                                    "☐"
-                                }
-                            )
-                        } else {
-                            v.clone()
-                        }
-                    })
-                    .collect(),
-            };
-            self.choice = self.choice.min(labels.len().saturating_sub(1));
-            let offset = self
-                .choice
-                .saturating_sub(list.height.saturating_sub(1) as usize);
-            for (index, label) in labels
+            self.render_step(frame, chunks[4], rows);
+        }
+        for ((x, row, width), (label, color, focused, hit)) in grid.into_iter().zip(buttons) {
+            let rect =
+                Rect::new(chunks[6].x + x, chunks[6].y + row * 3, width, 3).intersection(chunks[6]);
+            render_button(frame, rect, label, color, focused);
+            self.hits.push((rect, hit));
+        }
+        let hint: Vec<(&'static str, &'static str)> = if !overview {
+            // Enter does what the confirm button says: Next, or Save on the last step.
+            messages::GLOBAL_FILTER_VALUE_HINT
                 .into_iter()
-                .enumerate()
-                .skip(offset)
-                .take(list.height as usize)
-            {
-                let rect = Rect::new(list.x, list.y + (index - offset) as u16, list.width, 1);
-                let style = if index == self.choice {
-                    Style::default()
-                        .fg(colors::BRAND)
-                        .add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::default()
-                };
-                frame.render_widget(Paragraph::new(label).style(style), rect);
-                self.hits.push((rect, EditorHit::Choice(index)));
+                .map(|(key, action)| (key, if key == "Enter" { confirm } else { action }))
+                .collect()
+        } else if self.focus < count {
+            messages::GLOBAL_FILTER_RULES_HINT.to_vec()
+        } else {
+            // Without rules there is no other section for Tab to reach.
+            messages::GLOBAL_FILTER_BUTTONS_HINT
+                .into_iter()
+                .filter(|(key, _)| count > 0 || *key != "Tab")
+                .collect()
+        };
+        frame.render_widget(Paragraph::new(hint_line(&hint)), chunks[8]);
+    }
+
+    /// One bordered card per OR group; the focused rule gets the selection bar.
+    fn render_rules(&mut self, frame: &mut ratatui::Frame, body: Rect) {
+        let width = body.width as usize;
+        let border = muted();
+        // Scroll whole card lines together; focus remains visible for arbitrarily many rules.
+        let mut lines = Vec::new();
+        let mut rule_lines = Vec::new();
+        let mut index = 0;
+        for (g, group) in self.draft.groups.iter().enumerate() {
+            if g > 0 {
+                lines.push(or_line().alignment(Alignment::Center));
             }
-            let validation = self.error.or_else(|| {
-                (self.step == EditorStep::Value
-                    && self.field.kind() == DashboardFilterKind::Number
-                    && !self.input.value.is_empty()
-                    && self.pending_rule().is_none())
-                .then_some(messages::GLOBAL_FILTER_INTEGER_ERROR)
-            });
-            let info = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(0),
-            ])
-            .split(chunks[3]);
-            frame.render_widget(
-                Paragraph::new(validation.unwrap_or("")).style(Style::default().fg(colors::ERROR)),
-                info[0],
-            );
-            frame.render_widget(Paragraph::new(messages::GLOBAL_FILTER_VALUE_HINT), info[1]);
-            frame.render_widget(Paragraph::new(messages::GLOBAL_FILTER_NEXT), info[2]);
-            if self.step == EditorStep::Value && self.field.kind() == DashboardFilterKind::Enum {
-                frame.render_widget(
-                    Paragraph::new(format!(
-                        "{}{}",
-                        messages::GLOBAL_FILTER_SELECTED,
-                        self.selected_values.join(", ")
-                    )),
-                    info[3],
-                );
-            }
-            self.hits.push((
-                Rect::new(info[2].x, info[2].y, 15.min(info[2].width), info[2].height),
-                EditorHit::Confirm,
-            ));
-            self.hits.push((
-                Rect::new(
-                    info[2].x.saturating_add(16),
-                    info[2].y,
-                    info[2].width.saturating_sub(16),
-                    info[2].height,
+            let [prefix, all, suffix] = messages::GLOBAL_FILTER_ALL;
+            let title = Line::from(format!("{prefix}{all}{suffix}")).width();
+            lines.push(Line::from(vec![
+                Span::styled("┌─ ", border),
+                Span::styled(prefix, muted()),
+                Span::styled(all, keyword()),
+                Span::styled(suffix, muted()),
+                Span::styled(
+                    format!(" {}┐", "─".repeat(width.saturating_sub(title + 5))),
+                    border,
                 ),
-                EditorHit::Back,
+            ]));
+            for rule in &group.rules {
+                rule_lines.push((index, lines.len()));
+                let focused = self.focus == index;
+                // Room left between "│ " + marker and " │".
+                let available = width.saturating_sub(6);
+                let mut content = fit_spans(
+                    [
+                        rule_prefix(rule),
+                        vec![Span::raw(" ")],
+                        value_spans(&rule.values, 0),
+                    ]
+                    .concat(),
+                    available,
+                );
+                let padding = available.saturating_sub(Line::from(content.clone()).width());
+                content.push(Span::raw(" ".repeat(padding)));
+                let mut spans = vec![Span::styled("│", border)];
+                spans.extend(selectable_spans(content, focused));
+                spans.push(Span::styled("│", border));
+                lines.push(Line::from(spans));
+                index += 1;
+            }
+            lines.push(Line::styled(
+                format!("└{}┘", "─".repeat(width.saturating_sub(2))),
+                border,
             ));
         }
+        if lines.is_empty() {
+            lines.push(Line::styled(
+                messages::GLOBAL_FILTER_NONE,
+                muted().add_modifier(Modifier::ITALIC),
+            ));
+        }
+        let selected_line = rule_lines
+            .iter()
+            .find(|(i, _)| *i == self.focus)
+            .map(|(_, l)| *l)
+            .unwrap_or(0);
+        let offset = selected_line.saturating_sub(body.height.saturating_sub(2) as usize);
+        frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), body);
+        for (index, line) in rule_lines {
+            if line >= offset && line - offset < body.height as usize {
+                self.hits.push((
+                    Rect::new(body.x, body.y + (line - offset) as u16, body.width, 1),
+                    EditorHit::Focus(index),
+                ));
+            }
+        }
     }
+
+    /// The field / operator / value picker of the guided rule flow.
+    fn render_step(&mut self, frame: &mut ratatui::Frame, body: Rect, rows: &[DashboardRow]) {
+        use ratatui::layout::{Constraint, Layout};
+        let [card, status] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(body);
+        let heading = Style::default()
+            .fg(colors::WHITE)
+            .add_modifier(Modifier::BOLD);
+        let field = Span::styled(
+            self.field.label(),
+            Style::default().fg(colors::FILTER_FIELD),
+        );
+        let operator = Span::styled(
+            self.operator.label(),
+            Style::default().fg(colors::FILTER_OPERATOR),
+        );
+        let mut title = vec![Span::raw(" ")];
+        match self.step {
+            EditorStep::Field => {
+                title.push(Span::styled(messages::GLOBAL_FILTER_FIELD_STEP, heading))
+            }
+            EditorStep::Operator => title.extend([
+                Span::styled(messages::GLOBAL_FILTER_OPERATOR_STEP, heading),
+                Span::styled(" · ", muted()),
+                field,
+            ]),
+            _ => title.extend([
+                Span::styled(messages::GLOBAL_FILTER_VALUE_STEP, heading),
+                Span::styled(" · ", muted()),
+                field,
+                Span::raw(" "),
+                operator,
+            ]),
+        }
+        title.push(Span::raw(" "));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(muted())
+            .title(Line::from(title));
+        let content = block.inner(card);
+        frame.render_widget(block, card);
+        if self.step != EditorStep::Operator {
+            frame.render_widget(
+                Paragraph::new(self.input.inline_line()),
+                Rect::new(content.x, content.y, content.width, content.height.min(1)),
+            );
+        }
+        let top = u16::from(self.step != EditorStep::Operator).min(content.height);
+        let list = Rect::new(
+            content.x,
+            content.y + top,
+            content.width,
+            content.height.saturating_sub(top),
+        );
+        let items: Vec<Vec<Span<'static>>> = match self.step {
+            EditorStep::Field => self
+                .fields()
+                .iter()
+                .map(|f| {
+                    vec![
+                        Span::styled(f.label(), Style::default().fg(colors::FILTER_FIELD)),
+                        Span::styled(format!(" — {}", field_description(*f)), muted()),
+                    ]
+                })
+                .collect(),
+            EditorStep::Operator => DashboardFilterOperator::for_kind(self.field.kind())
+                .iter()
+                .map(|o| {
+                    vec![Span::styled(
+                        o.label(),
+                        Style::default().fg(colors::FILTER_OPERATOR),
+                    )]
+                })
+                .collect(),
+            _ => self
+                .values(rows)
+                .into_iter()
+                .map(|v| {
+                    if self.field.kind() != DashboardFilterKind::Enum {
+                        return value_spans(&[v], 0);
+                    }
+                    let count = rows
+                        .iter()
+                        .filter(|r| {
+                            field_values(self.field, r)
+                                .iter()
+                                .any(|a| a.eq_ignore_ascii_case(&v))
+                        })
+                        .count();
+                    let checkbox = if self.selected_values.contains(&v) {
+                        Span::styled("☒", Style::default().fg(colors::SUCCESS))
+                    } else {
+                        Span::styled("☐", muted())
+                    };
+                    [
+                        vec![checkbox, Span::raw(" ")],
+                        value_spans(&[v], 0),
+                        vec![Span::styled(format!(" ({count})"), muted())],
+                    ]
+                    .concat()
+                })
+                .collect(),
+        };
+        self.choice = self.choice.min(items.len().saturating_sub(1));
+        let offset = self
+            .choice
+            .saturating_sub(list.height.saturating_sub(1) as usize);
+        for (index, item) in items
+            .into_iter()
+            .enumerate()
+            .skip(offset)
+            .take(list.height as usize)
+        {
+            let rect = Rect::new(list.x, list.y + (index - offset) as u16, list.width, 1);
+            let selected = index == self.choice;
+            let mut paragraph = Paragraph::new(Line::from(selectable_spans(item, selected)));
+            if selected {
+                paragraph = paragraph.style(Style::default().bg(colors::BG_SELECTED));
+            }
+            frame.render_widget(paragraph, rect);
+            self.hits.push((rect, EditorHit::Choice(index)));
+        }
+        let validation = self.error.or_else(|| {
+            (self.step == EditorStep::Value
+                && self.field.kind() == DashboardFilterKind::Number
+                && !self.input.value.is_empty()
+                && self.pending_rule().is_none())
+            .then_some(messages::GLOBAL_FILTER_INTEGER_ERROR)
+        });
+        let line = if let Some(error) = validation {
+            Line::styled(error, Style::default().fg(colors::ERROR))
+        } else if self.step == EditorStep::Value && self.field.kind() == DashboardFilterKind::Enum {
+            Line::from(
+                [
+                    vec![Span::styled(messages::GLOBAL_FILTER_SELECTED, muted())],
+                    value_spans(&self.selected_values, 0),
+                ]
+                .concat(),
+            )
+        } else {
+            Line::default()
+        };
+        frame.render_widget(Paragraph::new(line), status);
+    }
+}
+
+fn muted() -> Style {
+    Style::default().fg(colors::MUTED)
+}
+
+fn keyword() -> Style {
+    Style::default()
+        .fg(colors::FILTER_KEYWORD)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// `Field operator`, without the values.
+fn rule_prefix(rule: &DashboardFilterRule) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            rule.field.label(),
+            Style::default().fg(colors::FILTER_FIELD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            rule.operator.label(),
+            Style::default().fg(colors::FILTER_OPERATOR),
+        ),
+    ]
+}
+
+/// `a, b, +N more` with the values highlighted and the separators muted.
+fn value_spans(values: &[String], hidden: usize) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for value in values {
+        if !spans.is_empty() {
+            spans.push(Span::styled(", ", muted()));
+        }
+        spans.push(Span::styled(
+            value.clone(),
+            Style::default().fg(colors::FILTER_VALUE),
+        ));
+    }
+    if hidden > 0 {
+        if !spans.is_empty() {
+            spans.push(Span::styled(", ", muted()));
+        }
+        spans.push(Span::styled(format!("+{hidden} more"), muted()));
+    }
+    spans
+}
+
+fn or_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("── ", muted()),
+        Span::styled("OR", keyword()),
+        Span::styled(" ──", muted()),
+    ])
+}
+
+/// `Showing 17 of 37 worktrees · 20 hidden`, each count colored by meaning.
+pub(super) fn summary_line(visible: usize, total: usize) -> Line<'static> {
+    let [showing, of, worktrees, hidden_label] = messages::GLOBAL_FILTER_SUMMARY;
+    let hidden = total.saturating_sub(visible);
+    let count = |value: usize, color: Color| {
+        Span::styled(
+            value.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )
+    };
+    let mut spans = vec![
+        Span::styled(showing, muted()),
+        count(visible, colors::SUCCESS),
+        Span::styled(of, muted()),
+        count(total, colors::WHITE),
+    ];
+    spans.extend(branded_line(worktrees, muted()));
+    spans.push(count(
+        hidden,
+        if hidden == 0 {
+            colors::MUTED
+        } else {
+            colors::ACCENT
+        },
+    ));
+    spans.push(Span::styled(hidden_label, muted()));
+    Line::from(spans)
+}
+
+/// Keyboard hints styled like the other command footers: key in the brand
+/// accent (error pink for Esc), action muted.
+fn hint_line(hints: &[(&'static str, &'static str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (key, action)) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ·  ", muted()));
+        }
+        let color = if *key == "Esc" {
+            colors::ERROR
+        } else {
+            colors::BRAND
+        };
+        spans.push(Span::styled(format!("{key} "), Style::default().fg(color)));
+        spans.push(Span::styled(*action, muted()));
+    }
+    Line::from(spans)
+}
+
+/// Prefixes the selection marker and, when selected, paints the row bar
+/// behind the spans while keeping their syntax colors.
+fn selectable_spans(spans: Vec<Span<'static>>, selected: bool) -> Vec<Span<'static>> {
+    if !selected {
+        return [vec![Span::raw("   ")], spans, vec![Span::raw(" ")]].concat();
+    }
+    let bar = Style::default()
+        .bg(colors::BG_SELECTED)
+        .add_modifier(Modifier::BOLD);
+    [
+        vec![Span::styled(" ➤ ", bar.fg(colors::WHITE))],
+        spans,
+        vec![Span::raw(" ")],
+    ]
+    .concat()
+    .into_iter()
+    .map(|span| {
+        let style = bar.patch(span.style);
+        span.style(style)
+    })
+    .collect()
+}
+
+/// Truncates styled spans to `max` columns, ending with `…` when cut.
+fn fit_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
+    if Line::from(spans.clone()).width() <= max {
+        return spans;
+    }
+    let mut fitted = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let width = Span::raw(c.to_string()).width();
+            if used + width + 1 > max {
+                text.push('…');
+                fitted.push(Span::styled(text, span.style));
+                return fitted;
+            }
+            text.push(c);
+            used += width;
+        }
+        fitted.push(Span::styled(text, span.style));
+    }
+    fitted
+}
+
+/// Bordered button matching the dashboard's; focus fills the label row.
+pub(super) fn render_button(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    label: &str,
+    color: Color,
+    focused: bool,
+) {
+    let style = if focused {
+        Style::default()
+            .fg(colors::BG)
+            .bg(color)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(format!(" {label} "), style))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(color)),
+            ),
+        area,
+    );
+}
+
+pub(super) fn button_width(label: &str) -> u16 {
+    Line::from(label).width() as u16 + 4
+}
+
+/// `(x, row, width)` for each button: left to right, wrapping when the next
+/// one does not fit, with the last `trailing` ones aligned to the right edge.
+fn button_grid(width: u16, labels: &[&str], trailing: usize) -> Vec<(u16, u16, u16)> {
+    let split = labels.len().saturating_sub(trailing);
+    let widths: Vec<u16> = labels.iter().map(|label| button_width(label)).collect();
+    let mut grid = Vec::new();
+    let (mut x, mut row) = (0u16, 0u16);
+    for &button in &widths[..split] {
+        if x > 0 && x + button > width {
+            (x, row) = (0, row + 1);
+        }
+        grid.push((x, row, button));
+        x += button + 1;
+    }
+    let cluster =
+        widths[split..].iter().sum::<u16>() + (widths.len() - split).saturating_sub(1) as u16;
+    if x > 0 && x + 1 + cluster > width {
+        row += 1;
+    }
+    let mut x = width.saturating_sub(cluster);
+    for &button in &widths[split..] {
+        grid.push((x, row, button));
+        x += button + 1;
+    }
+    grid
 }
 
 fn field_description(field: DashboardFilterField) -> &'static str {

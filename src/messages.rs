@@ -150,6 +150,20 @@ pub mod colors {
     /// Creative accent for moments worth a splash of color.
     pub const ACCENT: Color = ORANGE;
 
+    // ── Global Dashboard filter syntax ─────────────────────────────────
+    //
+    // A rule reads like highlighted code wherever it is shown (dashboard
+    // tooltip and filter editor): `Status is any of Merged AND …`.
+
+    /// Dashboard field names (`Status`, `Profile`), like a type name.
+    pub const FILTER_FIELD: Color = TEAL;
+    /// Comparison operators (`is any of`, `contains`, `>=`).
+    pub const FILTER_OPERATOR: Color = BRAND;
+    /// Compared values (`Mother`, `alice`), like a string literal.
+    pub const FILTER_VALUE: Color = YELLOW;
+    /// `AND` / `OR` connectives between rules and groups.
+    pub const FILTER_KEYWORD: Color = ORANGE;
+
     /// Welcome header backdrop.
     pub const HEADER_BG: Color = BG;
     /// Welcome header border — uses the focus brown so the panel frame
@@ -233,16 +247,14 @@ pub mod delete_progress {
 pub const GLOBAL_FILTER_BUTTON: &str = "Filter";
 pub const GLOBAL_FILTER_NONE: &str = "No filters — showing all worktrees";
 pub const GLOBAL_DASHBOARD_FILTER_HIDDEN: &str = "All worktrees are hidden by the active filter.";
-pub fn global_filter_summary(visible: usize, total: usize) -> String {
-    format!(
-        "Showing {visible} of {total} worktrees · {} hidden",
-        total.saturating_sub(visible)
-    )
-}
+/// `Showing {visible} of {total} worktrees · {hidden} hidden`, split around
+/// the three counts so each one can be colored.
+pub const GLOBAL_FILTER_SUMMARY: [&str; 4] = ["Showing ", " of ", " worktrees · ", " hidden"];
 
 // Global Dashboard filter editor
 pub const GLOBAL_FILTER_TITLE: &str = "Global Dashboard · Filter";
-pub const GLOBAL_FILTER_ALL: &str = "Match ALL of";
+/// `Match ALL of`, split so the `ALL` keyword can be highlighted.
+pub const GLOBAL_FILTER_ALL: [&str; 3] = ["Match ", "ALL", " of"];
 pub const GLOBAL_FILTER_BUTTONS: [&str; 6] = [
     "+ Rule",
     "+ OR group",
@@ -254,10 +266,34 @@ pub const GLOBAL_FILTER_BUTTONS: [&str; 6] = [
 pub const GLOBAL_FILTER_FIELD_STEP: &str = "1/3 · Choose a field (type to search)";
 pub const GLOBAL_FILTER_OPERATOR_STEP: &str = "2/3 · Choose an operator";
 pub const GLOBAL_FILTER_VALUE_STEP: &str = "3/3 · Choose values";
-pub const GLOBAL_FILTER_OVERVIEW_HINT: &str =
-    "↑↓ Move · Enter Edit · a Rule · o OR group · Delete Remove · Tab Buttons · Esc Cancel";
-pub const GLOBAL_FILTER_VALUE_HINT: &str = "↑↓ Choose · Space Toggle · Type Search / Custom value · Tab Complete text · Enter Next · Esc Back";
-pub const GLOBAL_FILTER_NEXT: &str = "[ Next / Save ]  [ Back ]";
+/// `(key, action)` hints while a rule is focused.
+pub const GLOBAL_FILTER_RULES_HINT: [(&str, &str); 7] = [
+    ("↑↓", "Move"),
+    ("Enter", "Edit"),
+    ("a", "Add rule"),
+    ("o", "Add OR group"),
+    ("Delete", "Remove"),
+    ("Tab", "Buttons"),
+    ("Esc", "Cancel"),
+];
+/// `(key, action)` hints while a button is focused.
+pub const GLOBAL_FILTER_BUTTONS_HINT: [(&str, &str); 4] = [
+    ("←→", "Move"),
+    ("Enter", "Select"),
+    ("Tab", "Rules"),
+    ("Esc", "Cancel"),
+];
+pub const GLOBAL_FILTER_VALUE_HINT: [(&str, &str); 6] = [
+    ("↑↓", "Choose"),
+    ("Space", "Toggle"),
+    ("Type", "Search / Custom value"),
+    ("Tab", "Complete text"),
+    ("Enter", "Next"),
+    ("Esc", "Back"),
+];
+pub const GLOBAL_FILTER_NEXT: &str = "Next";
+pub const GLOBAL_FILTER_SAVE: &str = "Save";
+pub const GLOBAL_FILTER_BACK: &str = "Back";
 pub const GLOBAL_FILTER_INTEGER_ERROR: &str = "Enter a valid integer.";
 pub const GLOBAL_FILTER_VALUE_ERROR: &str = "Select at least one value or enter a nonempty value.";
 pub const GLOBAL_FILTER_SAVE_FAILED: &str =

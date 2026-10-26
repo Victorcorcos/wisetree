@@ -1890,6 +1890,8 @@ fn rendered_query(screen: &mut DashboardScreen) -> String {
         .lines()
         .find(|line| line.starts_with("Search:"))
         .unwrap()
+        // The global Filter button's bottom border shares the search row.
+        .trim_end_matches(['└', '─', '┘'])
         .to_string()
 }
 
@@ -2007,7 +2009,10 @@ fn plain_deletion_keys_only_edit_search_and_word_deletion_still_works() {
             assert_eq!(screen.handle_key(shortcut), DashboardAction::Continue);
             // The Global Dashboard can render its Filter button beside the query.
             let rendered = rendered_query(&mut screen);
-            assert_eq!(rendered.split("  ").next().unwrap().trim_end(), "Search: feat");
+            assert_eq!(
+                rendered.split("  ").next().unwrap().trim_end(),
+                "Search: feat"
+            );
         }
     }
 }
@@ -2063,22 +2068,22 @@ fn global_filter_button_stays_at_right_and_hover_clears_on_leave() {
     ]);
     for width in [160, 50, 20] {
         let rendered = dump_lines(width, 30, |f| screen.render(f, f.area()));
-        assert!(rendered.lines().next().unwrap().ends_with("[ Filter (1) ]"));
+        assert!(rendered.lines().nth(1).unwrap().ends_with("│ Filter (1) │"));
         let button = screen.filter_button_rect().unwrap();
         assert_eq!(button.right(), width);
-        assert_eq!(button.y, 0);
+        assert_eq!((button.y, button.height), (0, 3));
     }
     let plain = dump(160, 30, |f| screen.render(f, f.area()));
     assert!(plain.contains("1 of 2 worktrees, 1 dirty, 0 PRs open"));
-    assert!(!plain.contains("Status  is none of"));
+    assert!(!plain.contains("Status is none of"));
     let button = screen.filter_button_rect().unwrap();
     screen.handle_mouse_move(Position::new(button.x, button.y));
     let hovered = dump(160, 30, |f| screen.render(f, f.area()));
-    assert!(hovered.contains("Status  is none of  Mother"));
+    assert!(hovered.contains("Status is none of Mother"));
     assert!(hovered.contains("Showing 1 of 2 worktrees · 1 hidden"));
     screen.handle_mouse_move(Position::new(0, 2));
     let left = dump(160, 30, |f| screen.render(f, f.area()));
-    assert!(!left.contains("Status  is none of"));
+    assert!(!left.contains("Status is none of"));
     assert!(!left.contains("Showing 1 of 2 worktrees · 1 hidden"));
 }
 
@@ -2183,9 +2188,9 @@ fn global_tooltip_groups_truncation_inactive_loading_and_modal_suppression() {
         .collect();
     filter.groups.push(other);
     assert!(filter
-        .tooltip_lines(26)
+        .tooltip_lines(24)
         .iter()
-        .any(|line| line == "+30 more"));
+        .any(|line| line.to_string() == "+30 more"));
     let mut screen = global_screen(vec![global_row(
         row("/tmp/alpha/bug", "bug", false),
         "alpha",
@@ -2208,10 +2213,10 @@ fn global_tooltip_groups_truncation_inactive_loading_and_modal_suppression() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| screen.render(f, f.area())).unwrap();
     let button = screen.filter_button_rect().unwrap();
-    assert_eq!(
-        terminal.backend().buffer()[(button.x, button.y)].fg,
-        colors::MUTED
-    );
+    // Same gray as the Closed bulk-delete button, border and label alike.
+    for (x, y) in [(button.x, button.y), (button.x + 2, button.y + 1)] {
+        assert_eq!(terminal.backend().buffer()[(x, y)].fg, colors::GRAY_LIGHT);
+    }
     screen.handle_mouse_move(Position::new(button.x, button.y));
     assert!(dump(120, 30, |f| screen.render(f, f.area()))
         .contains(wisetree::messages::GLOBAL_FILTER_NONE));
@@ -2220,7 +2225,7 @@ fn global_tooltip_groups_truncation_inactive_loading_and_modal_suppression() {
         .with_scope(wisetree::tui::screens::dashboard::DashboardScope::Global);
     let loading = dump_lines(120, 30, |f| screen.render(f, f.area()));
     assert!(loading.contains("0 of 0 worktrees"));
-    assert!(loading.lines().next().unwrap().ends_with("[ Filter (1) ]"));
+    assert!(loading.lines().nth(1).unwrap().ends_with("│ Filter (1) │"));
     let button = screen.filter_button_rect().unwrap();
     screen.handle_mouse_move(Position::new(button.x, button.y));
     for (width, height) in [(120, 30), (30, 5), (8, 3), (1, 1)] {
@@ -2252,7 +2257,7 @@ fn global_filter_tooltip_is_suppressed_by_close_pr_modal() {
     screen.handle_mouse_move(Position::new(button.x, button.y));
     let modal = dump(180, 35, |f| screen.render(f, f.area()));
     assert!(modal.contains("Close Pull Request"));
-    assert!(!modal.contains("Status  is none of"));
+    assert!(!modal.contains("Status is none of"));
     assert!(!modal.contains("Showing 1 of 1"));
 }
 
@@ -2283,7 +2288,7 @@ fn filter_button(screen: &mut DashboardScreen, label: &str) -> DashboardAction {
         .enumerate()
         .find(|(_, line)| line.contains(label))
         .unwrap();
-    let x = line.find(label).unwrap();
+    let x = line[..line.find(label).unwrap()].chars().count();
     screen.handle_mouse_click(Position::new(x as u16, y as u16))
 }
 
@@ -2355,9 +2360,10 @@ fn global_filter_editor_builds_and_or_rules_applies_rows_and_persists_json() {
     // Latest polling data changes counts without losing the draft.
     screen.set_rows(rows[..4].to_vec());
     assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("Showing 3 of 4 worktrees"));
-    // Tab from the focused rule reaches + Rule, then Apply after four more Tabs.
-    for _ in 0..5 {
-        screen.handle_key(key(KeyCode::Tab));
+    // Tab from the focused rule reaches + Rule, then Apply is four buttons right.
+    screen.handle_key(key(KeyCode::Tab));
+    for _ in 0..4 {
+        screen.handle_key(key(KeyCode::Right));
     }
     let action = screen.handle_scoped_key(key(KeyCode::Enter));
     let rule = |field, operator, values: &[&str]| DashboardFilterRule {
@@ -2535,7 +2541,7 @@ fn global_filter_editor_mouse_rule_edit_and_text_suggestions() {
     let rendered = dump_lines(120, 35, |f| screen.render(f, f.area()));
     let y = rendered
         .lines()
-        .position(|line| line.contains("Status  is none of  Mother"))
+        .position(|line| line.contains("Status is none of Mother"))
         .unwrap();
     screen.handle_mouse_click(Position::new(3, y as u16));
     assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("1/3"));
@@ -2567,4 +2573,147 @@ fn global_filter_editor_mouse_rule_edit_and_text_suggestions() {
     screen.handle_key(key(KeyCode::Enter));
     filter_button(&mut screen, "Apply");
     assert_eq!(screen.filter().groups[0].rules[1].values, vec!["Failed"]);
+}
+/// The cell `offset` columns into the first on-screen occurrence of `text`.
+fn cell_at<'a>(
+    buffer: &'a ratatui::buffer::Buffer,
+    text: &str,
+    offset: u16,
+) -> &'a ratatui::buffer::Cell {
+    let area = buffer.area;
+    for y in 0..area.height {
+        let line: String = (0..area.width).map(|x| buffer[(x, y)].symbol()).collect();
+        if let Some(byte) = line.find(text) {
+            return &buffer[(line[..byte].chars().count() as u16 + offset, y)];
+        }
+    }
+    panic!("{text:?} is not rendered");
+}
+
+#[test]
+fn global_filter_rules_read_like_highlighted_code_in_tooltip_and_editor() {
+    use wisetree::config::schema::{
+        DashboardFilter, DashboardFilterField as F, DashboardFilterOperator as O,
+        DashboardFilterRule,
+    };
+    let mut filter = DashboardFilter::default();
+    filter.groups[0].rules.push(DashboardFilterRule {
+        field: F::Profile,
+        operator: O::IsAnyOf,
+        values: vec!["alpha".into()],
+    });
+    let mut screen = global_screen(vec![
+        global_row(row("/tmp/alpha/api", "main", true), "alpha", "api", true),
+        global_row(row("/tmp/alpha/bug", "bug", false), "alpha", "api", true),
+    ])
+    .with_filter(filter);
+    let render = |screen: &mut DashboardScreen| {
+        let mut terminal = Terminal::new(TestBackend::new(160, 35)).unwrap();
+        terminal.draw(|f| screen.render(f, f.area())).unwrap();
+        terminal.backend().buffer().clone()
+    };
+    render(&mut screen);
+    let button = screen.filter_button_rect().unwrap();
+    screen.handle_mouse_move(Position::new(button.x, button.y));
+    let tooltip = render(&mut screen);
+    assert_eq!(cell_at(&tooltip, "AND", 0).fg, colors::FILTER_KEYWORD);
+    filter_ctrl_f(&mut screen);
+    let editor = render(&mut screen);
+    assert_eq!(
+        cell_at(&editor, "Match ALL of", 6).fg,
+        colors::FILTER_KEYWORD
+    );
+    for buffer in [&tooltip, &editor] {
+        for (text, offset, color) in [
+            ("Status is none of Mother", 0, colors::FILTER_FIELD),
+            ("Status is none of Mother", 7, colors::FILTER_OPERATOR),
+            ("Status is none of Mother", 18, colors::FILTER_VALUE),
+            ("Profile is any of alpha", 0, colors::FILTER_FIELD),
+            ("Profile is any of alpha", 8, colors::FILTER_OPERATOR),
+            ("Profile is any of alpha", 18, colors::FILTER_VALUE),
+            ("Showing 1 of 2 worktrees · 1 hidden", 8, colors::SUCCESS),
+            ("Showing 1 of 2 worktrees · 1 hidden", 13, colors::WHITE),
+            ("Showing 1 of 2 worktrees · 1 hidden", 15, colors::BRAND),
+            ("Showing 1 of 2 worktrees · 1 hidden", 27, colors::ACCENT),
+        ] {
+            assert_eq!(cell_at(buffer, text, offset).fg, color, "{text} +{offset}");
+        }
+    }
+    // The selection bar keeps the syntax colors of the focused rule.
+    let focused = cell_at(&editor, "Status is none of Mother", 0);
+    assert_eq!(
+        (focused.fg, focused.bg),
+        (colors::FILTER_FIELD, colors::BG_SELECTED)
+    );
+}
+
+#[test]
+fn global_filter_editor_tab_switches_sections_and_arrows_stay_inside_them() {
+    use wisetree::config::schema::{
+        DashboardFilterField as F, DashboardFilterOperator as O, DashboardFilterRule,
+    };
+    let mut filter = profile_filter("alpha");
+    filter.groups[0].rules.push(DashboardFilterRule {
+        field: F::Branch,
+        operator: O::Contains,
+        values: vec!["bug".into()],
+    });
+    let mut screen = global_screen(vec![]).with_filter(filter);
+    filter_ctrl_f(&mut screen);
+    let focused_rule = |screen: &mut DashboardScreen| {
+        dump_lines(120, 35, |f| screen.render(f, f.area()))
+            .lines()
+            .find(|line| line.contains('➤'))
+            .map(str::to_string)
+    };
+    // ↑↓ wrap inside the rules and never fall through to the buttons.
+    for (code, rule) in [
+        (KeyCode::Down, "Branch contains bug"),
+        (KeyCode::Down, "Profile is any of alpha"),
+        (KeyCode::Up, "Branch contains bug"),
+    ] {
+        screen.handle_key(key(code));
+        assert!(focused_rule(&mut screen).unwrap().contains(rule), "{rule}");
+    }
+    // Tab moves to the buttons (+ Rule); arrows cycle through them.
+    screen.handle_key(key(KeyCode::Tab));
+    assert_eq!(focused_rule(&mut screen), None);
+    assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("Tab Rules"));
+    screen.handle_key(key(KeyCode::Up)); // wraps to Cancel
+    screen.handle_key(key(KeyCode::Left)); // Apply
+    screen.handle_key(key(KeyCode::Right)); // Cancel
+    screen.handle_key(key(KeyCode::Down)); // wraps to + Rule
+                                           // Tab returns to the rule it left, which Delete then removes.
+    screen.handle_key(key(KeyCode::Tab));
+    assert!(focused_rule(&mut screen)
+        .unwrap()
+        .contains("Branch contains bug"));
+    screen.handle_key(key(KeyCode::Delete));
+    screen.handle_key(key(KeyCode::Tab));
+    screen.handle_key(key(KeyCode::Left)); // Cancel
+    screen.handle_key(key(KeyCode::Left)); // Apply
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        DashboardAction::PersistFilter(profile_filter("alpha"))
+    );
+}
+
+#[test]
+fn global_filter_editor_spaces_header_buttons_and_hint() {
+    let mut screen = global_screen(vec![]);
+    filter_ctrl_f(&mut screen);
+    let rendered = dump_lines(120, 35, |f| screen.render(f, f.area()));
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert_eq!(lines[0], wisetree::messages::GLOBAL_FILTER_TITLE);
+    assert_eq!(lines[1], "");
+    assert!(lines[2].starts_with("Showing 0 of 0 worktrees"));
+    assert_eq!(lines[3], "");
+    assert!(lines[4].contains("Match ALL of"));
+    // One row of bordered buttons, then a blank line above the hint.
+    let buttons = lines.iter().position(|l| l.contains("+ Rule")).unwrap();
+    for label in wisetree::messages::GLOBAL_FILTER_BUTTONS {
+        assert!(lines[buttons].contains(&format!("│ {label} │")), "{label}");
+    }
+    assert_eq!(lines[buttons + 2], "");
+    assert!(lines[buttons + 3].starts_with("↑↓ Move"));
 }

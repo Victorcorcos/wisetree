@@ -5357,10 +5357,11 @@ mod tests {
                 let tx = app_event_tx();
                 let dashboard = app.dashboard.as_mut().unwrap();
                 dashboard.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-                // The default rule has focus: remove it, then Tab through the buttons to Apply.
+                // The default rule has focus: remove it, leaving focus on the buttons, then
+                // move right to Apply.
                 dashboard.handle_key(key(KeyCode::Delete));
                 for _ in 0..4 {
-                    dashboard.handle_key(key(KeyCode::Tab));
+                    dashboard.handle_key(key(KeyCode::Right));
                 }
                 let action = dashboard.handle_scoped_key(key(KeyCode::Enter));
                 assert!(matches!(
@@ -5379,7 +5380,7 @@ mod tests {
                 let dashboard = app.dashboard.as_mut().unwrap();
                 dashboard.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
                 for _ in 0..4 {
-                    dashboard.handle_key(key(KeyCode::Tab));
+                    dashboard.handle_key(key(KeyCode::Right));
                 }
                 assert_eq!(
                     dashboard.handle_key(key(KeyCode::Enter)),
@@ -5389,13 +5390,14 @@ mod tests {
                 std::fs::create_dir(&path).unwrap();
                 let dashboard = app.dashboard.as_mut().unwrap();
                 dashboard.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-                // Reset to default, then Apply.
+                // Reset to default (focus lands on its rule), then Tab to the buttons and Apply.
                 for _ in 0..2 {
-                    dashboard.handle_key(key(KeyCode::Tab));
+                    dashboard.handle_key(key(KeyCode::Right));
                 }
                 dashboard.handle_key(key(KeyCode::Enter));
-                for _ in 0..5 {
-                    dashboard.handle_key(key(KeyCode::Tab));
+                dashboard.handle_key(key(KeyCode::Tab));
+                for _ in 0..4 {
+                    dashboard.handle_key(key(KeyCode::Right));
                 }
                 let action = dashboard.handle_scoped_key(key(KeyCode::Enter));
                 app.apply_scoped_dashboard_action(action, &tx);
@@ -5464,7 +5466,7 @@ mod tests {
                     .iter()
                     .map(|cell| cell.symbol())
                     .collect();
-                assert!(rendered.contains("[ Filter (0) ]"));
+                assert!(rendered.contains("│ Filter (0) │"));
                 assert!(rendered.contains("1 worktrees"));
                 app.handle_mouse(
                     mouse(MouseEventKind::Moved, button.x, button.y),
