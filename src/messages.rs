@@ -263,6 +263,15 @@ pub const GLOBAL_FILTER_BUTTONS: [&str; 6] = [
     "Apply",
     "Cancel",
 ];
+/// Hover help for [`GLOBAL_FILTER_BUTTONS`], in the same order.
+pub const GLOBAL_FILTER_BUTTON_TIPS: [&str; 6] = [
+    "Add a rule to the current group; a worktree must match every rule in a group (AND).",
+    "Start a new group; a worktree is shown when any group matches (OR).",
+    "Restore the default filter, which hides Mother worktrees.",
+    "Remove every rule to show all worktrees.",
+    "Save this filter and return to the Global Dashboard.",
+    "Discard your changes and return to the Global Dashboard.",
+];
 pub const GLOBAL_FILTER_FIELD_STEP: &str = "1/3 · Choose a field (type to search)";
 pub const GLOBAL_FILTER_OPERATOR_STEP: &str = "2/3 · Choose an operator";
 pub const GLOBAL_FILTER_VALUE_STEP: &str = "3/3 · Choose values";
@@ -273,14 +282,14 @@ pub const GLOBAL_FILTER_RULES_HINT: [(&str, &str); 7] = [
     ("a", "Add rule"),
     ("o", "Add OR group"),
     ("Delete", "Remove"),
-    ("Tab", "Buttons"),
+    ("Tab/⇧Tab", "Sections"),
     ("Esc", "Cancel"),
 ];
 /// `(key, action)` hints while a button is focused.
 pub const GLOBAL_FILTER_BUTTONS_HINT: [(&str, &str); 4] = [
     ("←→", "Move"),
     ("Enter", "Select"),
-    ("Tab", "Rules"),
+    ("Tab/⇧Tab", "Sections"),
     ("Esc", "Cancel"),
 ];
 pub const GLOBAL_FILTER_VALUE_HINT: [(&str, &str); 6] = [

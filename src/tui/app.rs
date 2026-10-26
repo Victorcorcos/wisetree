@@ -5357,12 +5357,10 @@ mod tests {
                 let tx = app_event_tx();
                 let dashboard = app.dashboard.as_mut().unwrap();
                 dashboard.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-                // The default rule has focus: remove it, leaving focus on the buttons, then
-                // move right to Apply.
+                // The default rule has focus: remove it, leaving focus on the editing
+                // buttons, then Tab to Apply.
                 dashboard.handle_key(key(KeyCode::Delete));
-                for _ in 0..4 {
-                    dashboard.handle_key(key(KeyCode::Right));
-                }
+                dashboard.handle_key(key(KeyCode::Tab));
                 let action = dashboard.handle_scoped_key(key(KeyCode::Enter));
                 assert!(matches!(
                     action,
@@ -5379,9 +5377,7 @@ mod tests {
                 // An unchanged Apply must not ask the app to write again.
                 let dashboard = app.dashboard.as_mut().unwrap();
                 dashboard.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-                for _ in 0..4 {
-                    dashboard.handle_key(key(KeyCode::Right));
-                }
+                dashboard.handle_key(key(KeyCode::Tab));
                 assert_eq!(
                     dashboard.handle_key(key(KeyCode::Enter)),
                     DashboardAction::Continue
@@ -5390,15 +5386,12 @@ mod tests {
                 std::fs::create_dir(&path).unwrap();
                 let dashboard = app.dashboard.as_mut().unwrap();
                 dashboard.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-                // Reset to default (focus lands on its rule), then Tab to the buttons and Apply.
+                // Reset to default (focus lands on its rule), then Shift+Tab to Apply.
                 for _ in 0..2 {
                     dashboard.handle_key(key(KeyCode::Right));
                 }
                 dashboard.handle_key(key(KeyCode::Enter));
-                dashboard.handle_key(key(KeyCode::Tab));
-                for _ in 0..4 {
-                    dashboard.handle_key(key(KeyCode::Right));
-                }
+                dashboard.handle_key(key(KeyCode::BackTab));
                 let action = dashboard.handle_scoped_key(key(KeyCode::Enter));
                 app.apply_scoped_dashboard_action(action, &tx);
                 assert_eq!(app.toast.current().unwrap().variant, ToastVariant::Error);

@@ -1,9 +1,9 @@
 //! Global Dashboard filter evaluation. The editor and dashboard share this model.
 
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 
 use crate::config::schema::{
     DashboardFilter, DashboardFilterField, DashboardFilterKind, DashboardFilterOperator,
@@ -176,7 +176,8 @@ fn field_values(field: DashboardFilterField, row: &DashboardRow) -> Vec<String> 
 pub struct DashboardFilterEditor {
     draft: DashboardFilter,
     focus: usize,
-    rule_focus: usize,
+    /// Last focus offset inside each Tab section, restored on re-entry.
+    section_focus: [usize; 3],
     step: EditorStep,
     target: (usize, Option<usize>),
     field: DashboardFilterField,
@@ -186,6 +187,7 @@ pub struct DashboardFilterEditor {
     choice: usize,
     error: Option<&'static str>,
     hits: Vec<(ratatui::layout::Rect, EditorHit)>,
+    pointer: Option<Position>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -215,7 +217,7 @@ impl DashboardFilterEditor {
         Self {
             draft: filter,
             focus: 0,
-            rule_focus: 0,
+            section_focus: [0; 3],
             step: EditorStep::Overview,
             target: (0, None),
             field: DashboardFilterField::Status,
@@ -225,7 +227,39 @@ impl DashboardFilterEditor {
             choice: 0,
             error: None,
             hits: Vec::new(),
+            pointer: None,
         }
+    }
+
+    /// Focus ranges in Tab order: the rules, the editing buttons, then
+    /// Apply / Cancel. Button focus indexes follow the rule indexes.
+    fn sections(&self) -> [std::ops::Range<usize>; 3] {
+        let count = self.draft.rule_count();
+        let end = count + messages::GLOBAL_FILTER_BUTTONS.len();
+        [
+            0..count,
+            count..end - COMMIT_BUTTONS,
+            end - COMMIT_BUTTONS..end,
+        ]
+    }
+
+    /// Tab / Shift+Tab: move to the next / previous section (skipping the
+    /// rules when there are none), back where it was last left.
+    fn cycle_section(&mut self, forward: bool) {
+        let sections = self.sections();
+        let current = sections
+            .iter()
+            .position(|section| section.contains(&self.focus))
+            .unwrap_or(1);
+        self.section_focus[current] = self.focus - sections[current].start;
+        let mut next = current;
+        loop {
+            next = (next + if forward { 1 } else { 2 }) % 3;
+            if !sections[next].is_empty() {
+                break;
+            }
+        }
+        self.focus = sections[next].start + self.section_focus[next].min(sections[next].len() - 1);
     }
 
     fn rules(&self) -> Vec<(usize, usize)> {
@@ -506,15 +540,19 @@ impl DashboardFilterEditor {
             if let Some(&(group, _)) = self.rules().get(self.focus) {
                 self.target.0 = group;
             }
-            let count = self.draft.rule_count();
-            // Arrows move inside the focused section (rules or buttons);
-            // Tab switches sections, returning to the rule it left.
-            let in_rules = self.focus < count;
-            let (start, len) = if in_rules {
-                (0, count)
-            } else {
-                (count, messages::GLOBAL_FILTER_BUTTONS.len())
+            // Arrows move inside the focused section (rules, editing buttons
+            // or Apply / Cancel); Tab and Shift+Tab move between sections.
+            let sections = self.sections();
+            let Some(section) = sections
+                .iter()
+                .find(|section| section.contains(&self.focus))
+                .cloned()
+            else {
+                self.focus = 0;
+                return FilterEditorOutcome::Pending;
             };
+            let in_rules = sections[0].contains(&self.focus);
+            let (start, len) = (section.start, section.len());
             let previous = start + (self.focus - start + len - 1) % len;
             let next = start + (self.focus - start + 1) % len;
             match key.code {
@@ -522,13 +560,8 @@ impl DashboardFilterEditor {
                 KeyCode::Down => self.focus = next,
                 KeyCode::Left if !in_rules => self.focus = previous,
                 KeyCode::Right if !in_rules => self.focus = next,
-                KeyCode::Tab | KeyCode::BackTab if in_rules => {
-                    self.rule_focus = self.focus;
-                    self.focus = count;
-                }
-                KeyCode::Tab | KeyCode::BackTab if count > 0 => {
-                    self.focus = self.rule_focus.min(count - 1)
-                }
+                KeyCode::Tab => self.cycle_section(true),
+                KeyCode::BackTab => self.cycle_section(false),
                 KeyCode::Enter => return self.activate(),
                 KeyCode::Char('a') => self.start_rule(self.focused_group(), None),
                 KeyCode::Char('o') => self.start_rule(self.draft.groups.len(), None),
@@ -659,7 +692,7 @@ impl DashboardFilterEditor {
         };
         // Commit actions (Apply/Cancel, Next/Back) hug the right edge.
         let labels: Vec<&str> = buttons.iter().map(|(label, ..)| *label).collect();
-        let grid = button_grid(area.width, &labels, 2);
+        let grid = button_grid(area.width, &labels, COMMIT_BUTTONS);
         let button_rows = grid.iter().map(|(_, row, _)| row + 1).max().unwrap_or(0);
         let chunks = Layout::vertical([
             Constraint::Length(1),
@@ -693,11 +726,17 @@ impl DashboardFilterEditor {
         } else {
             self.render_step(frame, chunks[4], rows);
         }
-        for ((x, row, width), (label, color, focused, hit)) in grid.into_iter().zip(buttons) {
+        let mut hovered = None;
+        for (index, ((x, row, width), (label, color, focused, hit))) in
+            grid.into_iter().zip(buttons).enumerate()
+        {
             let rect =
                 Rect::new(chunks[6].x + x, chunks[6].y + row * 3, width, 3).intersection(chunks[6]);
             render_button(frame, rect, label, color, focused);
             self.hits.push((rect, hit));
+            if overview && self.pointer.is_some_and(|pointer| rect.contains(pointer)) {
+                hovered = Some((rect, messages::GLOBAL_FILTER_BUTTON_TIPS[index], color));
+            }
         }
         let hint: Vec<(&'static str, &'static str)> = if !overview {
             // Enter does what the confirm button says: Next, or Save on the last step.
@@ -708,13 +747,20 @@ impl DashboardFilterEditor {
         } else if self.focus < count {
             messages::GLOBAL_FILTER_RULES_HINT.to_vec()
         } else {
-            // Without rules there is no other section for Tab to reach.
-            messages::GLOBAL_FILTER_BUTTONS_HINT
-                .into_iter()
-                .filter(|(key, _)| count > 0 || *key != "Tab")
-                .collect()
+            messages::GLOBAL_FILTER_BUTTONS_HINT.to_vec()
         };
         frame.render_widget(Paragraph::new(hint_line(&hint)), chunks[8]);
+        if let Some((button, tip, color)) = hovered {
+            render_button_tip(frame, area, button, tip, color);
+        }
+    }
+
+    pub fn handle_mouse_move(&mut self, position: Position) {
+        self.pointer = Some(position);
+    }
+
+    pub fn clear_hover(&mut self) {
+        self.pointer = None;
     }
 
     /// One bordered card per OR group; the focused rule gets the selection bar.
@@ -991,7 +1037,8 @@ fn or_line() -> Line<'static> {
     ])
 }
 
-/// `Showing 17 of 37 worktrees · 20 hidden`, each count colored by meaning.
+/// `Showing 17 of 37 worktrees · 20 hidden`: the visible count green,
+/// `37 worktrees` purple and `20 hidden` orange (muted when nothing hides).
 pub(super) fn summary_line(visible: usize, total: usize) -> Line<'static> {
     let [showing, of, worktrees, hidden_label] = messages::GLOBAL_FILTER_SUMMARY;
     let hidden = total.saturating_sub(visible);
@@ -1005,18 +1052,19 @@ pub(super) fn summary_line(visible: usize, total: usize) -> Line<'static> {
         Span::styled(showing, muted()),
         count(visible, colors::SUCCESS),
         Span::styled(of, muted()),
-        count(total, colors::WHITE),
+        count(total, colors::BRAND),
     ];
     spans.extend(branded_line(worktrees, muted()));
-    spans.push(count(
-        hidden,
-        if hidden == 0 {
-            colors::MUTED
-        } else {
-            colors::ACCENT
-        },
+    let hidden_color = if hidden == 0 {
+        colors::MUTED
+    } else {
+        colors::ACCENT
+    };
+    spans.push(count(hidden, hidden_color));
+    spans.push(Span::styled(
+        hidden_label,
+        Style::default().fg(hidden_color),
     ));
-    spans.push(Span::styled(hidden_label, muted()));
     Line::from(spans)
 }
 
@@ -1113,6 +1161,44 @@ pub(super) fn render_button(
         area,
     );
 }
+
+/// Hover help drawn just above `button`, in the button's color, kept
+/// inside `area`; long text wraps when the area is narrow.
+fn render_button_tip(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    button: Rect,
+    tip: &str,
+    color: Color,
+) {
+    let width = (Line::from(tip).width() as u16 + 4).min(area.width);
+    let paragraph = Paragraph::new(tip)
+        .wrap(Wrap { trim: true })
+        .style(Style::default().fg(colors::EMPHASIS).bg(colors::BG))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(color))
+                .padding(Padding::horizontal(1)),
+        );
+    let height =
+        (paragraph.line_count(width.saturating_sub(4)) as u16).min(button.y.saturating_sub(area.y));
+    if width < 5 || height < 3 {
+        return;
+    }
+    let tip_area = Rect::new(
+        button.x.min(area.right().saturating_sub(width)),
+        button.y - height,
+        width,
+        height,
+    );
+    frame.render_widget(ratatui::widgets::Clear, tip_area);
+    frame.render_widget(paragraph, tip_area);
+}
+
+/// Apply / Cancel (and Next / Back) sit apart, at the right edge.
+const COMMIT_BUTTONS: usize = 2;
 
 pub(super) fn button_width(label: &str) -> u16 {
     Line::from(label).width() as u16 + 4

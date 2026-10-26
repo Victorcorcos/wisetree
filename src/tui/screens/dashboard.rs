@@ -467,12 +467,18 @@ impl DashboardScreen {
     }
 
     pub fn handle_mouse_move(&mut self, position: Position) {
+        if let Some(editor) = &mut self.filter_editor {
+            editor.handle_mouse_move(position);
+        }
         self.pointer =
             (self.mode == DashboardMode::Table && self.filter_editor.is_none()).then_some(position);
     }
 
     pub fn clear_filter_hover(&mut self) {
         self.pointer = None;
+        if let Some(editor) = &mut self.filter_editor {
+            editor.clear_hover();
+        }
     }
 
     /// Use this entry point for global scope so actions retain repository identity.

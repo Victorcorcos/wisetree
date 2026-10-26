@@ -2360,10 +2360,9 @@ fn global_filter_editor_builds_and_or_rules_applies_rows_and_persists_json() {
     // Latest polling data changes counts without losing the draft.
     screen.set_rows(rows[..4].to_vec());
     assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("Showing 3 of 4 worktrees"));
-    // Tab from the focused rule reaches + Rule, then Apply is four buttons right.
-    screen.handle_key(key(KeyCode::Tab));
-    for _ in 0..4 {
-        screen.handle_key(key(KeyCode::Right));
+    // Tab from the focused rule reaches the editing buttons, then Apply / Cancel.
+    for _ in 0..2 {
+        screen.handle_key(key(KeyCode::Tab));
     }
     let action = screen.handle_scoped_key(key(KeyCode::Enter));
     let rule = |field, operator, values: &[&str]| DashboardFilterRule {
@@ -2632,9 +2631,10 @@ fn global_filter_rules_read_like_highlighted_code_in_tooltip_and_editor() {
             ("Profile is any of alpha", 8, colors::FILTER_OPERATOR),
             ("Profile is any of alpha", 18, colors::FILTER_VALUE),
             ("Showing 1 of 2 worktrees · 1 hidden", 8, colors::SUCCESS),
-            ("Showing 1 of 2 worktrees · 1 hidden", 13, colors::WHITE),
+            ("Showing 1 of 2 worktrees · 1 hidden", 13, colors::BRAND),
             ("Showing 1 of 2 worktrees · 1 hidden", 15, colors::BRAND),
             ("Showing 1 of 2 worktrees · 1 hidden", 27, colors::ACCENT),
+            ("Showing 1 of 2 worktrees · 1 hidden", 29, colors::ACCENT),
         ] {
             assert_eq!(cell_at(buffer, text, offset).fg, color, "{text} +{offset}");
         }
@@ -2647,10 +2647,23 @@ fn global_filter_rules_read_like_highlighted_code_in_tooltip_and_editor() {
     );
 }
 
+/// The overview button whose label row is filled, i.e. keyboard focused.
+fn focused_filter_button(screen: &mut DashboardScreen) -> Option<&'static str> {
+    let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let buffer = terminal.backend().buffer();
+    wisetree::messages::GLOBAL_FILTER_BUTTONS
+        .into_iter()
+        .find(|label| {
+            cell_at(buffer, &format!("│ {label} │"), 2).bg != ratatui::style::Color::Reset
+        })
+}
+
 #[test]
-fn global_filter_editor_tab_switches_sections_and_arrows_stay_inside_them() {
+fn global_filter_editor_tab_cycles_three_sections_and_arrows_stay_inside_them() {
     use wisetree::config::schema::{
-        DashboardFilterField as F, DashboardFilterOperator as O, DashboardFilterRule,
+        DashboardFilter, DashboardFilterField as F, DashboardFilterOperator as O,
+        DashboardFilterRule,
     };
     let mut filter = profile_filter("alpha");
     filter.groups[0].rules.push(DashboardFilterRule {
@@ -2666,6 +2679,10 @@ fn global_filter_editor_tab_switches_sections_and_arrows_stay_inside_them() {
             .find(|line| line.contains('➤'))
             .map(str::to_string)
     };
+    let press = |screen: &mut DashboardScreen, code: KeyCode| {
+        screen.handle_key(key(code));
+        focused_filter_button(screen)
+    };
     // ↑↓ wrap inside the rules and never fall through to the buttons.
     for (code, rule) in [
         (KeyCode::Down, "Branch contains bug"),
@@ -2675,27 +2692,64 @@ fn global_filter_editor_tab_switches_sections_and_arrows_stay_inside_them() {
         screen.handle_key(key(code));
         assert!(focused_rule(&mut screen).unwrap().contains(rule), "{rule}");
     }
-    // Tab moves to the buttons (+ Rule); arrows cycle through them.
-    screen.handle_key(key(KeyCode::Tab));
+    // Tab: rules → editing buttons, where arrows wrap among the four.
+    assert_eq!(press(&mut screen, KeyCode::Tab), Some("+ Rule"));
     assert_eq!(focused_rule(&mut screen), None);
-    assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("Tab Rules"));
-    screen.handle_key(key(KeyCode::Up)); // wraps to Cancel
-    screen.handle_key(key(KeyCode::Left)); // Apply
-    screen.handle_key(key(KeyCode::Right)); // Cancel
-    screen.handle_key(key(KeyCode::Down)); // wraps to + Rule
-                                           // Tab returns to the rule it left, which Delete then removes.
-    screen.handle_key(key(KeyCode::Tab));
+    assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("Tab/⇧Tab Sections"));
+    assert_eq!(press(&mut screen, KeyCode::Left), Some("Clear all"));
+    assert_eq!(press(&mut screen, KeyCode::Right), Some("+ Rule"));
+    assert_eq!(press(&mut screen, KeyCode::Up), Some("Clear all"));
+    // Tab: editing buttons → Apply / Cancel, where arrows wrap between the two.
+    assert_eq!(press(&mut screen, KeyCode::Tab), Some("Apply"));
+    assert_eq!(press(&mut screen, KeyCode::Right), Some("Cancel"));
+    assert_eq!(press(&mut screen, KeyCode::Down), Some("Apply"));
+    // Tab wraps back to the rule it left.
+    assert_eq!(press(&mut screen, KeyCode::Tab), None);
     assert!(focused_rule(&mut screen)
         .unwrap()
         .contains("Branch contains bug"));
-    screen.handle_key(key(KeyCode::Delete));
-    screen.handle_key(key(KeyCode::Tab));
-    screen.handle_key(key(KeyCode::Left)); // Cancel
-    screen.handle_key(key(KeyCode::Left)); // Apply
+    // Shift+Tab walks the sections backwards, each restoring its last focus.
+    assert_eq!(press(&mut screen, KeyCode::BackTab), Some("Apply"));
+    assert_eq!(press(&mut screen, KeyCode::BackTab), Some("Clear all"));
+    assert_eq!(press(&mut screen, KeyCode::BackTab), None);
+    screen.handle_key(key(KeyCode::Delete)); // removes "Branch contains bug"
+    assert_eq!(press(&mut screen, KeyCode::BackTab), Some("Apply"));
     assert_eq!(
         screen.handle_key(key(KeyCode::Enter)),
         DashboardAction::PersistFilter(profile_filter("alpha"))
     );
+    // Without rules, Tab and Shift+Tab alternate between the button sections.
+    let mut screen = global_screen(vec![]).with_filter(DashboardFilter { groups: vec![] });
+    filter_ctrl_f(&mut screen);
+    assert_eq!(focused_filter_button(&mut screen), Some("+ Rule"));
+    assert_eq!(press(&mut screen, KeyCode::Tab), Some("Apply"));
+    assert_eq!(press(&mut screen, KeyCode::Tab), Some("+ Rule"));
+    assert_eq!(press(&mut screen, KeyCode::BackTab), Some("Apply"));
+}
+
+#[test]
+fn global_filter_editor_buttons_explain_themselves_on_hover() {
+    use wisetree::messages::{GLOBAL_FILTER_BUTTONS, GLOBAL_FILTER_BUTTON_TIPS};
+    let mut screen = global_screen(vec![]);
+    filter_ctrl_f(&mut screen);
+    for (label, tip) in GLOBAL_FILTER_BUTTONS.iter().zip(GLOBAL_FILTER_BUTTON_TIPS) {
+        let rendered = dump_lines(120, 35, |f| screen.render(f, f.area()));
+        assert!(!rendered.contains(tip), "{label}");
+        let (y, line) = rendered
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(&format!("│ {label} │")))
+            .unwrap();
+        let x = line[..line.find(label).unwrap()].chars().count();
+        screen.handle_mouse_move(Position::new(x as u16, y as u16));
+        let hovered = dump_lines(120, 35, |f| screen.render(f, f.area()));
+        let tip_row = hovered.lines().position(|line| line.contains(tip));
+        assert!(tip_row.is_some_and(|row| row < y), "{label}: {hovered}");
+        // Hovering never moves keyboard focus off the first rule.
+        assert!(hovered.contains("➤ Status is none of Mother"));
+        screen.handle_mouse_move(Position::new(0, 0));
+    }
+    assert!(!dump(120, 35, |f| screen.render(f, f.area())).contains(GLOBAL_FILTER_BUTTON_TIPS[0]));
 }
 
 #[test]
