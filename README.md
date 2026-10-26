@@ -282,6 +282,8 @@ Press **Enter** on a row to open its action menu. **General Commands** is a sear
 
 Some terminals send the same byte for Backspace and Ctrl+Backspace, so Wisetree cannot distinguish them. Configure your terminal to send `0x08` (Ctrl+H) for Ctrl+Backspace and `0x7f` for plain Backspace, or use **Enter → Delete worktree** from the row actions menu. On Mac keyboards, the backward-delete key is labelled **delete**; **fn+delete** is forward-delete. Wisetree also accepts **Ctrl+Delete** (forward-delete), including Terminal.app’s `ESC [ 3 ; 5 ~` encoding. Legacy terminals can send Ctrl+Backspace as `0x08` (Ctrl+H), which Wisetree accepts as the delete shortcut. If your terminal configures plain Backspace to send `^H`, it also opens the delete confirmation; the confirmation defaults to **No**.
 
+Apple Terminal on macOS 15.6 sends plain Backspace and Ctrl+Backspace identically by default. See [Apple Terminal Ctrl+Backspace setup](docs/macos-terminal-backspace.md) for a tested profile mapping that preserves plain Backspace search editing.
+
 ### Global Dashboard
 
 **Global Dashboard** shows the Dashboard for several repositories at once, grouped by the GitHub organizations and users you select. It needs the GitHub CLI (`gh`), authenticated with `gh auth login`. Listing organizations requires the `read:org` scope.
