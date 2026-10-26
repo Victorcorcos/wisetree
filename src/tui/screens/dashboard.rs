@@ -7,13 +7,19 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Padding, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::messages::colors;
+use super::dashboard_filter::{
+    button_width as filter_button_width, render_button as render_filter_button,
+    summary_line as filter_summary_line, DashboardFilterEditor, FilterEditorOutcome,
+};
+use crate::config::schema::DashboardFilter;
+
+use crate::messages::{self, colors};
 use crate::services::{
-    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRow, MergeStatus,
-    PrState, ReviewStatus,
+    CheckStatus, CommitSummary, DashboardNotice, DashboardNoticeLevel, DashboardRepository,
+    DashboardRow, MergeStatus, PrState, ReviewStatus,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
@@ -24,6 +30,25 @@ use crate::tui::widgets::{
 
 const SELECT_MARKER: &str = " ➤ ";
 const BLANK_SELECT_MARKER: &str = "   ";
+
+fn is_delete_shortcut(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
+}
+
+pub(super) fn remote_only(row: &DashboardRow) -> bool {
+    row.repository
+        .as_ref()
+        .is_some_and(|repository| repository.local_root.is_none())
+}
+
+pub(super) fn dashboard_worktree_name(row: &DashboardRow) -> String {
+    if remote_only(row) {
+        messages::GLOBAL_NOT_CLONED.to_string()
+    } else {
+        worktree_display_name(&row.worktree.path)
+    }
+}
 
 fn worktree_display_name(path: &str) -> String {
     Path::new(path)
@@ -158,6 +183,7 @@ pub enum DashboardAction {
     Continue,
     Back,
     Refresh,
+    PersistFilter(DashboardFilter),
     NavigateTo(String),
     OpenTerminal { path: String, branch: String },
     JumpToDelete(String),
@@ -172,8 +198,31 @@ pub enum DashboardAction {
     MotherWorktreeProtected,
 }
 
+/// Scope of the shared dashboard table. Repository scope preserves the original layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DashboardScope {
+    #[default]
+    Repository,
+    Global,
+}
+
+/// Global callers consume this envelope to route row actions to their repository.
+/// Screen-wide and batch actions retain their existing payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopedDashboardAction {
+    Dashboard(DashboardAction),
+    Row {
+        repository: DashboardRepository,
+        action: DashboardAction,
+    },
+    /// The App should show `messages::GLOBAL_NO_LOCAL_WORKTREE` as a toast.
+    NoLocalWorktree,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardColumn {
+    Profile,
+    Repository,
     Branch,
     From,
     Status,
@@ -243,6 +292,11 @@ impl DashboardTableLayout {
 }
 
 pub struct DashboardScreen {
+    scope: DashboardScope,
+    filter: DashboardFilter,
+    filter_editor: Option<DashboardFilterEditor>,
+    filter_button_rect: Option<Rect>,
+    pointer: Option<Position>,
     rows: Vec<DashboardRow>,
     selected: usize,
     loading: bool,
@@ -308,6 +362,11 @@ impl DashboardScreen {
         pr_enrichment_enabled: bool,
     ) -> Self {
         Self {
+            scope: DashboardScope::Repository,
+            filter: DashboardFilter::default(),
+            filter_editor: None,
+            filter_button_rect: None,
+            pointer: None,
             rows: Vec::new(),
             selected: 0,
             loading: true,
@@ -341,6 +400,140 @@ impl DashboardScreen {
             close_pr_modal: None,
             tick: 0,
         }
+    }
+
+    pub fn with_scope(mut self, scope: DashboardScope) -> Self {
+        self.scope = scope;
+        self.columns.retain(|column| {
+            !matches!(
+                column,
+                DashboardColumn::Profile | DashboardColumn::Repository
+            )
+        });
+        if scope == DashboardScope::Global {
+            self.columns.splice(
+                0..0,
+                [DashboardColumn::Profile, DashboardColumn::Repository],
+            );
+        }
+        self
+    }
+
+    pub fn with_filter(mut self, filter: DashboardFilter) -> Self {
+        self.filter = filter;
+        self.selected = self
+            .selected
+            .min(self.filtered_indices().len().saturating_sub(1));
+        self
+    }
+
+    pub fn filter(&self) -> &DashboardFilter {
+        &self.filter
+    }
+
+    fn open_filter_editor(&mut self) {
+        self.filter_editor = Some(DashboardFilterEditor::new(self.filter.clone()));
+        self.clear_filter_hover();
+    }
+
+    fn finish_filter_edit(&mut self, outcome: FilterEditorOutcome) -> DashboardAction {
+        match outcome {
+            FilterEditorOutcome::Pending => DashboardAction::Continue,
+            FilterEditorOutcome::Cancel => {
+                self.filter_editor = None;
+                DashboardAction::Continue
+            }
+            FilterEditorOutcome::Apply(filter) => {
+                self.filter_editor = None;
+                if filter == self.filter {
+                    return DashboardAction::Continue;
+                }
+                self.filter = filter.clone();
+                self.selected = 0;
+                self.footer_focus = None;
+                DashboardAction::PersistFilter(filter)
+            }
+        }
+    }
+
+    pub fn filter_button_rect(&self) -> Option<Rect> {
+        self.filter_button_rect
+    }
+
+    pub fn handle_mouse_move(&mut self, position: Position) {
+        if let Some(editor) = &mut self.filter_editor {
+            editor.handle_mouse_move(position);
+        }
+        self.pointer =
+            (self.mode == DashboardMode::Table && self.filter_editor.is_none()).then_some(position);
+    }
+
+    pub fn clear_filter_hover(&mut self) {
+        self.pointer = None;
+        if let Some(editor) = &mut self.filter_editor {
+            editor.clear_hover();
+        }
+    }
+
+    /// Use this entry point for global scope so actions retain repository identity.
+    pub fn handle_scoped_key(&mut self, key: KeyEvent) -> ScopedDashboardAction {
+        if self.filter_editor.is_none()
+            && !self.loading
+            && self.mode == DashboardMode::Table
+            && self.footer_focus.is_none()
+            && is_delete_shortcut(key)
+            && self.selected_row().is_some_and(remote_only)
+        {
+            return ScopedDashboardAction::NoLocalWorktree;
+        }
+        let repository = self.action_repository();
+        let action = self.handle_key(key);
+        self.scope_action(repository, action)
+    }
+
+    pub fn handle_scoped_mouse_click(&mut self, position: Position) -> ScopedDashboardAction {
+        let repository = self.action_repository();
+        let action = self.handle_mouse_click(position);
+        self.scope_action(repository, action)
+    }
+
+    fn action_repository(&self) -> Option<DashboardRepository> {
+        self.action_target
+            .or_else(|| self.selected_row_index())
+            .and_then(|index| self.rows.get(index))
+            .and_then(|row| row.repository.clone())
+    }
+
+    fn scope_action(
+        &self,
+        repository: Option<DashboardRepository>,
+        action: DashboardAction,
+    ) -> ScopedDashboardAction {
+        if self.scope == DashboardScope::Global
+            && !matches!(
+                action,
+                DashboardAction::Continue
+                    | DashboardAction::Back
+                    | DashboardAction::PersistFilter(..)
+                    | DashboardAction::Refresh
+                    | DashboardAction::BulkDelete(..)
+            )
+        {
+            if let Some(repository) = repository {
+                return ScopedDashboardAction::Row { repository, action };
+            }
+        }
+        ScopedDashboardAction::Dashboard(action)
+    }
+
+    pub fn rows(&self) -> &[DashboardRow] {
+        &self.rows
+    }
+
+    pub fn forget_worktrees(&mut self, paths: &[String]) {
+        let mut rows = self.rows.clone();
+        rows.retain(|row| !paths.contains(&row.worktree.path));
+        self.set_rows(rows);
     }
 
     pub fn set_rows(&mut self, rows: Vec<DashboardRow>) {
@@ -384,6 +577,9 @@ impl DashboardScreen {
     }
 
     pub fn preferred_content_height(&self) -> u16 {
+        if self.filter_editor.is_some() {
+            return 30;
+        }
         if self.loading {
             return 4;
         }
@@ -404,6 +600,19 @@ impl DashboardScreen {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DashboardAction {
+        if let Some(editor) = &mut self.filter_editor {
+            let outcome = editor.handle_key(key, &self.rows);
+            return self.finish_filter_edit(outcome);
+        }
+        // Global shortcuts precede loading and the always-on search input.
+        if self.scope == DashboardScope::Global
+            && self.mode == DashboardMode::Table
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
+        {
+            self.open_filter_editor();
+            return DashboardAction::Continue;
+        }
         if self.loading {
             return DashboardAction::Continue;
         }
@@ -485,12 +694,13 @@ impl DashboardScreen {
                 self.open_action_menu(index);
                 DashboardAction::Continue
             }
-            // Backspace on an empty search jumps directly to the delete
-            // confirmation for the highlighted worktree. While the user is
-            // typing into the search box, Backspace edits the query.
-            KeyCode::Backspace | KeyCode::Delete if self.query().is_empty() => {
+            // Handle deletion before search editing, regardless of the query.
+            _ if is_delete_shortcut(key) => {
                 if let Some(index) = self.selected_row_index() {
                     let row = &self.rows[index];
+                    if remote_only(row) {
+                        return DashboardAction::Continue;
+                    }
                     if row.worktree.is_main {
                         return DashboardAction::MotherWorktreeProtected;
                     }
@@ -544,11 +754,35 @@ impl DashboardScreen {
 
         self.row_rects.clear();
         self.pr_button_rects.clear();
+        self.filter_button_rect = None;
 
+        if let Some(editor) = &mut self.filter_editor {
+            editor.render(frame, area, &self.rows);
+            return;
+        }
         if self.loading {
+            let loading_area = if self.scope == DashboardScope::Global {
+                Rect {
+                    y: area.y.saturating_add(area.height.min(1)),
+                    height: area.height.saturating_sub(1),
+                    ..area
+                }
+            } else {
+                area
+            };
             StatusIndicator::new(Status::Loading, "Loading dashboard...")
                 .with_tick(self.tick)
-                .render(frame, area);
+                .render(frame, loading_area);
+            if self.scope == DashboardScope::Global {
+                self.render_status_banner(
+                    frame,
+                    Rect {
+                        height: area.height.min(3),
+                        ..area
+                    },
+                );
+                self.render_filter_tooltip(frame, area);
+            }
             return;
         }
         if let Some(error) = &self.error {
@@ -575,11 +809,20 @@ impl DashboardScreen {
             ])
             .split(area);
 
-        frame.render_widget(Paragraph::new(self.status_banner()), chunks[0]);
-        frame.render_widget(Paragraph::new(self.search_line()), chunks[2]);
+        self.render_status_banner(frame, chunks[0].union(chunks[2]));
+        // The Filter button spans the banner and search rows at the right.
+        let search = Rect {
+            width: self.filter_button_rect.map_or(chunks[2].width, |button| {
+                button.x.saturating_sub(chunks[2].x + 1)
+            }),
+            ..chunks[2]
+        };
+        frame.render_widget(Paragraph::new(self.search_line()), search);
         let layout = self.table_layout(chunks[4].width);
         self.render_table(frame, chunks[4], &layout);
         self.render_footer(frame, chunks[5], chunks[4].width, &layout);
+
+        self.render_filter_tooltip(frame, area);
 
         // The Close PR confirmation is owned by the dashboard so the table
         // and footer stay visible behind it. `ConfirmationModal::render`
@@ -657,9 +900,17 @@ impl DashboardScreen {
     /// Returns the worktree paths whose live status matches `status`,
     /// excluding the main repository checkout (never deletable).
     fn bulk_target_paths(&self, status: BulkDeleteStatus) -> Vec<String> {
+        let filtered = (self.scope == DashboardScope::Global).then(|| self.filtered_indices());
         self.rows
             .iter()
-            .filter(|row| !row.worktree.is_main)
+            .enumerate()
+            .filter(|(index, _)| {
+                filtered
+                    .as_ref()
+                    .map_or(true, |indices| indices.contains(index))
+            })
+            .map(|(_, row)| row)
+            .filter(|row| !remote_only(row) && !row.worktree.is_main)
             .filter(|row| row_matches_bulk_status(row, status))
             .map(|row| row.worktree.path.clone())
             .collect()
@@ -668,6 +919,19 @@ impl DashboardScreen {
     /// Hit-test a mouse position against the latest captured button
     /// rects. Public so `App::handle_mouse` can dispatch clicks.
     pub fn handle_mouse_click(&mut self, position: Position) -> DashboardAction {
+        if let Some(editor) = &mut self.filter_editor {
+            let outcome = editor.handle_mouse_click(position, &self.rows);
+            return self.finish_filter_edit(outcome);
+        }
+        if self.scope == DashboardScope::Global
+            && self.mode == DashboardMode::Table
+            && self
+                .filter_button_rect
+                .is_some_and(|rect| rect.contains(position))
+        {
+            self.open_filter_editor();
+            return DashboardAction::Continue;
+        }
         if matches!(self.mode, DashboardMode::ConfirmClosePr) {
             let outcome = match self.close_pr_modal.as_mut() {
                 Some((modal, _)) => modal.handle_mouse_click(position),
@@ -753,6 +1017,9 @@ impl DashboardScreen {
     /// button row built by [`Self::build_pr_commands`].
     fn build_action_select(&self, row: &DashboardRow) -> SelectPrompt<ActionChoice> {
         let mut options = Vec::new();
+        if remote_only(row) {
+            return SelectPrompt::new("General Commands", options).without_hint();
+        }
         if self.is_from_wrapper {
             options.push(SelectOption::new(
                 "Navigate to Directory",
@@ -797,6 +1064,10 @@ impl DashboardScreen {
                 choice: ActionChoice::OpenPullRequest,
                 color: colors::PRIMARY,
             });
+            // Remote-only rows have no checkout for any other PR command.
+            if remote_only(row) {
+                return commands;
+            }
             if pr.state == PrState::Open {
                 commands.push(PrCommand {
                     label: "Merge",
@@ -852,7 +1123,9 @@ impl DashboardScreen {
         let row = self.rows[index].clone();
         self.action_select = Some(self.build_action_select(&row));
         self.pr_commands = self.build_pr_commands(&row);
-        self.action_pr_focus = None;
+        self.action_pr_focus = remote_only(&row)
+            .then_some(0)
+            .filter(|_| !self.pr_commands.is_empty());
         self.last_pr_focus = 0;
         self.action_target = Some(index);
         self.mode = DashboardMode::ActionMenu;
@@ -890,6 +1163,10 @@ impl DashboardScreen {
     fn toggle_action_focus(&mut self) {
         if self.pr_commands.is_empty() {
             self.action_pr_focus = None;
+            return;
+        }
+        if self.general_command_labels().is_empty() {
+            self.action_pr_focus = Some(0);
             return;
         }
         self.action_pr_focus = match self.action_pr_focus {
@@ -1014,6 +1291,9 @@ impl DashboardScreen {
     /// buttons, and mouse clicks so every path dispatches identically.
     fn dispatch_action_choice(&mut self, choice: ActionChoice, index: usize) -> DashboardAction {
         let row = &self.rows[index];
+        if remote_only(row) && choice != ActionChoice::OpenPullRequest {
+            return DashboardAction::Continue;
+        }
         let path = row.worktree.path.clone();
         let branch = row.worktree.branch.clone();
         let is_main = row.worktree.is_main;
@@ -1118,7 +1398,9 @@ impl DashboardScreen {
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
-                if tokens.is_empty() || self.row_matches_query(row, &tokens) {
+                if (self.scope != DashboardScope::Global || self.filter.matches(row))
+                    && (tokens.is_empty() || self.row_matches_query(row, &tokens))
+                {
                     Some(index)
                 } else {
                     None
@@ -1140,6 +1422,14 @@ impl DashboardScreen {
             // (`clean`/`dirty`/`opened`/`merged`).
             status_label_and_style(row).0.to_ascii_lowercase(),
         ];
+        if self.scope == DashboardScope::Global {
+            if let Some(repository) = &row.repository {
+                haystacks.push(repository.owner.to_ascii_lowercase());
+                haystacks.push(repository.name.to_ascii_lowercase());
+                haystacks
+                    .push(format!("{}/{}", repository.owner, repository.name).to_ascii_lowercase());
+            }
+        }
         // Ahead/Behind column text — match the rendered "+N -N" / "=0" form
         // and also raw "ahead N", "behind N" so either spelling filters.
         if let Some(branch_status) = &row.worktree.branch_status {
@@ -1198,13 +1488,19 @@ impl DashboardScreen {
     }
 
     fn status_banner(&self) -> Line<'static> {
-        let dirty = self
-            .rows
+        let visible: Vec<&DashboardRow> = if self.scope == DashboardScope::Global {
+            self.filtered_indices()
+                .into_iter()
+                .map(|index| &self.rows[index])
+                .collect()
+        } else {
+            self.rows.iter().collect()
+        };
+        let dirty = visible
             .iter()
             .filter(|row| status_label_and_style(row).0 == "Dirty")
             .count();
-        let open_prs = self
-            .rows
+        let open_prs = visible
             .iter()
             .filter(|row| {
                 matches!(
@@ -1217,17 +1513,112 @@ impl DashboardScreen {
             Some(instant) => format_refreshed_label(instant.elapsed()),
             None => "Waiting for first refresh".to_string(),
         };
+        let count = if self.scope == DashboardScope::Global {
+            if self.loading || visible.len() != self.rows.len() {
+                format!("{} of {}", visible.len(), self.rows.len())
+            } else {
+                visible.len().to_string()
+            }
+        } else {
+            self.rows
+                .iter()
+                .filter(|row| !remote_only(row))
+                .count()
+                .to_string()
+        };
         Line::from(vec![
             Span::styled(refreshed, Style::default().fg(colors::INFO)),
             Span::styled(" - ", Style::default().fg(colors::MUTED)),
             Span::raw(format!(
                 "{} worktrees, {} dirty, {} {} open",
-                self.rows.len(),
+                count,
                 dirty,
                 open_prs,
                 if open_prs == 1 { "PR" } else { "PRs" }
             )),
         ])
+    }
+
+    /// `area` is the header band: the banner sits on its first row and, in
+    /// global scope, the bordered Filter button spans its full height.
+    fn render_status_banner(&mut self, frame: &mut Frame, area: Rect) {
+        let banner = Rect {
+            height: area.height.min(1),
+            ..area
+        };
+        if self.scope != DashboardScope::Global {
+            frame.render_widget(Paragraph::new(self.status_banner()), banner);
+            return;
+        }
+        let label = format!(
+            "{} ({})",
+            messages::GLOBAL_FILTER_BUTTON,
+            self.filter.rule_count()
+        );
+        let width = filter_button_width(&label).min(area.width);
+        let button = Rect {
+            x: area.right().saturating_sub(width),
+            width,
+            ..area
+        };
+        let text = Rect {
+            width: area.width.saturating_sub(width + 1),
+            ..banner
+        };
+        frame.render_widget(Paragraph::new(self.status_banner()), text);
+        render_filter_button(frame, button, &label, colors::GRAY_LIGHT, false);
+        self.filter_button_rect = Some(button);
+    }
+
+    fn render_filter_tooltip(&self, frame: &mut Frame, panel: Rect) {
+        if self.scope != DashboardScope::Global || self.mode != DashboardMode::Table {
+            return;
+        }
+        let Some(button) = self.filter_button_rect else {
+            return;
+        };
+        if !self.pointer.is_some_and(|pointer| button.contains(pointer)) {
+            return;
+        }
+        let width = panel.width.min(78);
+        let available_height = panel.bottom().saturating_sub(button.bottom());
+        if width < 4 || available_height < 3 {
+            return;
+        }
+        let mut lines = self.filter.tooltip_lines(width.saturating_sub(4) as usize);
+        if self.filter.rule_count() > 0 {
+            lines.push(Line::default());
+            lines.push(filter_summary_line(
+                self.filtered_indices().len(),
+                self.rows.len(),
+            ));
+        }
+        let height = (lines.len() as u16).saturating_add(2).min(available_height);
+        let content_height = height.saturating_sub(2) as usize;
+        if lines.len() > content_height {
+            let summary = lines.pop().unwrap_or_default();
+            lines.truncate(content_height.saturating_sub(1));
+            lines.push(summary);
+        }
+        let tooltip = Rect::new(
+            panel.right().saturating_sub(width),
+            button.bottom(),
+            width,
+            height,
+        );
+        frame.render_widget(Clear, tooltip);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::default().fg(colors::EMPHASIS).bg(colors::BG))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(colors::PRIMARY))
+                        .padding(Padding::horizontal(1)),
+                ),
+            tooltip,
+        );
     }
 
     fn search_line(&self) -> Line<'_> {
@@ -1253,7 +1644,15 @@ impl DashboardScreen {
     fn render_table(&mut self, frame: &mut Frame, area: Rect, layout: &DashboardTableLayout) {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
-            let message = if self.rows.is_empty() {
+            let message = if self.scope == DashboardScope::Global {
+                if self.rows.is_empty() {
+                    messages::GLOBAL_DASHBOARD_EMPTY
+                } else if !self.rows.iter().any(|row| self.filter.matches(row)) {
+                    messages::GLOBAL_DASHBOARD_FILTER_HIDDEN
+                } else {
+                    messages::GLOBAL_DASHBOARD_NO_MATCHES
+                }
+            } else if self.rows.is_empty() {
                 "No worktrees found."
             } else {
                 "No worktrees match the current filter."
@@ -1371,7 +1770,7 @@ impl DashboardScreen {
             Span::raw(marker),
             Span::styled(
                 truncate(
-                    &worktree_display_name(&row.worktree.path),
+                    &dashboard_worktree_name(row),
                     layout
                         .worktree_width
                         .saturating_sub(marker.chars().count() as u16) as usize,
@@ -1620,7 +2019,7 @@ impl DashboardScreen {
 
     fn shortcuts_line(&self) -> Line<'static> {
         Line::from(Span::styled(
-            "↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type to Search  Ctrl+R Refresh  Esc Clear / Back",
+            format!("↑↓ Navigate  ↵ Actions{}  {}  Tab Bulk Delete  Type to Search  Ctrl+R Refresh  Esc Clear / Back", if self.scope == DashboardScope::Global { messages::GLOBAL_FILTER_SHORTCUT } else { "" }, messages::DASHBOARD_DELETE_SHORTCUT),
             Style::default()
                 .fg(colors::MUTED)
                 .add_modifier(Modifier::DIM),
@@ -1890,7 +2289,11 @@ impl DashboardScreen {
             let header = Line::from(vec![
                 Span::raw("Selected: "),
                 Span::styled(
-                    fold_home(&row.worktree.path),
+                    if remote_only(row) {
+                        messages::GLOBAL_NOT_CLONED.to_string()
+                    } else {
+                        fold_home(&row.worktree.path)
+                    },
                     Style::default().fg(colors::PRIMARY),
                 ),
                 Span::raw(" "),
@@ -1902,8 +2305,10 @@ impl DashboardScreen {
             frame.render_widget(Paragraph::new(header), chunks[0]);
         }
 
-        if let Some(select) = &self.action_select {
-            select.render(frame, chunks[1]);
+        if !self.general_command_labels().is_empty() {
+            if let Some(select) = &self.action_select {
+                select.render(frame, chunks[1]);
+            }
         }
 
         if pr_section_height > 0 {
@@ -2025,7 +2430,7 @@ impl DashboardScreen {
         let longest_path = self
             .rows
             .iter()
-            .map(|row| worktree_display_name(&row.worktree.path).chars().count() as u16)
+            .map(|row| dashboard_worktree_name(row).chars().count() as u16)
             .max()
             .unwrap_or(0);
         let header_min = "Worktree".chars().count() as u16;
@@ -2122,7 +2527,7 @@ impl DashboardScreen {
         for column in &layout.hidden_columns {
             match column {
                 DashboardColumn::LastCommit => {
-                    if let Some(commit) = &row.last_commit {
+                    if let Some(commit) = row.last_commit.as_ref().filter(|_| !remote_only(row)) {
                         if !spans.is_empty() {
                             spans.push(Span::styled("  •  ", muted));
                         }
@@ -2136,7 +2541,9 @@ impl DashboardScreen {
                     }
                 }
                 DashboardColumn::PullRequest => {}
-                DashboardColumn::Branch
+                DashboardColumn::Profile
+                | DashboardColumn::Repository
+                | DashboardColumn::Branch
                 | DashboardColumn::From
                 | DashboardColumn::Status
                 | DashboardColumn::AheadBehind
@@ -2215,6 +2622,8 @@ impl DashboardColumn {
 
     fn title(self, compact: bool) -> &'static str {
         match self {
+            Self::Profile => messages::GLOBAL_PROFILE_COLUMN,
+            Self::Repository => messages::GLOBAL_REPOSITORY_COLUMN,
             Self::Branch => "Branch",
             Self::From => "From",
             Self::Status => "Status",
@@ -2240,6 +2649,20 @@ impl DashboardColumn {
 
     fn width(self, compact: bool) -> u16 {
         match self {
+            Self::Profile => {
+                if compact {
+                    12
+                } else {
+                    18
+                }
+            }
+            Self::Repository => {
+                if compact {
+                    16
+                } else {
+                    24
+                }
+            }
             Self::Branch => {
                 if compact {
                     12
@@ -2301,7 +2724,32 @@ impl DashboardColumn {
     }
 
     fn cell(self, row: &DashboardRow, compact: bool, width: u16) -> Cell<'static> {
+        if remote_only(row)
+            && matches!(
+                self,
+                Self::From | Self::AheadBehind | Self::Diff | Self::LastCommit
+            )
+        {
+            return Cell::from(Span::styled(
+                messages::GLOBAL_UNAVAILABLE,
+                Style::default().fg(colors::MUTED),
+            ));
+        }
         match self {
+            Self::Profile | Self::Repository => {
+                let value = row
+                    .repository
+                    .as_ref()
+                    .map(|repository| {
+                        if self == Self::Profile {
+                            repository.owner.as_str()
+                        } else {
+                            repository.name.as_str()
+                        }
+                    })
+                    .unwrap_or(messages::GLOBAL_UNAVAILABLE);
+                Cell::from(truncate(value, width as usize))
+            }
             Self::Branch => Cell::from(Line::from(Span::raw(truncate(
                 &row.worktree.branch,
                 width as usize,
@@ -2465,6 +2913,9 @@ impl PrState {
 /// matches the guard in `build_action_select` so the menu and the dispatch
 /// stay in lockstep.
 fn build_merge_request(row: &DashboardRow) -> Option<MergePullRequestRequest> {
+    if remote_only(row) {
+        return None;
+    }
     let pr = row.pull_request.as_ref()?;
     if !matches!(pr.state, PrState::Open) {
         return None;
@@ -2487,6 +2938,9 @@ fn build_merge_request(row: &DashboardRow) -> Option<MergePullRequestRequest> {
 }
 
 fn build_close_request(row: &DashboardRow) -> Option<ClosePullRequestRequest> {
+    if remote_only(row) {
+        return None;
+    }
     let pr = row.pull_request.as_ref()?;
     if !matches!(pr.state, PrState::Open | PrState::Draft) {
         return None;
@@ -2521,7 +2975,7 @@ fn pr_base_mismatch(row: &DashboardRow) -> Option<(&str, &str)> {
     (base != source).then_some((base, source))
 }
 
-fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
+pub(super) fn status_label_and_style(row: &DashboardRow) -> (&'static str, Style) {
     // The main worktree is the "mother" — it generates every other
     // worktree and cannot be deleted. Surface that uniqueness with its
     // own status label so users can distinguish it at a glance and so

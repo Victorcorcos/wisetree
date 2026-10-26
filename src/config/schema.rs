@@ -119,6 +119,283 @@ impl DashboardConfig {
     }
 }
 
+/// The available Global Dashboard filter fields, including compound columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DashboardFilterField {
+    Profile,
+    Repository,
+    Location,
+    Status,
+    Checks,
+    Review,
+    Mergeability,
+    Worktree,
+    Branch,
+    From,
+    LastCommit,
+    PrTitle,
+    Ahead,
+    Behind,
+    Insertions,
+    Deletions,
+    PrNumber,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardFilterKind {
+    Enum,
+    Text,
+    Number,
+}
+
+impl DashboardFilterField {
+    pub const ALL: [Self; 17] = [
+        Self::Profile,
+        Self::Repository,
+        Self::Location,
+        Self::Status,
+        Self::Checks,
+        Self::Review,
+        Self::Mergeability,
+        Self::Worktree,
+        Self::Branch,
+        Self::From,
+        Self::LastCommit,
+        Self::PrTitle,
+        Self::Ahead,
+        Self::Behind,
+        Self::Insertions,
+        Self::Deletions,
+        Self::PrNumber,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Profile => "Profile",
+            Self::Repository => "Repository",
+            Self::Location => "Location",
+            Self::Status => "Status",
+            Self::Checks => "Checks",
+            Self::Review => "Review",
+            Self::Mergeability => "Mergeability",
+            Self::Worktree => "Worktree",
+            Self::Branch => "Branch",
+            Self::From => "From",
+            Self::LastCommit => "Last commit",
+            Self::PrTitle => "PR title",
+            Self::Ahead => "Ahead",
+            Self::Behind => "Behind",
+            Self::Insertions => "Insertions",
+            Self::Deletions => "Deletions",
+            Self::PrNumber => "PR number",
+        }
+    }
+
+    pub fn kind(self) -> DashboardFilterKind {
+        match self {
+            Self::Profile
+            | Self::Repository
+            | Self::Location
+            | Self::Status
+            | Self::Checks
+            | Self::Review
+            | Self::Mergeability => DashboardFilterKind::Enum,
+            Self::Ahead | Self::Behind | Self::Insertions | Self::Deletions | Self::PrNumber => {
+                DashboardFilterKind::Number
+            }
+            _ => DashboardFilterKind::Text,
+        }
+    }
+
+    /// Profile and Repository choices come from the current rows.
+    pub fn enum_values(self) -> &'static [&'static str] {
+        match self {
+            Self::Location => &["Local", "Not cloned"],
+            Self::Status => &[
+                "Mother", "Merged", "Opened", "Drafted", "Closed", "Clean", "Dirty",
+            ],
+            Self::Checks => &["Passed", "Failed", "Running", "Pending", "Errored", "None"],
+            Self::Review => &["Approved", "Rejected", "Pending", "None"],
+            Self::Mergeability => &[
+                "Draft", "Dirty", "Blocked", "Unknown", "Behind", "HasHooks", "Unstable", "Clean",
+                "None",
+            ],
+            _ => &[],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DashboardFilterOperator {
+    IsAnyOf,
+    IsNoneOf,
+    Contains,
+    DoesNotContain,
+    Is,
+    IsNot,
+    Equal,
+    NotEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+}
+
+impl DashboardFilterOperator {
+    pub fn for_kind(kind: DashboardFilterKind) -> &'static [Self] {
+        match kind {
+            DashboardFilterKind::Enum => &[Self::IsAnyOf, Self::IsNoneOf],
+            DashboardFilterKind::Text => {
+                &[Self::Contains, Self::DoesNotContain, Self::Is, Self::IsNot]
+            }
+            DashboardFilterKind::Number => &[
+                Self::Equal,
+                Self::NotEqual,
+                Self::GreaterThan,
+                Self::GreaterThanOrEqual,
+                Self::LessThan,
+                Self::LessThanOrEqual,
+            ],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::IsAnyOf => "is any of",
+            Self::IsNoneOf => "is none of",
+            Self::Contains => "contains",
+            Self::DoesNotContain => "does not contain",
+            Self::Is => "is",
+            Self::IsNot => "is not",
+            Self::Equal => "=",
+            Self::NotEqual => "≠",
+            Self::GreaterThan => ">",
+            Self::GreaterThanOrEqual => "≥",
+            Self::LessThan => "<",
+            Self::LessThanOrEqual => "≤",
+        }
+    }
+
+    pub fn is_negated(self) -> bool {
+        matches!(
+            self,
+            Self::IsNoneOf | Self::DoesNotContain | Self::IsNot | Self::NotEqual
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DashboardFilterRule {
+    pub field: DashboardFilterField,
+    pub operator: DashboardFilterOperator,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DashboardFilterGroup {
+    pub rules: Vec<DashboardFilterRule>,
+}
+
+/// OR of AND groups. No groups means show everything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DashboardFilter {
+    pub groups: Vec<DashboardFilterGroup>,
+}
+
+impl Default for DashboardFilter {
+    fn default() -> Self {
+        Self {
+            groups: vec![DashboardFilterGroup {
+                rules: vec![DashboardFilterRule {
+                    field: DashboardFilterField::Status,
+                    operator: DashboardFilterOperator::IsNoneOf,
+                    values: vec!["Mother".to_string()],
+                }],
+            }],
+        }
+    }
+}
+
+impl DashboardFilter {
+    pub fn normalize(&mut self) -> std::result::Result<(), String> {
+        for group in &mut self.groups {
+            group.rules.retain(|rule| !rule.values.is_empty());
+            for rule in &mut group.rules {
+                if !DashboardFilterOperator::for_kind(rule.field.kind()).contains(&rule.operator) {
+                    return Err(format!("Invalid operator for {}", rule.field.label()));
+                }
+                let choices = rule.field.enum_values();
+                if !choices.is_empty() && rule.values.iter().any(|v| !choices.contains(&v.as_str()))
+                {
+                    return Err(format!("Unknown value for {}", rule.field.label()));
+                }
+                if rule.field.kind() == DashboardFilterKind::Number
+                    && rule.values.iter().any(|v| v.parse::<i128>().is_err())
+                {
+                    return Err(format!("Invalid number for {}", rule.field.label()));
+                }
+                let mut seen = std::collections::HashSet::new();
+                rule.values
+                    .retain(|value| seen.insert(value.to_lowercase()));
+            }
+        }
+        self.groups.retain(|group| !group.rules.is_empty());
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for DashboardFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            groups: Vec<DashboardFilterGroup>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let mut filter = Self {
+            groups: wire.groups,
+        };
+        filter.normalize().map_err(serde::de::Error::custom)?;
+        Ok(filter)
+    }
+}
+
+fn deserialize_dashboard_filter<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<DashboardFilter, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|err| {
+        eprintln!("Invalid globalDashboard.filter; using default: {err}");
+        DashboardFilter::default()
+    }))
+}
+
+/// Global Dashboard account selection, independent of project configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GlobalDashboardConfig {
+    #[serde(default)]
+    pub selected_accounts: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_dashboard_filter")]
+    pub filter: DashboardFilter,
+}
+
+impl GlobalDashboardConfig {
+    /// Keep the first spelling and order of each GitHub account.
+    pub fn deduplicate(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.selected_accounts
+            .retain(|account| seen.insert(account.to_ascii_lowercase()));
+    }
+}
+
 /// Configuration for the worktree manager.
 ///
 /// JSON keys use camelCase. Unknown legacy fields are ignored when loading
@@ -166,6 +443,14 @@ pub struct WorktreeConfig {
     /// Live dashboard preferences.
     #[serde(rename = "dashboard", default)]
     pub dashboard: DashboardConfig,
+
+    /// Stored only in the global config; project saves omit this field.
+    #[serde(
+        rename = "globalDashboard",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub global_dashboard: Option<GlobalDashboardConfig>,
 }
 
 impl Default for WorktreeConfig {
@@ -181,6 +466,7 @@ impl Default for WorktreeConfig {
             terminal_command: String::new(),
             delete_branch_with_worktree: false,
             dashboard: DashboardConfig::default(),
+            global_dashboard: None,
         }
     }
 }

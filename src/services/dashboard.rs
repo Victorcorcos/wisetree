@@ -48,7 +48,7 @@ pub const BASE_REF_PRIORITY: [&str; 6] = [
 ];
 /// Remotes searched, in order, for a base branch or the repository hosting
 /// the PRs: `upstream` first so fork-based workflows reach the canonical repo.
-const CONVENTIONAL_REMOTES: [&str; 2] = ["upstream", "origin"];
+pub(crate) const CONVENTIONAL_REMOTES: [&str; 2] = ["upstream", "origin"];
 /// Remote a PR update is pushed to when the branch has no push destination
 /// of its own yet (see [`resolve_push_remote`]).
 const FALLBACK_PUSH_REMOTE: &str = "origin";
@@ -58,7 +58,7 @@ const FALLBACK_PUSH_REMOTE: &str = "origin";
 pub const PR_REFRESH_PERIOD_MS: u64 = 30 * 1000;
 
 /// How long to suspend PR fetches after a rate-limit error.
-const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
+pub(crate) const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitSummary {
@@ -211,8 +211,19 @@ pub struct PullRequestDetails {
     pub body: String,
 }
 
+/// GitHub identity and optional local context for an aggregated dashboard row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardRepository {
+    pub owner: String,
+    pub name: String,
+    pub local_root: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DashboardRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<DashboardRepository>,
     #[serde(flatten)]
     pub worktree: GitWorktree,
     #[serde(rename = "lastCommit", skip_serializing_if = "Option::is_none")]
@@ -288,8 +299,8 @@ impl DashboardUpdate {
 pub struct DashboardWatch {
     pub rx: mpsc::Receiver<DashboardUpdate>,
     pub notice_rx: mpsc::Receiver<DashboardNotice>,
-    cancel: Option<oneshot::Sender<()>>,
-    refresh_tx: mpsc::Sender<()>,
+    pub(crate) cancel: Option<oneshot::Sender<()>>,
+    pub(crate) refresh_tx: mpsc::Sender<()>,
 }
 
 impl DashboardWatch {
@@ -344,11 +355,22 @@ pub struct DashboardService {
 }
 
 impl DashboardService {
-    pub fn new(git_root: PathBuf, mut config: DashboardConfig) -> Self {
-        config.clamp();
-        let git_binary = PathBuf::from("git");
+    pub fn new(git_root: PathBuf, config: DashboardConfig) -> Self {
         let gh_binary = PathBuf::from("gh");
         let gh_available = binary_available(&gh_binary);
+        Self::new_with_probed_gh(git_root, config, gh_binary, gh_available)
+    }
+
+    /// For callers that already probed `gh_binary`: the probe spawns a
+    /// process, and the Global Dashboard builds one service per repository.
+    pub(crate) fn new_with_probed_gh(
+        git_root: PathBuf,
+        mut config: DashboardConfig,
+        gh_binary: PathBuf,
+        gh_available: bool,
+    ) -> Self {
+        config.clamp();
+        let git_binary = PathBuf::from("git");
         Self {
             git_root,
             config,
@@ -386,6 +408,10 @@ impl DashboardService {
     pub fn with_cache_path(mut self, path: Option<PathBuf>) -> Self {
         self.cache_path = path;
         self
+    }
+
+    pub(crate) fn set_notice_sender(&self, sender: mpsc::Sender<DashboardNotice>) {
+        self.pr_state.lock().expect("pr_state poisoned").notice_tx = Some(sender);
     }
 
     pub fn gh_available(&self) -> bool {
@@ -738,7 +764,7 @@ impl DashboardService {
     /// for every worktree in parallel, then layer cached PR data on top. No
     /// network calls — safe to emit immediately so the UI can render before
     /// the slower `gh` refresh completes.
-    async fn collect_git_rows(&self) -> Result<Vec<DashboardRow>> {
+    pub(crate) async fn collect_git_rows(&self) -> Result<Vec<DashboardRow>> {
         let worktrees = self.list_worktrees_basic().await?;
         let mut tasks = JoinSet::new();
         self.ensure_cache_loaded();
@@ -863,6 +889,7 @@ impl DashboardService {
         };
 
         DashboardRow {
+            repository: None,
             worktree,
             last_commit,
             pull_request: None,
@@ -1079,7 +1106,11 @@ impl DashboardService {
     /// `true` once per refresh period, `false` between periods. Off-cycle
     /// runs still pick up brand-new branches and SHA changes so the UI
     /// keeps up with local commits without disturbing the cycle rhythm.
-    async fn refresh_pull_requests(&self, rows: &[DashboardRow], on_cycle: bool) -> bool {
+    pub(crate) async fn refresh_pull_requests(
+        &self,
+        rows: &[DashboardRow],
+        on_cycle: bool,
+    ) -> bool {
         if !self.pr_enrichment_enabled() || self.is_rate_limited() {
             return false;
         }
@@ -1283,7 +1314,7 @@ impl DashboardService {
         .is_ok_and(|result| result.is_ok())
     }
 
-    fn apply_cached_prs(&self, rows: &mut [DashboardRow]) {
+    pub(crate) fn apply_cached_prs(&self, rows: &mut [DashboardRow]) {
         let state = self.pr_state.lock().expect("pr_state poisoned");
         for row in rows {
             if let Some(entry) = state.entries.get(&row.worktree.branch) {
@@ -1292,7 +1323,7 @@ impl DashboardService {
         }
     }
 
-    fn is_rate_limited(&self) -> bool {
+    pub(crate) fn is_rate_limited(&self) -> bool {
         let mut state = self.pr_state.lock().expect("pr_state poisoned");
         match state.rate_limited_until {
             Some(deadline) if Instant::now() < deadline => true,
@@ -1440,7 +1471,7 @@ impl DashboardService {
         }
     }
 
-    fn save_cache(&self) {
+    pub(crate) fn save_cache(&self) {
         let Some(path) = self.cache_path.clone() else {
             return;
         };
@@ -1480,7 +1511,7 @@ impl DashboardService {
     }
 }
 
-fn binary_available(binary: &Path) -> bool {
+pub(crate) fn binary_available(binary: &Path) -> bool {
     std::process::Command::new(binary)
         .arg("--version")
         .stdout(Stdio::null())
@@ -1490,7 +1521,7 @@ fn binary_available(binary: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_rate_limit_error(err: &str) -> bool {
+pub(crate) fn is_rate_limit_error(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("rate limit") || lower.contains("rate-limit")
 }
@@ -1551,7 +1582,7 @@ pub fn pr_repository(url: &str) -> Option<String> {
     parse_github_slug(url).map(|(owner, repo)| format!("{owner}/{repo}"))
 }
 
-fn parse_github_slug(remote: &str) -> Option<(String, String)> {
+pub(crate) fn parse_github_slug(remote: &str) -> Option<(String, String)> {
     let trimmed = remote.trim();
     let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
     let trimmed = trimmed.trim_end_matches('/');
@@ -1586,6 +1617,8 @@ struct PrFetchTarget {
     worktree_path: PathBuf,
 }
 
+pub(crate) const PR_GRAPHQL_FIELDS: &str = "number url title state isDraft baseRefName baseRepository { nameWithOwner } headRefOid headRepository { nameWithOwner } mergeStateStatus reviewDecision labels(first: 20) { nodes { name } } reviewRequests(first: 100) { totalCount nodes { requestedReviewer { __typename ... on User { login } } } } latestOpinionatedReviews(first: 100) { nodes { state author { login } } } latestReviews(first: 100) { nodes { state author { login } } } commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes { __typename ... on CheckRun { status conclusion } ... on StatusContext { state } } } } } } }";
+
 fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     let mut q = String::new();
     q.push_str("query { repository(owner: \"");
@@ -1595,7 +1628,7 @@ fn build_graphql_query(owner: &str, repo: &str, branches: &[&str]) -> String {
     q.push_str("\") { ");
     for (i, branch) in branches.iter().enumerate() {
         q.push_str(&format!(
-            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: {PR_CANDIDATES_PER_BRANCH}, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ number url title state isDraft baseRefName baseRepository {{ nameWithOwner }} headRefOid headRepository {{ nameWithOwner }} mergeStateStatus reviewDecision labels(first: 20) {{ nodes {{ name }} }} reviewRequests(first: 100) {{ totalCount nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} latestOpinionatedReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} latestReviews(first: 100) {{ nodes {{ state author {{ login }} }} }} commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state contexts(first: 100) {{ nodes {{ __typename ... on CheckRun {{ status conclusion }} ... on StatusContext {{ state }} }} }} }} }} }} }} }} }} ",
+            "b{i}: pullRequests(headRefName: \"{}\", states: [OPEN, CLOSED, MERGED], first: {PR_CANDIDATES_PER_BRANCH}, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ {PR_GRAPHQL_FIELDS} }} }} ",
             escape_graphql_string(branch)
         ));
     }
@@ -1686,97 +1719,98 @@ fn parse_graphql_response(
             .map(|conn| conn.nodes)
             .unwrap_or_default()
             .into_iter()
-            .map(|node| {
-                let head_repository = node
-                    .head_repository
-                    .as_ref()
-                    .and_then(|repo| repo.name_with_owner.clone());
-                // GitHub keeps `isDraft = true` on a PR that was closed while
-                // still a draft, so the terminal states must win over the draft
-                // flag — otherwise a closed draft keeps reading as "Drafted".
-                // Priority: Merged > Closed > Drafted > Opened.
-                let state = match node.state.as_str() {
-                    "MERGED" => PrState::Merged,
-                    "CLOSED" => PrState::Closed,
-                    "OPEN" if node.is_draft => PrState::Draft,
-                    "OPEN" => PrState::Open,
-                    _ => PrState::Closed,
-                };
-                let checks_status = node
-                    .commits
-                    .nodes
-                    .into_iter()
-                    .next()
-                    .and_then(|c| c.commit)
-                    .and_then(|c| c.status_check_rollup)
-                    .and_then(|r| aggregate_checks(&r.contexts.nodes));
-                let requested_user_logins: HashSet<String> = node
-                    .review_requests
-                    .nodes
-                    .iter()
-                    .filter_map(|r| {
-                        r.requested_reviewer.as_ref().and_then(|rev| {
-                            if rev.typename == "User" {
-                                rev.login.clone()
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .collect();
-                let changes_requested_logins: HashSet<String> = node
-                    .latest_opinionated_reviews
-                    .nodes
-                    .iter()
-                    .filter(|r| r.state.as_deref() == Some("CHANGES_REQUESTED"))
-                    .filter_map(|r| r.author.as_ref().and_then(|a| a.login.clone()))
-                    .collect();
-                let review_status = derive_review_status(
-                    node.review_decision.as_deref(),
-                    node.review_requests.total_count,
-                    &changes_requested_logins,
-                    &requested_user_logins,
-                );
-                let reviewers =
-                    build_reviewer_summary(&requested_user_logins, &node.latest_reviews.nodes);
-                let merge_status = match node.merge_state_status.as_deref() {
-                    Some("DRAFT") => Some(MergeStatus::Draft),
-                    Some("DIRTY") => Some(MergeStatus::Dirty),
-                    Some("BLOCKED") => Some(MergeStatus::Blocked),
-                    Some("UNKNOWN") => Some(MergeStatus::Unknown),
-                    Some("BEHIND") => Some(MergeStatus::Behind),
-                    Some("HAS_HOOKS") => Some(MergeStatus::HasHooks),
-                    Some("UNSTABLE") => Some(MergeStatus::Unstable),
-                    Some("CLEAN") => Some(MergeStatus::Clean),
-                    _ => None,
-                };
-                let labels = node
-                    .labels
-                    .nodes
-                    .into_iter()
-                    .filter(|l| !l.name.is_empty())
-                    .map(|l| l.name)
-                    .collect();
-                PullRequest {
-                    number: node.number,
-                    state,
-                    url: node.url,
-                    title: node.title,
-                    base_ref_name: node.base_ref_name,
-                    base_repository: node.base_repository.and_then(|repo| repo.name_with_owner),
-                    head_ref_oid: node.head_ref_oid,
-                    head_repository,
-                    labels,
-                    checks_status,
-                    review_status,
-                    merge_status,
-                    reviewers,
-                }
-            })
+            .map(map_pull_request)
             .collect();
         out.insert((*branch).to_string(), candidates);
     }
     Ok(out)
+}
+
+pub(crate) fn map_pull_request(node: GhNode) -> PullRequest {
+    let head_repository = node
+        .head_repository
+        .as_ref()
+        .and_then(|repo| repo.name_with_owner.clone());
+    // GitHub keeps `isDraft = true` on a PR that was closed while
+    // still a draft, so the terminal states must win over the draft
+    // flag — otherwise a closed draft keeps reading as "Drafted".
+    // Priority: Merged > Closed > Drafted > Opened.
+    let state = match node.state.as_str() {
+        "MERGED" => PrState::Merged,
+        "CLOSED" => PrState::Closed,
+        "OPEN" if node.is_draft => PrState::Draft,
+        "OPEN" => PrState::Open,
+        _ => PrState::Closed,
+    };
+    let checks_status = node
+        .commits
+        .nodes
+        .into_iter()
+        .next()
+        .and_then(|c| c.commit)
+        .and_then(|c| c.status_check_rollup)
+        .and_then(|r| aggregate_checks(&r.contexts.nodes));
+    let requested_user_logins: HashSet<String> = node
+        .review_requests
+        .nodes
+        .iter()
+        .filter_map(|r| {
+            r.requested_reviewer.as_ref().and_then(|rev| {
+                if rev.typename == "User" {
+                    rev.login.clone()
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    let changes_requested_logins: HashSet<String> = node
+        .latest_opinionated_reviews
+        .nodes
+        .iter()
+        .filter(|r| r.state.as_deref() == Some("CHANGES_REQUESTED"))
+        .filter_map(|r| r.author.as_ref().and_then(|a| a.login.clone()))
+        .collect();
+    let review_status = derive_review_status(
+        node.review_decision.as_deref(),
+        node.review_requests.total_count,
+        &changes_requested_logins,
+        &requested_user_logins,
+    );
+    let reviewers = build_reviewer_summary(&requested_user_logins, &node.latest_reviews.nodes);
+    let merge_status = match node.merge_state_status.as_deref() {
+        Some("DRAFT") => Some(MergeStatus::Draft),
+        Some("DIRTY") => Some(MergeStatus::Dirty),
+        Some("BLOCKED") => Some(MergeStatus::Blocked),
+        Some("UNKNOWN") => Some(MergeStatus::Unknown),
+        Some("BEHIND") => Some(MergeStatus::Behind),
+        Some("HAS_HOOKS") => Some(MergeStatus::HasHooks),
+        Some("UNSTABLE") => Some(MergeStatus::Unstable),
+        Some("CLEAN") => Some(MergeStatus::Clean),
+        _ => None,
+    };
+    let labels = node
+        .labels
+        .nodes
+        .into_iter()
+        .filter(|l| !l.name.is_empty())
+        .map(|l| l.name)
+        .collect();
+    PullRequest {
+        number: node.number,
+        state,
+        url: node.url,
+        title: node.title,
+        base_ref_name: node.base_ref_name,
+        base_repository: node.base_repository.and_then(|repo| repo.name_with_owner),
+        head_ref_oid: node.head_ref_oid,
+        head_repository,
+        labels,
+        checks_status,
+        review_status,
+        merge_status,
+        reviewers,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1879,7 +1913,7 @@ struct GhBaseRepository {
     name_with_owner: Option<String>,
 }
 #[derive(Deserialize)]
-struct GhNode {
+pub(crate) struct GhNode {
     number: u64,
     state: String,
     url: String,

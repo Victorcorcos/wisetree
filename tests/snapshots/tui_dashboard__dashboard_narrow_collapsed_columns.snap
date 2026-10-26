@@ -16,7 +16,7 @@ Narrow view: 2 hidden  •  PR #42 Open: Improve dashboard...  •  Commit d
                                      ┌────────┐  ┌────────┐  ┌─────────┐
        Delete worktrees with status: │ Merged │  │ Closed │  │ Drafted │
                                      └────────┘  └────────┘  └─────────┘
-↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type t
+↑↓ Navigate  ↵ Actions  Ctrl+X Delete  Tab Bulk Delete  Type to Search
 Status: Mother = main worktree (protected)  Dirty = has uncommitted chan
 PR Checks: ⚪  (Pending)  🟡  (Running)  ⚠️  (Errored)  🔴  (Failed)  🟢  (Pa
 PR Reviews: ✋  (Pending)  👎  (Changes Requested)  👍  (Approved)

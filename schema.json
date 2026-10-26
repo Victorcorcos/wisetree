@@ -28,6 +28,17 @@
       "default": false,
       "type": "boolean"
     },
+    "globalDashboard": {
+      "description": "Stored only in the global config; project saves omit this field.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/GlobalDashboardConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "postCreateCmd": {
       "description": "Commands to run after creating a worktree. Variables: $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH.",
       "default": [],
@@ -125,6 +136,136 @@
           "type": "boolean"
         }
       }
+    },
+    "DashboardFilter": {
+      "description": "OR of AND groups. No groups means show everything.",
+      "type": "object",
+      "required": [
+        "groups"
+      ],
+      "properties": {
+        "groups": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DashboardFilterGroup"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DashboardFilterField": {
+      "description": "The available Global Dashboard filter fields, including compound columns.",
+      "type": "string",
+      "enum": [
+        "profile",
+        "repository",
+        "location",
+        "status",
+        "checks",
+        "review",
+        "mergeability",
+        "worktree",
+        "branch",
+        "from",
+        "lastCommit",
+        "prTitle",
+        "ahead",
+        "behind",
+        "insertions",
+        "deletions",
+        "prNumber"
+      ]
+    },
+    "DashboardFilterGroup": {
+      "type": "object",
+      "required": [
+        "rules"
+      ],
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DashboardFilterRule"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DashboardFilterOperator": {
+      "type": "string",
+      "enum": [
+        "isAnyOf",
+        "isNoneOf",
+        "contains",
+        "doesNotContain",
+        "is",
+        "isNot",
+        "equal",
+        "notEqual",
+        "greaterThan",
+        "greaterThanOrEqual",
+        "lessThan",
+        "lessThanOrEqual"
+      ]
+    },
+    "DashboardFilterRule": {
+      "type": "object",
+      "required": [
+        "field",
+        "operator",
+        "values"
+      ],
+      "properties": {
+        "field": {
+          "$ref": "#/definitions/DashboardFilterField"
+        },
+        "operator": {
+          "$ref": "#/definitions/DashboardFilterOperator"
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "GlobalDashboardConfig": {
+      "description": "Global Dashboard account selection, independent of project configuration.",
+      "type": "object",
+      "properties": {
+        "filter": {
+          "default": {
+            "groups": [
+              {
+                "rules": [
+                  {
+                    "field": "status",
+                    "operator": "isNoneOf",
+                    "values": [
+                      "Mother"
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/DashboardFilter"
+            }
+          ]
+        },
+        "selectedAccounts": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "LinkStrategy": {
       "oneOf": [

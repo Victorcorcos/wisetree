@@ -31,12 +31,18 @@ use crate::git::service::GitService;
 use crate::git::types::{GitBranch, GitWorktree, WorktreeCreateOptions};
 use crate::messages::{colors, CREATE_SUCCESS, DELETE_SUCCESS};
 
+use crate::services::global_dashboard::github::{
+    AccountDiscovery, GitHubError, GitHubService, DISCOVERY_CACHE_MAX_AGE,
+    DISCOVERY_CACHE_MAX_STALE, DISCOVERY_CACHE_REFRESH,
+};
+use crate::services::global_dashboard::registry::RepositoryRegistry;
+use crate::services::global_dashboard::GlobalDashboardService;
 use crate::services::presets::WisePresetDiscovery;
 
 use crate::services::{
     default_dashboard_warning, detect_shell_integration, install_shell_integration, pr_repository,
-    resolve_dashboard_columns, DashboardNoticeLevel, DashboardService, DashboardUpdate,
-    DashboardWatch, Shell, ShellIntegrationStatus,
+    resolve_dashboard_columns, DashboardNoticeLevel, DashboardRepository, DashboardService,
+    DashboardUpdate, DashboardWatch, Shell, ShellIntegrationStatus,
 };
 use crate::tui::event::{Event, EventLoop};
 
@@ -46,13 +52,14 @@ use crate::tui::screens;
 use crate::tui::screens::cache::{CacheAction as CacheScreenAction, CacheScreen};
 use crate::tui::screens::create::{CreateAction, CreateScreen};
 use crate::tui::screens::dashboard::{
-    BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScreen,
-    MergePullRequestRequest,
+    BulkDeleteStatus, ClosePullRequestRequest, DashboardAction, DashboardScope, DashboardScreen,
+    MergePullRequestRequest, ScopedDashboardAction,
 };
 use crate::tui::screens::delete::{
     DeleteAction, DeleteOutcome as ScreenDeleteOutcome, DeleteScreen, DeleteStep,
 };
 
+use crate::tui::screens::global_accounts::{GlobalAccountsAction, GlobalAccountsScreen};
 use crate::tui::screens::menu::{MenuChoice, MenuOutcome, MenuScreen};
 use crate::tui::screens::merge_pr::{MergeAction, MergePullRequestScreen, MergeStep};
 
@@ -96,6 +103,16 @@ enum InitPhase {
 
 enum AppEvent {
     Initialized(Box<InitOutcome>),
+    GlobalAccountsDiscovered {
+        generation: u64,
+        result: Result<AccountDiscovery, GitHubError>,
+    },
+    DashboardContextReady {
+        generation: u64,
+        root: PathBuf,
+        action: DashboardAction,
+        result: Result<Box<WorktreeService>, String>,
+    },
     CacheLoaded(Result<crate::files::CacheOverview, String>),
     CacheEntryDeleted(Result<crate::files::CacheOverview, String>),
     CreateBranchesLoaded(Result<Vec<GitBranch>, String>),
@@ -150,6 +167,20 @@ struct MergeExecution {
     push_first: bool,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+enum AppDashboardScope {
+    #[default]
+    Repository,
+    Global(Vec<String>),
+}
+
+struct LaunchRepositoryContext {
+    root: Option<String>,
+    cwd: PathBuf,
+    // Saved on the first switch; the launch service stays active until then.
+    service: Option<WorktreeService>,
+}
+
 /// State the TUI carries across frames.
 pub struct App {
     pub screen: Screen,
@@ -163,8 +194,17 @@ pub struct App {
     git_root: Option<String>,
     quit_requested: bool,
     menu: Option<MenuScreen>,
+    // Retained across Dashboard/command transitions so Esc can edit the selection.
+    global_accounts: Option<GlobalAccountsScreen>,
+    global_accounts_generation: u64,
     dashboard: Option<DashboardScreen>,
     dashboard_watch: Option<DashboardWatch>,
+    deleted_worktree_paths: Vec<String>,
+    dashboard_scope: AppDashboardScope,
+    global_dashboard_service: Option<GlobalDashboardService>,
+    global_dashboard_filter: Option<crate::config::schema::DashboardFilter>,
+    launch_repository: Option<LaunchRepositoryContext>,
+    dashboard_context_generation: u64,
 
     cache: Option<CacheScreen>,
     create: Option<CreateScreen>,
@@ -204,8 +244,16 @@ impl App {
             git_root: None,
             quit_requested: false,
             menu: None,
+            global_accounts: None,
+            global_accounts_generation: 0,
             dashboard: None,
             dashboard_watch: None,
+            deleted_worktree_paths: Vec::new(),
+            dashboard_scope: AppDashboardScope::Repository,
+            global_dashboard_service: None,
+            global_dashboard_filter: None,
+            launch_repository: None,
+            dashboard_context_generation: 0,
 
             cache: None,
             create: None,
@@ -271,7 +319,11 @@ impl App {
         terminal: &mut ratatui::Terminal<B>,
     ) -> anyhow::Result<()> {
         let local = tokio::task::LocalSet::new();
-        local.run_until(self.event_loop_inner(terminal)).await
+        let result = local.run_until(self.event_loop_inner(terminal)).await;
+        if self.is_global_dashboard() {
+            self.restore_launch_repository();
+        }
+        result
     }
 
     async fn event_loop_inner<B: ratatui::backend::Backend>(
@@ -360,6 +412,13 @@ impl App {
                 let menu = self.menu.as_mut().expect("menu set above");
                 menu.render(frame, area);
             }
+            Screen::GlobalAccounts => {
+                let panel = self.render_framed_panel_fill(frame, area);
+                if let Some(accounts) = self.global_accounts.as_mut() {
+                    accounts.tick = self.tick;
+                    accounts.render(frame, panel);
+                }
+            }
             Screen::Dashboard => {
                 let panel = self.render_framed_panel_fill(frame, area);
                 if let Some(dashboard) = self.dashboard.as_mut() {
@@ -401,7 +460,7 @@ impl App {
                     .filter(|d| matches!(d.step(), DeleteStep::Confirm))
                     .and_then(|d| d.overlay_modal());
                 // While the worktree list is still loading for a single-path
-                // delete (Backspace shortcut), the confirm modal isn't built
+                // delete (Ctrl+X shortcut), the confirm modal isn't built
                 // yet, so overlay_modal is None. Keep the dashboard visible
                 // during that window to avoid a ~1 s blink before the modal
                 // appears.
@@ -411,6 +470,7 @@ impl App {
                     let panel = self.render_framed_panel_fill(frame, area);
                     if let Some(dashboard) = self.dashboard.as_mut() {
                         dashboard.tick = self.tick;
+                        dashboard.clear_filter_hover();
                         dashboard.render(frame, panel);
                     }
                     modal.render(frame, panel);
@@ -418,6 +478,7 @@ impl App {
                     let panel = self.render_framed_panel_fill(frame, area);
                     if let Some(dashboard) = self.dashboard.as_mut() {
                         dashboard.tick = self.tick;
+                        dashboard.clear_filter_hover();
                         dashboard.render(frame, panel);
                     }
                 } else {
@@ -520,9 +581,17 @@ impl App {
             .split(area);
 
         let cwd = self.git_root.as_deref().unwrap_or("");
-        WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+        WelcomeHeader::new(self.screen, cwd)
+            .with_label(self.header_label_override())
+            .render(frame, chunks[0]);
 
         self.render_panel_block(frame, chunks[1])
+    }
+
+    /// The shared Dashboard screen reads "Global Dashboard" in global scope.
+    fn header_label_override(&self) -> Option<&'static str> {
+        (self.screen == Screen::Dashboard && self.is_global_dashboard())
+            .then_some(crate::messages::GLOBAL_DASHBOARD_TITLE)
     }
 
     fn render_framed_panel_fill(&self, frame: &mut Frame, area: Rect) -> Rect {
@@ -532,7 +601,9 @@ impl App {
             .split(area);
 
         let cwd = self.git_root.as_deref().unwrap_or("");
-        WelcomeHeader::new(self.screen, cwd).render(frame, chunks[0]);
+        WelcomeHeader::new(self.screen, cwd)
+            .with_label(self.header_label_override())
+            .render(frame, chunks[0]);
 
         self.render_panel_block(frame, chunks[1])
     }
@@ -592,6 +663,13 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if self.screen == Screen::Dashboard && matches!(mouse.kind, MouseEventKind::Moved) {
+            if let Some(dashboard) = self.dashboard.as_mut() {
+                dashboard.handle_mouse_move(Position::new(mouse.column, mouse.row));
+            }
+            return;
+        }
+
         let Some(snapshot) = self.last_rendered_buffer.as_ref() else {
             return;
         };
@@ -692,6 +770,7 @@ impl App {
     fn handle_screen_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         match self.screen {
             Screen::Menu => self.handle_menu_key(key, tx),
+            Screen::GlobalAccounts => self.handle_global_accounts_key(key, tx),
             Screen::Dashboard => self.handle_dashboard_key(key, tx),
             Screen::Cache => self.handle_cache_key(key, tx),
             Screen::Create => self.handle_create_key(key, tx),
@@ -724,6 +803,10 @@ impl App {
                             MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                             MenuChoice::Create => self.enter_screen(Screen::Create, tx),
                             MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
+                            MenuChoice::GlobalDashboard => {
+                                self.global_accounts = None;
+                                self.enter_screen(Screen::GlobalAccounts, tx);
+                            }
                             MenuChoice::Cache => self.enter_screen(Screen::Cache, tx),
                             MenuChoice::Settings => self.enter_screen(Screen::Settings, tx),
                         }
@@ -736,9 +819,9 @@ impl App {
                 let action = self
                     .dashboard
                     .as_mut()
-                    .map(|dashboard| dashboard.handle_mouse_click(position))
-                    .unwrap_or(DashboardAction::Continue);
-                self.apply_dashboard_action(action, tx);
+                    .map(|dashboard| dashboard.handle_scoped_mouse_click(position))
+                    .unwrap_or(ScopedDashboardAction::Dashboard(DashboardAction::Continue));
+                self.apply_scoped_dashboard_action(action, tx);
             }
             Screen::Cache => {
                 let action = self
@@ -979,6 +1062,7 @@ impl App {
                     SetupProjectAction::Apply(preset) => self.apply_setup_project_preset(preset),
                 }
             }
+            Screen::GlobalAccounts => {}
             Screen::MergePullRequest => {
                 let action = self
                     .merge_pr
@@ -1085,6 +1169,10 @@ impl App {
                     MenuChoice::Setup => self.enter_screen(Screen::Setup, tx),
                     MenuChoice::Create => self.enter_screen(Screen::Create, tx),
                     MenuChoice::Dashboard => self.enter_screen(Screen::Dashboard, tx),
+                    MenuChoice::GlobalDashboard => {
+                        self.global_accounts = None;
+                        self.enter_screen(Screen::GlobalAccounts, tx);
+                    }
                     MenuChoice::Cache => self.enter_screen(Screen::Cache, tx),
                     MenuChoice::Settings => self.enter_screen(Screen::Settings, tx),
                 }
@@ -1094,12 +1182,224 @@ impl App {
         }
     }
 
+    /// Opening renders gh's cached responses at once and then revalidates
+    /// stale ones (each result only adds accounts); `fresh` skips the cache.
+    fn discover_global_accounts(&mut self, tx: &mpsc::UnboundedSender<AppEvent>, fresh: bool) {
+        let Some(accounts) = self.global_accounts.as_mut() else {
+            return;
+        };
+        accounts.start_loading();
+        let selected = accounts.selected_accounts();
+        self.global_accounts_generation = self.global_accounts_generation.wrapping_add(1);
+        let generation = self.global_accounts_generation;
+        let tx = tx.clone();
+        let cache_ttls = if fresh {
+            vec![DISCOVERY_CACHE_REFRESH]
+        } else {
+            vec![DISCOVERY_CACHE_MAX_STALE, DISCOVERY_CACHE_MAX_AGE]
+        };
+        tokio::spawn(async move {
+            let repositories = RepositoryRegistry::default().resolve().await;
+            for ttl in cache_ttls {
+                let mut result = GitHubService::default()
+                    .with_cache(ttl)
+                    .discover_accounts(repositories.as_deref().unwrap_or_default(), &selected)
+                    .await;
+                if let (Ok(discovery), Err(error)) = (&mut result, &repositories) {
+                    discovery
+                        .warnings
+                        .push(GitHubError::Request(error.to_string()));
+                }
+                let _ = tx.send(AppEvent::GlobalAccountsDiscovered { generation, result });
+            }
+        });
+    }
+
+    fn handle_global_accounts_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
+        let Some(accounts) = self.global_accounts.as_mut() else {
+            return;
+        };
+        match accounts.handle_key(key) {
+            GlobalAccountsAction::Continue => {}
+            GlobalAccountsAction::Back => {
+                self.global_accounts = None;
+                self.back_to_menu();
+            }
+            GlobalAccountsAction::Refresh => self.discover_global_accounts(tx, true),
+            GlobalAccountsAction::Open(selected) => {
+                match ConfigService::update_global_dashboard_selected_accounts(selected.clone()) {
+                    Ok(_) => {
+                        self.set_global_dashboard_scope(selected);
+                        self.enter_screen(Screen::Dashboard, tx);
+                    }
+                    Err(error) => accounts.set_error(format!(
+                        "{}: {error}",
+                        crate::messages::GLOBAL_ACCOUNTS_SAVE_FAILED
+                    )),
+                }
+            }
+        }
+    }
+
     fn handle_dashboard_key(&mut self, key: KeyEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         let action = match self.dashboard.as_mut() {
-            Some(dashboard) => dashboard.handle_key(key),
+            Some(dashboard) => dashboard.handle_scoped_key(key),
             None => return,
         };
-        self.apply_dashboard_action(action, tx);
+        self.apply_scoped_dashboard_action(action, tx);
+    }
+
+    fn is_global_dashboard(&self) -> bool {
+        matches!(self.dashboard_scope, AppDashboardScope::Global(_))
+    }
+
+    /// The account picker sets the scope before entering the shared Dashboard.
+    /// Keeping the service here preserves its caches across command screens.
+    pub fn set_global_dashboard_scope(&mut self, accounts: Vec<String>) {
+        if self.launch_repository.is_none() {
+            self.launch_repository = Some(LaunchRepositoryContext {
+                root: self.git_root.clone(),
+                cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                service: None,
+            });
+        }
+        if self.dashboard_scope != AppDashboardScope::Global(accounts.clone()) {
+            self.global_dashboard_service = Some(GlobalDashboardService::new(
+                self.current_dashboard_config(),
+                accounts.clone(),
+            ));
+        }
+        self.dashboard_scope = AppDashboardScope::Global(accounts);
+    }
+
+    fn restore_launch_repository(&mut self) {
+        self.dashboard_context_generation = self.dashboard_context_generation.wrapping_add(1);
+        if let Some(context) = self.launch_repository.take() {
+            self.git_root = context.root;
+            if let Some(service) = context.service {
+                self.worktree_service = Some(service);
+            }
+            if let Err(error) = env::set_current_dir(&context.cwd) {
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!(
+                        "{}: {error}",
+                        crate::messages::GLOBAL_CONTEXT_RESTORE_FAILED
+                    ),
+                );
+            }
+        }
+        self.dashboard_scope = AppDashboardScope::Repository;
+    }
+
+    fn start_dashboard_watch(&mut self) {
+        let deleted = std::mem::take(&mut self.deleted_worktree_paths);
+        self.dashboard_watch = if self.is_global_dashboard() {
+            self.global_dashboard_service
+                .as_ref()
+                .map(|service| service.watch_forgetting(deleted))
+        } else {
+            self.git_root.as_ref().map(|root| {
+                DashboardService::new(PathBuf::from(root), self.current_dashboard_config()).watch()
+            })
+        };
+    }
+
+    fn apply_scoped_dashboard_action(
+        &mut self,
+        action: ScopedDashboardAction,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        match action {
+            ScopedDashboardAction::Dashboard(action) => self.apply_dashboard_action(action, tx),
+            ScopedDashboardAction::NoLocalWorktree => {
+                self.show_toast(
+                    ToastVariant::Warning,
+                    crate::messages::GLOBAL_NO_LOCAL_WORKTREE,
+                );
+            }
+            ScopedDashboardAction::Row { repository, action } => {
+                self.switch_dashboard_repository(repository, action, tx);
+            }
+        }
+    }
+
+    /// Run a row action inside the row's repository: switch the active git
+    /// root and worktree service (with that repository's own config) first,
+    /// so every existing handler works unchanged.
+    fn switch_dashboard_repository(
+        &mut self,
+        repository: DashboardRepository,
+        action: DashboardAction,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        self.dashboard_context_generation = self.dashboard_context_generation.wrapping_add(1);
+        let generation = self.dashboard_context_generation;
+        let Some(root) = repository.local_root else {
+            // Remote rows only offer actions that use their explicit GitHub URL.
+            self.apply_dashboard_action(action, tx);
+            return;
+        };
+        if root.is_dir() && self.git_root.as_deref().map(Path::new) == Some(root.as_path()) {
+            self.apply_dashboard_action(action, tx);
+            return;
+        }
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut service = WorktreeService::new(Some(root.clone()));
+            let result = service
+                .initialize()
+                .await
+                .map(|()| Box::new(service))
+                .map_err(|error| user_friendly_message(&error));
+            let _ = tx.send(AppEvent::DashboardContextReady {
+                generation,
+                root,
+                action,
+                result,
+            });
+        });
+    }
+
+    fn apply_dashboard_context(
+        &mut self,
+        generation: u64,
+        root: PathBuf,
+        action: DashboardAction,
+        result: Result<Box<WorktreeService>, String>,
+        tx: &mpsc::UnboundedSender<AppEvent>,
+    ) {
+        if generation != self.dashboard_context_generation
+            || !self.is_global_dashboard()
+            || self.screen != Screen::Dashboard
+        {
+            return;
+        }
+        let result = result.and_then(|service| {
+            env::set_current_dir(&root).map_err(|error| error.to_string())?;
+            Ok(service)
+        });
+        match result {
+            Ok(service) => {
+                if let Some(launch) = self.launch_repository.as_mut() {
+                    if launch.service.is_none() {
+                        launch.service = self.worktree_service.take();
+                    }
+                }
+                self.git_root = Some(root.display().to_string());
+                self.worktree_service = Some(*service);
+                self.apply_dashboard_action(action, tx);
+            }
+            Err(error) => {
+                self.show_toast(
+                    ToastVariant::Error,
+                    format!("{}: {error}", crate::messages::GLOBAL_CONTEXT_FAILED),
+                );
+                if let Some(watch) = &self.dashboard_watch {
+                    watch.refresh();
+                }
+            }
+        }
     }
 
     fn apply_dashboard_action(
@@ -1109,7 +1409,23 @@ impl App {
     ) {
         match action {
             DashboardAction::Continue => {}
-            DashboardAction::Back => self.back_to_menu(),
+            DashboardAction::PersistFilter(filter) => {
+                self.global_dashboard_filter = Some(filter.clone());
+                if let Err(error) = ConfigService::update_global_dashboard_filter(filter) {
+                    self.show_toast(
+                        ToastVariant::Error,
+                        format!("{}: {error}", crate::messages::GLOBAL_FILTER_SAVE_FAILED),
+                    );
+                }
+            }
+
+            DashboardAction::Back => {
+                if self.is_global_dashboard() {
+                    self.enter_screen(Screen::GlobalAccounts, tx);
+                } else {
+                    self.back_to_menu();
+                }
+            }
             DashboardAction::Refresh => {
                 if let Some(watch) = self.dashboard_watch.as_ref() {
                     watch.refresh();
@@ -1308,7 +1624,7 @@ impl App {
                     delete.start_deleting();
                 }
                 kick_off_delete_worktree(
-                    self.git_root.clone(),
+                    self.delete_repository_root(&path),
                     path,
                     force,
                     delete_unmerged_branch,
@@ -1349,7 +1665,7 @@ impl App {
             if self.quit_requested {
                 return;
             }
-            if self.git_root.is_some() {
+            if self.git_root.is_some() || self.is_global_dashboard() {
                 self.enter_screen(Screen::Dashboard, tx);
             } else {
                 self.back_to_menu();
@@ -1357,7 +1673,29 @@ impl App {
             return;
         }
         let (path, force) = self.bulk_delete_queue.remove(0);
-        kick_off_delete_worktree(self.git_root.clone(), path, force, false, tx.clone());
+        kick_off_delete_worktree(
+            self.delete_repository_root(&path),
+            path,
+            force,
+            false,
+            tx.clone(),
+        );
+    }
+
+    /// Global bulk deletes span repositories: each worktree is deleted by
+    /// its own repository rather than the active one.
+    fn delete_repository_root(&self, path: &str) -> Option<String> {
+        if self.is_global_dashboard() && self.delete.as_ref().is_some_and(|delete| delete.is_bulk())
+        {
+            self.delete
+                .as_ref()?
+                .repository(path)?
+                .local_root
+                .as_ref()
+                .map(|root| root.display().to_string())
+        } else {
+            self.git_root.clone()
+        }
     }
 
     /// Exit the Delete screen back to wherever we came from. When the
@@ -1372,7 +1710,9 @@ impl App {
         if self.quit_requested {
             return;
         }
-        if (from_dashboard_single || from_dashboard_bulk) && self.git_root.is_some() {
+        if (from_dashboard_single || from_dashboard_bulk)
+            && (self.git_root.is_some() || self.is_global_dashboard())
+        {
             self.enter_screen(Screen::Dashboard, tx);
         } else {
             self.back_to_menu();
@@ -1386,6 +1726,10 @@ impl App {
     /// path. wisetree stays open on the mother worktree; the caller re-renders
     /// the Dashboard from the updated `git_root`.
     fn maybe_redirect_git_root_to_mother(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+        // The Global Dashboard restores its launch repository on exit instead.
+        if self.is_global_dashboard() {
+            return;
+        }
         let needs_redirect = self
             .git_root
             .as_deref()
@@ -1418,8 +1762,8 @@ impl App {
     }
 
     /// Cancel the Delete screen and return to the preserved dashboard. Unlike
-    /// `leave_delete_screen` (which re-creates the dashboard from scratch after
-    /// a completed deletion), this path keeps the existing `self.dashboard`
+    /// `leave_delete_screen` (which rebuilds the dashboard with surviving rows
+    /// after a deletion), this path keeps the existing `self.dashboard`
     /// instance so the user's row selection, scroll position, and any other
     /// in-flight state survive the round-trip.
     fn cancel_delete_screen(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -1427,7 +1771,9 @@ impl App {
         let from_dashboard_bulk = self.delete.as_ref().map(|d| d.is_bulk()).unwrap_or(false)
             || !self.pending_bulk_delete_paths.is_empty();
 
-        if (from_dashboard_single || from_dashboard_bulk) && self.git_root.is_some() {
+        if (from_dashboard_single || from_dashboard_bulk)
+            && (self.git_root.is_some() || self.is_global_dashboard())
+        {
             if self.dashboard.is_some() {
                 // A dashboard instance was preserved when we entered the delete
                 // screen. Restore it directly to keep selection state intact.
@@ -1438,18 +1784,11 @@ impl App {
                 // The watch was dropped when we entered the delete screen.
                 // Restore it so the dashboard keeps receiving live updates.
                 if self.dashboard_watch.is_none() {
-                    if let Some(git_root) = self.git_root.as_ref().map(std::path::PathBuf::from) {
-                        let config = self
-                            .current_config()
-                            .map(|cfg| cfg.dashboard.clone())
-                            .unwrap_or_default();
-                        let service = DashboardService::new(git_root, config);
-                        self.dashboard_watch = Some(service.watch());
-                    }
+                    self.start_dashboard_watch();
                 }
             } else {
                 // No preserved dashboard (e.g. delete was opened from the menu
-                // rather than the Backspace shortcut). Fall back to a fresh one.
+                // rather than the Ctrl+X shortcut). Fall back to a fresh one.
                 self.enter_screen(Screen::Dashboard, tx);
             }
         } else {
@@ -1702,6 +2041,21 @@ impl App {
     fn handle_app_event(&mut self, event: AppEvent, tx: &mpsc::UnboundedSender<AppEvent>) {
         match event {
             AppEvent::Initialized(outcome) => self.apply_init_outcome(*outcome, tx),
+            AppEvent::GlobalAccountsDiscovered { generation, result } => {
+                if generation == self.global_accounts_generation {
+                    if let Some(accounts) = self.global_accounts.as_mut() {
+                        accounts.set_discovery(result);
+                    }
+                }
+            }
+            AppEvent::DashboardContextReady {
+                generation,
+                root,
+                action,
+                result,
+            } => {
+                self.apply_dashboard_context(generation, root, action, result, tx);
+            }
             AppEvent::CacheLoaded(result) | AppEvent::CacheEntryDeleted(result) => {
                 if let Some(cache) = self.cache.as_mut() {
                     match result {
@@ -1760,6 +2114,25 @@ impl App {
                 let in_bulk = self.delete.as_ref().map(|d| d.is_bulk()).unwrap_or(false);
                 match result {
                     Ok(outcome) => {
+                        if outcome.worktree_deleted {
+                            let path = self
+                                .delete
+                                .as_ref()
+                                .and_then(|delete| {
+                                    if in_bulk {
+                                        delete.bulk_current_path()
+                                    } else {
+                                        delete.selected_path()
+                                    }
+                                })
+                                .map(str::to_owned);
+                            if let Some(path) = path {
+                                self.deleted_worktree_paths.push(path);
+                                if let Some(dashboard) = self.dashboard.as_mut() {
+                                    dashboard.forget_worktrees(&self.deleted_worktree_paths);
+                                }
+                            }
+                        }
                         if in_bulk {
                             // Defer per-item branch warnings to the end of
                             // the bulk run so they're surfaced together
@@ -1767,17 +2140,32 @@ impl App {
                             // would flash many 5-second warning toasts
                             // back-to-back, hiding earlier ones).
                             if let Some(delete) = self.delete.as_mut() {
-                                delete.bulk_record_progress(outcome.branch_delete_error.clone());
+                                let warning = outcome.branch_delete_error.clone().map(|warning| {
+                                    if self.dashboard_scope != AppDashboardScope::Repository {
+                                        format!("{}: {warning}", delete.bulk_item_label())
+                                    } else {
+                                        warning
+                                    }
+                                });
+                                delete
+                                    .bulk_record_progress(screen_delete_outcome(outcome), warning);
                             }
                             self.dispatch_next_bulk_delete(tx);
                         } else if let Some(warning) = outcome.branch_delete_error.clone() {
                             let screen_outcome = screen_delete_outcome(outcome);
                             if let Some(delete) = self.delete.as_mut() {
+                                delete.record_item_outcome(
+                                    screen_outcome.clone(),
+                                    Some(warning.clone()),
+                                );
                                 delete.mark_complete(screen_outcome);
                             }
                             self.show_toast(ToastVariant::Warning, warning);
                         } else {
                             let screen_outcome = screen_delete_outcome(outcome);
+                            if let Some(delete) = self.delete.as_mut() {
+                                delete.record_item_outcome(screen_outcome.clone(), None);
+                            }
                             let success_msg = self
                                 .delete
                                 .as_ref()
@@ -1792,6 +2180,18 @@ impl App {
                         // and surface the error.
                         self.bulk_delete_queue.clear();
                         if let Some(delete) = self.delete.as_mut() {
+                            let message = if in_bulk {
+                                let completed = delete
+                                    .bulk_progress()
+                                    .map(|(completed, _)| completed)
+                                    .unwrap_or(0);
+                                format!(
+                                    "{}: {message} ({completed} deleted successfully before failure)",
+                                    delete.bulk_item_label()
+                                )
+                            } else {
+                                message
+                            };
                             delete.set_error(message);
                         }
                     }
@@ -1942,10 +2342,32 @@ impl App {
     }
 
     fn enter_screen(&mut self, screen: Screen, tx: &mpsc::UnboundedSender<AppEvent>) {
+        if self.is_global_dashboard()
+            && matches!(
+                screen,
+                Screen::Menu
+                    | Screen::Create
+                    | Screen::Settings
+                    | Screen::Cache
+                    | Screen::Setup
+                    | Screen::SetupProject
+            )
+        {
+            self.restore_launch_repository();
+        }
         // Delete renders the confirmation modal as an overlay on top of
         // the dashboard. Preserve the dashboard instance across the
         // transition so the row being deleted stays visible behind the
         // modal instead of blanking out.
+        let returning_rows = if screen == Screen::Dashboard
+            && matches!(self.screen, Screen::Delete | Screen::Dashboard)
+        {
+            self.dashboard
+                .as_ref()
+                .map(|dashboard| dashboard.rows().to_vec())
+        } else {
+            None
+        };
         let preserved_dashboard = if matches!(screen, Screen::Delete) {
             self.dashboard.take()
         } else {
@@ -1959,10 +2381,31 @@ impl App {
             Screen::Menu => {
                 self.menu = Some(self.build_menu_screen());
             }
+            Screen::GlobalAccounts => {
+                if self.global_accounts.is_none() {
+                    let saved = ConfigService::load_global_dashboard_preferences();
+                    let mut accounts = GlobalAccountsScreen::new(
+                        saved
+                            .as_ref()
+                            .map(|preferences| preferences.selected_accounts.clone())
+                            .unwrap_or_default(),
+                    );
+                    if let Err(error) = saved {
+                        accounts.set_error(error.to_string());
+                    }
+                    self.global_accounts = Some(accounts);
+                    self.discover_global_accounts(tx, false);
+                }
+            }
             Screen::Dashboard => {
-                let Some(git_root) = self.git_root.as_ref().map(PathBuf::from) else {
+                let git_root = self
+                    .git_root
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                if git_root.as_os_str().is_empty() && !self.is_global_dashboard() {
                     return;
-                };
+                }
                 let config = self
                     .current_config()
                     .map(|cfg| cfg.dashboard.clone())
@@ -1980,15 +2423,36 @@ impl App {
                 if let Some(warning) = gh_warning {
                     warnings.push(warning);
                 }
-                self.dashboard = Some(DashboardScreen::new(
-                    self.is_from_wrapper,
-                    has_terminal_command,
-                    clipboard_available(),
-                    columns,
-                    warnings,
-                    service.pr_enrichment_enabled(),
-                ));
-                self.dashboard_watch = Some(service.watch());
+                self.dashboard = Some(
+                    DashboardScreen::new(
+                        self.is_from_wrapper,
+                        has_terminal_command,
+                        clipboard_available(),
+                        columns,
+                        warnings,
+                        service.pr_enrichment_enabled(),
+                    )
+                    .with_scope(if self.is_global_dashboard() {
+                        DashboardScope::Global
+                    } else {
+                        DashboardScope::Repository
+                    }),
+                );
+                if self.is_global_dashboard() {
+                    let filter = self.global_dashboard_filter.clone().unwrap_or_else(|| {
+                        ConfigService::load_global_dashboard_preferences()
+                            .map(|preferences| preferences.filter)
+                            .unwrap_or_default()
+                    });
+                    self.dashboard = self
+                        .dashboard
+                        .take()
+                        .map(|dashboard| dashboard.with_filter(filter));
+                }
+                if let Some(rows) = returning_rows {
+                    self.dashboard.as_mut().unwrap().set_rows(rows);
+                }
+                self.start_dashboard_watch();
             }
             Screen::Cache => {
                 self.cache = Some(CacheScreen::new());
@@ -2003,8 +2467,32 @@ impl App {
                     .current_config()
                     .map(|cfg| cfg.delete_branch_with_worktree)
                     .unwrap_or(false);
-                self.delete = Some(DeleteScreen::new(delete_branch_with_worktree));
-                kick_off_delete_load(self.git_root.clone(), tx.clone());
+                let mut delete = DeleteScreen::new(delete_branch_with_worktree);
+                if self.is_global_dashboard() && !self.pending_bulk_delete_paths.is_empty() {
+                    // Bulk targets span repositories; the rows already carry each one.
+                    let rows = self
+                        .dashboard
+                        .as_ref()
+                        .map(|dashboard| {
+                            dashboard
+                                .rows()
+                                .iter()
+                                .filter_map(|row| {
+                                    row.repository
+                                        .clone()
+                                        .filter(|repository| repository.local_root.is_some())
+                                        .map(|repository| (repository, row.worktree.clone()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    delete.set_repository_worktrees(rows);
+                    delete
+                        .jump_to_bulk_confirm(std::mem::take(&mut self.pending_bulk_delete_paths));
+                } else {
+                    kick_off_delete_load(self.git_root.clone(), tx.clone());
+                }
+                self.delete = Some(delete);
             }
             Screen::Settings => {
                 let local_path = self.local_config_path_str();
@@ -2072,6 +2560,9 @@ impl App {
     }
 
     fn back_to_menu(&mut self) {
+        if self.is_global_dashboard() {
+            self.restore_launch_repository();
+        }
         self.clear_screen_state();
         self.screen = Screen::Menu;
         self.pending_delete_path = None;
@@ -2089,6 +2580,9 @@ impl App {
             (Some(dashboard), Some(path)) => {
                 self.screen = Screen::Dashboard;
                 dashboard.reopen_action_menu_for_worktree(&path);
+                if self.dashboard_watch.is_none() {
+                    self.start_dashboard_watch();
+                }
             }
             _ => self.enter_screen(Screen::Dashboard, tx),
         }
@@ -2817,7 +3311,16 @@ fn kick_off_initialize(tx: mpsc::UnboundedSender<AppEvent>) {
         let working_dir = git_root.clone().map(PathBuf::from);
         let mut service = WorktreeService::new(working_dir);
         let result = match service.initialize().await {
-            Ok(()) => Ok(service),
+            Ok(()) => {
+                if let Some(mother) = service.mother_worktree_path().map(Path::to_path_buf) {
+                    tokio::spawn(async move {
+                        // Registry failures must never prevent TUI initialization.
+                        let _ = crate::services::global_dashboard::registry::RepositoryRegistry::default()
+                            .register(&mother).await;
+                    });
+                }
+                Ok(service)
+            }
             Err(e) => Err(user_friendly_message(&e)),
         };
         let _ = tx.send(AppEvent::Initialized(Box::new(InitOutcome {
@@ -3332,6 +3835,7 @@ fn reset_global_config() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::DashboardRow;
 
     use crossterm::event::{KeyEventKind, KeyEventState};
     use once_cell::sync::Lazy;
@@ -3457,6 +3961,7 @@ mod tests {
             let mut app = initialized_menu_app();
             let tx = app_event_tx();
 
+            app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Down), &tx);
             app.handle_key(key(KeyCode::Enter), &tx);
@@ -4771,5 +5276,711 @@ mod tests {
             .collect::<String>();
         assert!(dumped.contains("Choose wisely"));
         assert!(dumped.contains("Copied to clipboard"));
+    }
+
+    // ── Global Dashboard helpers ────────────────────────────────────────
+
+    fn seeded_repo(home: &TempDir) -> std::path::PathBuf {
+        let repo = home.path().join("work");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        fs::write(repo.join("seed.txt"), "seed").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        repo
+    }
+
+    async fn global_test_app(home: &TempDir) -> (App, PathBuf, PathBuf, PathBuf) {
+        let repo_a = seeded_repo(home).canonicalize().unwrap();
+        let repo_b = home.path().join("repository-b");
+        fs::create_dir(&repo_b).unwrap();
+        git(&repo_b, &["init", "-q"]);
+        git(
+            &repo_b,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "seed",
+            ],
+        );
+        let repo_b = repo_b.canonicalize().unwrap();
+        let checkout = home.path().join("repository-b-feature");
+        git(
+            &repo_b,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                checkout.to_str().unwrap(),
+            ],
+        );
+        let checkout = checkout.canonicalize().unwrap();
+        write(
+            &repo_a,
+            ".wisetree/config.json",
+            r#"{"terminalCommand":"repo-a","dashboard":{"showPullRequests":false}}"#,
+        );
+        write(
+            &repo_b,
+            ".wisetree/config.json",
+            r#"{"terminalCommand":"repo-b","dashboard":{"showPullRequests":false}}"#,
+        );
+        let mut service = WorktreeService::new(Some(repo_a.clone()));
+        service.initialize().await.unwrap();
+        let mut app = App::new(AppMode::Dashboard, false);
+        app.phase = InitPhase::Ready;
+        app.git_root = Some(repo_a.display().to_string());
+        app.worktree_service = Some(service);
+        // Empty accounts keep this lifecycle test independent of GitHub/registry state.
+        app.set_global_dashboard_scope(Vec::new());
+        app.enter_screen(Screen::Dashboard, &app_event_tx());
+        (app, repo_a, repo_b, checkout)
+    }
+
+    #[test]
+    fn global_filter_apply_persists_and_failed_save_retains_session_filter() {
+        with_home(|home| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (mut app, _, _, _) = global_test_app(home).await;
+                let tx = app_event_tx();
+                let dashboard = app.dashboard.as_mut().unwrap();
+                dashboard.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+                // The default rule has focus: remove it, leaving focus on the editing
+                // buttons, then Tab to Apply.
+                dashboard.handle_key(key(KeyCode::Delete));
+                dashboard.handle_key(key(KeyCode::Tab));
+                let action = dashboard.handle_scoped_key(key(KeyCode::Enter));
+                assert!(matches!(
+                    action,
+                    ScopedDashboardAction::Dashboard(DashboardAction::PersistFilter(_))
+                ));
+                app.apply_scoped_dashboard_action(action, &tx);
+                let path = home.path().join(".wisetree/config.json");
+                let document: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                assert_eq!(
+                    document["globalDashboard"]["filter"],
+                    serde_json::json!({"groups": []})
+                );
+                // An unchanged Apply must not ask the app to write again.
+                let dashboard = app.dashboard.as_mut().unwrap();
+                dashboard.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+                dashboard.handle_key(key(KeyCode::Tab));
+                assert_eq!(
+                    dashboard.handle_key(key(KeyCode::Enter)),
+                    DashboardAction::Continue
+                );
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                let dashboard = app.dashboard.as_mut().unwrap();
+                dashboard.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+                // Reset to default (focus lands on its rule), then Shift+Tab to Apply.
+                for _ in 0..2 {
+                    dashboard.handle_key(key(KeyCode::Right));
+                }
+                dashboard.handle_key(key(KeyCode::Enter));
+                dashboard.handle_key(key(KeyCode::BackTab));
+                let action = dashboard.handle_scoped_key(key(KeyCode::Enter));
+                app.apply_scoped_dashboard_action(action, &tx);
+                assert_eq!(app.toast.current().unwrap().variant, ToastVariant::Error);
+                assert!(app
+                    .toast
+                    .current()
+                    .unwrap()
+                    .message
+                    .contains(crate::messages::GLOBAL_FILTER_SAVE_FAILED));
+                assert_eq!(
+                    app.dashboard.as_ref().unwrap().filter(),
+                    &crate::config::schema::DashboardFilter::default()
+                );
+                app.enter_screen(Screen::Dashboard, &tx);
+                assert_eq!(
+                    app.dashboard.as_ref().unwrap().filter(),
+                    &crate::config::schema::DashboardFilter::default()
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn global_dashboard_loads_saved_filter_and_forwards_hover_only_on_dashboard() {
+        with_home(|home| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                // An empty saved filter must override the Mother-hiding default.
+                ConfigService::update_global_dashboard_filter(
+                    crate::config::schema::DashboardFilter { groups: vec![] },
+                )
+                .unwrap();
+                let (mut app, _, repo_b, _) = global_test_app(home).await;
+                let worktree = GitService::new(Some(repo_b.clone()))
+                    .list_worktrees()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|tree| tree.is_main)
+                    .unwrap();
+                app.dashboard.as_mut().unwrap().set_rows(vec![DashboardRow {
+                    repository: Some(global_test_repository(&repo_b)),
+                    worktree,
+                    last_commit: None,
+                    pull_request: None,
+                    error: None,
+                }]);
+                let mut terminal = Terminal::new(TestBackend::new(160, 35)).unwrap();
+                terminal
+                    .draw(|frame| app.dashboard.as_mut().unwrap().render(frame, frame.area()))
+                    .unwrap();
+                let button = app
+                    .dashboard
+                    .as_ref()
+                    .unwrap()
+                    .filter_button_rect()
+                    .unwrap();
+                let rendered: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(rendered.contains("│ Filter (0) │"));
+                assert!(rendered.contains("1 worktrees"));
+                app.handle_mouse(
+                    mouse(MouseEventKind::Moved, button.x, button.y),
+                    &app_event_tx(),
+                );
+                terminal
+                    .draw(|frame| app.dashboard.as_mut().unwrap().render(frame, frame.area()))
+                    .unwrap();
+                let rendered: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(rendered.contains(crate::messages::GLOBAL_FILTER_NONE));
+                app.handle_mouse(mouse(MouseEventKind::Moved, 0, 2), &app_event_tx());
+                terminal
+                    .draw(|frame| app.dashboard.as_mut().unwrap().render(frame, frame.area()))
+                    .unwrap();
+                let rendered: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(!rendered.contains(crate::messages::GLOBAL_FILTER_NONE));
+                app.screen = Screen::Delete;
+                app.handle_mouse(
+                    mouse(MouseEventKind::Moved, button.x, button.y),
+                    &app_event_tx(),
+                );
+                terminal
+                    .draw(|frame| app.dashboard.as_mut().unwrap().render(frame, frame.area()))
+                    .unwrap();
+                let rendered: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(!rendered.contains(crate::messages::GLOBAL_FILTER_NONE));
+            });
+        });
+    }
+
+    fn global_test_repository(root: &Path) -> DashboardRepository {
+        DashboardRepository {
+            owner: "owner".into(),
+            name: "repository-b".into(),
+            local_root: Some(root.into()),
+        }
+    }
+
+    async fn next_global_event(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn global_dashboard_delete_targets_row_repository_and_restores_launch_context() {
+        with_home(|home| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let original_cwd = env::current_dir().unwrap();
+                let (mut app, repo_a, repo_b, checkout) = global_test_app(home).await;
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let worktree = GitService::new(Some(repo_b.clone()))
+                    .list_worktrees()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|tree| !tree.is_main)
+                    .unwrap();
+                app.dashboard.as_mut().unwrap().set_rows(vec![DashboardRow {
+                    repository: Some(global_test_repository(&repo_b)),
+                    worktree,
+                    last_commit: None,
+                    pull_request: None,
+                    error: None,
+                }]);
+                let cached_service = app.global_dashboard_service.as_ref().unwrap() as *const _;
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                    &tx,
+                );
+                let event = next_global_event(&mut rx).await;
+                assert!(matches!(event, AppEvent::DashboardContextReady { .. }));
+                app.handle_app_event(event, &tx);
+                assert_eq!(app.screen, Screen::Delete);
+                assert_eq!(app.git_root.as_deref(), repo_b.to_str());
+                assert_eq!(env::current_dir().unwrap(), repo_b);
+                assert_eq!(app.current_config().unwrap().terminal_command, "repo-b");
+                let event = next_global_event(&mut rx).await;
+                app.handle_app_event(event, &tx);
+                assert_eq!(
+                    app.delete.as_ref().unwrap().selected_path(),
+                    checkout.to_str()
+                );
+                assert_eq!(
+                    app.delete
+                        .as_ref()
+                        .unwrap()
+                        .overlay_modal()
+                        .unwrap()
+                        .selected(),
+                    crate::tui::widgets::ConfirmationChoice::Cancel
+                );
+                // Enter accepts the default No and preserves the real worktree.
+                app.handle_key(key(KeyCode::Enter), &tx);
+                assert!(checkout.exists());
+                assert_eq!(app.screen, Screen::Dashboard);
+                assert!(app.is_global_dashboard());
+                assert!(app.dashboard_watch.is_some());
+                assert_eq!(
+                    app.header_label_override(),
+                    Some(crate::messages::GLOBAL_DASHBOARD_TITLE)
+                );
+                // Repeat Ctrl+X, then confirm through the existing safety UI.
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                    &tx,
+                );
+                app.handle_app_event(next_global_event(&mut rx).await, &tx);
+                app.handle_delete_key(key(KeyCode::Left), &tx);
+                app.handle_delete_key(key(KeyCode::Enter), &tx);
+                let event = next_global_event(&mut rx).await;
+                assert!(matches!(event, AppEvent::DeleteFinished(Ok(_))));
+                app.handle_app_event(event, &tx);
+                assert!(!checkout.exists());
+                assert!(repo_a.join("seed.txt").exists());
+                assert_eq!(app.screen, Screen::Dashboard);
+                assert!(app.is_global_dashboard());
+                assert!(app.dashboard_watch.is_some());
+                assert_eq!(
+                    cached_service,
+                    app.global_dashboard_service.as_ref().unwrap() as *const _
+                );
+                assert!(!app.quit_requested);
+                assert!(app.selected_path.is_none());
+                // Command cancellation and rebuild both retain global scope.
+                app.back_to_dashboard_action_menu(Some(checkout.display().to_string()), &tx);
+                app.enter_screen(Screen::Dashboard, &tx);
+                assert!(app.is_global_dashboard());
+                app.back_to_menu();
+                assert_eq!(app.git_root.as_deref(), repo_a.to_str());
+                assert_eq!(app.current_config().unwrap().terminal_command, "repo-a");
+                assert_eq!(env::current_dir().unwrap(), original_cwd);
+                assert!(!app.is_global_dashboard());
+            });
+        });
+    }
+
+    #[test]
+    fn global_dashboard_context_switch_discards_stale_results_and_handles_missing_roots() {
+        with_home(|home| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let original_cwd = env::current_dir().unwrap();
+                let (mut app, repo_a, repo_b, _) = global_test_app(home).await;
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                app.switch_dashboard_repository(
+                    global_test_repository(&repo_b),
+                    DashboardAction::JumpToDelete("stale".into()),
+                    &tx,
+                );
+                // A newer action on the already-active repository also invalidates B.
+                app.switch_dashboard_repository(
+                    global_test_repository(&repo_a),
+                    DashboardAction::Continue,
+                    &tx,
+                );
+                app.handle_app_event(next_global_event(&mut rx).await, &tx);
+                assert_eq!(app.git_root.as_deref(), repo_a.to_str());
+                assert_eq!(app.screen, Screen::Dashboard);
+                let mut remote = global_test_repository(&repo_b);
+                remote.local_root = None;
+                app.switch_dashboard_repository(remote, DashboardAction::Continue, &tx);
+                assert_eq!(app.git_root.as_deref(), repo_a.to_str());
+                let missing = home.path().join("vanished");
+                app.switch_dashboard_repository(
+                    global_test_repository(&missing),
+                    DashboardAction::JumpToDelete("missing".into()),
+                    &tx,
+                );
+                app.handle_app_event(next_global_event(&mut rx).await, &tx);
+                assert_eq!(app.screen, Screen::Dashboard);
+                assert_eq!(app.git_root.as_deref(), repo_a.to_str());
+                assert_eq!(app.toast.current().unwrap().variant, ToastVariant::Error);
+                assert_eq!(env::current_dir().unwrap(), original_cwd);
+                // Leaving invalidates a pending switch as well.
+                app.switch_dashboard_repository(
+                    global_test_repository(&repo_b),
+                    DashboardAction::Continue,
+                    &tx,
+                );
+                app.back_to_menu();
+                app.handle_app_event(next_global_event(&mut rx).await, &tx);
+                assert_eq!(app.git_root.as_deref(), repo_a.to_str());
+                assert_eq!(app.screen, Screen::Menu);
+            });
+        });
+    }
+
+    async fn global_batch_rows(roots: &[PathBuf]) -> Vec<DashboardRow> {
+        let mut rows = Vec::new();
+        for root in roots {
+            let mut repository = global_test_repository(root);
+            repository.name = root.file_name().unwrap().to_string_lossy().into_owned();
+            for worktree in GitService::new(Some(root.clone()))
+                .list_worktrees()
+                .await
+                .unwrap()
+            {
+                rows.push(DashboardRow {
+                    repository: Some(repository.clone()),
+                    worktree,
+                    last_commit: None,
+                    pull_request: None,
+                    error: None,
+                });
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn bulk_delete_returns_to_immediately_rendered_surviving_rows_in_both_scopes() {
+        with_home(|home| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (mut app, _, repo, checkout) = global_test_app(home).await;
+                    let rows = global_batch_rows(std::slice::from_ref(&repo)).await;
+                    for global in [false, true] {
+                        app.dashboard_scope = if global {
+                            AppDashboardScope::Global(Vec::new())
+                        } else {
+                            AppDashboardScope::Repository
+                        };
+                        app.git_root = Some(repo.display().to_string());
+                        app.enter_screen(Screen::Dashboard, &app_event_tx());
+                        app.dashboard.as_mut().unwrap().set_rows(rows.clone());
+                        let path = checkout.display().to_string();
+                        // Cancelling confirmation preserves every row.
+                        app.pending_delete_path = Some(path.clone());
+                        app.screen = Screen::Delete;
+                        app.delete = Some(DeleteScreen::new(false));
+                        app.dashboard_watch = None;
+                        app.cancel_delete_screen(&app_event_tx());
+                        assert_eq!(app.dashboard.as_ref().unwrap().rows(), &rows);
+                        assert!(app.deleted_worktree_paths.is_empty());
+
+                        // Simulate a completed bulk run, before any live watch update.
+                        app.screen = Screen::Delete;
+                        app.dashboard_watch = None;
+                        let mut delete = DeleteScreen::new(false);
+                        delete.set_worktrees(rows.iter().map(|row| row.worktree.clone()).collect());
+                        delete.jump_to_bulk_confirm(vec![path.clone()]);
+                        delete.start_deleting();
+                        app.delete = Some(delete);
+                        app.handle_app_event(
+                            AppEvent::DeleteFinished(Ok(ServiceDeleteOutcome {
+                                worktree_deleted: true,
+                                branch_deleted: false,
+                                branch_name: Some("feature".into()),
+                                branch_delete_error: None,
+                            })),
+                            &app_event_tx(),
+                        );
+                        assert_eq!(app.screen, Screen::Dashboard);
+                        let dashboard = app.dashboard.as_mut().unwrap();
+                        assert_eq!(dashboard.rows().len(), rows.len() - 1);
+                        assert!(dashboard.rows().iter().all(|row| row.worktree.path != path));
+                        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+                        terminal
+                            .draw(|frame| dashboard.render(frame, frame.area()))
+                            .unwrap();
+                        let rendered: String = terminal
+                            .backend()
+                            .buffer()
+                            .content()
+                            .iter()
+                            .map(|cell| cell.symbol())
+                            .collect();
+                        assert!(!rendered.contains("Loading dashboard"));
+                        assert!(!rendered.contains("feature"));
+                        assert!(rendered.contains("Mother"));
+                    }
+                });
+        });
+    }
+
+    #[test]
+    fn global_bulk_delete_isolates_same_named_worktrees_and_stops_on_failure() {
+        with_home(|home| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (mut app, repo_a, repo_b, checkout_b) = global_test_app(home).await;
+                    let checkout_a = home.path().join("repository-a-feature");
+                    git(
+                        &repo_a,
+                        &[
+                            "worktree",
+                            "add",
+                            "-b",
+                            "feature",
+                            checkout_a.to_str().unwrap(),
+                        ],
+                    );
+                    let checkout_a = checkout_a.canonicalize().unwrap();
+                    let roots = [repo_a.clone(), repo_b.clone()];
+                    let rows = global_batch_rows(&roots).await;
+                    app.dashboard.as_mut().unwrap().set_rows(rows.clone());
+                    let (tx, mut rx) = mpsc::unbounded_channel();
+                    app.start_bulk_delete_flow(
+                        BulkDeleteStatus::Clean,
+                        vec![
+                            checkout_a.display().to_string(),
+                            checkout_b.display().to_string(),
+                        ],
+                        &tx,
+                    );
+                    assert_eq!(app.delete.as_ref().unwrap().worktrees().len(), 2);
+                    // Uncheck B; confirming must delete only A despite identical branch names.
+                    app.handle_delete_key(key(KeyCode::Down), &tx);
+                    app.handle_delete_key(key(KeyCode::Char(' ')), &tx);
+                    app.handle_delete_key(key(KeyCode::Enter), &tx);
+                    app.handle_delete_key(key(KeyCode::Left), &tx);
+                    app.handle_delete_key(key(KeyCode::Enter), &tx);
+                    app.handle_app_event(next_global_event(&mut rx).await, &tx);
+                    assert!(!git(&repo_a, &["worktree", "list", "--porcelain"])
+                        .contains(checkout_a.to_str().unwrap()));
+                    assert!(git(&repo_b, &["worktree", "list", "--porcelain"])
+                        .contains(checkout_b.to_str().unwrap()));
+
+                    // Queue both repositories, a missing repository, then another B worktree.
+                    git(
+                        &repo_a,
+                        &["worktree", "add", checkout_a.to_str().unwrap(), "feature"],
+                    );
+                    let untouched = home.path().join("repository-b-untouched");
+                    git(
+                        &repo_b,
+                        &[
+                            "worktree",
+                            "add",
+                            "-b",
+                            "untouched",
+                            untouched.to_str().unwrap(),
+                        ],
+                    );
+                    let untouched = untouched.canonicalize().unwrap();
+                    let mut rows = global_batch_rows(&roots).await;
+                    let mut missing = rows
+                        .iter()
+                        .find(|row| row.worktree.path == checkout_b.to_str().unwrap())
+                        .unwrap()
+                        .clone();
+                    missing.repository =
+                        Some(global_test_repository(&home.path().join("vanished")));
+                    missing.worktree.path =
+                        home.path().join("vanished-feature").display().to_string();
+                    let missing_path = missing.worktree.path.clone();
+                    rows.push(missing);
+                    app.dashboard.as_mut().unwrap().set_rows(rows);
+                    app.start_bulk_delete_flow(
+                        BulkDeleteStatus::Clean,
+                        vec![
+                            checkout_a.display().to_string(),
+                            checkout_b.display().to_string(),
+                            missing_path,
+                            untouched.display().to_string(),
+                        ],
+                        &tx,
+                    );
+                    app.handle_delete_key(key(KeyCode::Enter), &tx);
+                    app.handle_delete_key(key(KeyCode::Left), &tx);
+                    app.handle_delete_key(key(KeyCode::Enter), &tx);
+                    app.handle_app_event(next_global_event(&mut rx).await, &tx);
+                    app.handle_app_event(next_global_event(&mut rx).await, &tx);
+                    app.handle_app_event(next_global_event(&mut rx).await, &tx);
+                    let error = app.delete.as_ref().unwrap().error().unwrap();
+                    assert!(error.contains("owner/repository-b"), "{error}");
+                    assert!(error.contains("vanished-feature"), "{error}");
+                    assert!(error.contains("2 deleted successfully"), "{error}");
+                    assert!(app.bulk_delete_queue.is_empty());
+                    assert!(!git(&repo_b, &["worktree", "list", "--porcelain"])
+                        .contains(checkout_b.to_str().unwrap()));
+                    assert!(git(&repo_b, &["worktree", "list", "--porcelain"])
+                        .contains(untouched.to_str().unwrap()));
+                    app.leave_delete_screen(&tx);
+                    let remaining = app.dashboard.as_ref().unwrap().rows();
+                    assert!(remaining
+                        .iter()
+                        .all(|row| row.worktree.path != checkout_a.to_str().unwrap()
+                            && row.worktree.path != checkout_b.to_str().unwrap()));
+                    assert!(remaining
+                        .iter()
+                        .any(|row| row.worktree.path == untouched.to_str().unwrap()));
+                    assert!(remaining
+                        .iter()
+                        .any(|row| row.worktree.path.ends_with("vanished-feature")));
+                    app.back_to_menu();
+                });
+        });
+    }
+
+    #[test]
+    fn global_accounts_menu_save_dashboard_return_and_cancel() {
+        with_home(|_| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            // No yield: discovery and Dashboard tasks cannot invoke external services.
+            runtime.block_on(async {
+                ConfigService::update_global_dashboard_selected_accounts(
+                    vec!["saved-owner".into()],
+                )
+                .unwrap();
+                let mut app = initialized_menu_app();
+                let tx = app_event_tx();
+                app.handle_key(key(KeyCode::Char('3')), &tx);
+                app.handle_key(key(KeyCode::Enter), &tx);
+                assert_eq!(app.screen, Screen::GlobalAccounts);
+                assert_eq!(
+                    app.global_accounts.as_ref().unwrap().selected_accounts(),
+                    ["saved-owner"]
+                );
+                let generation = app.global_accounts_generation;
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                    &tx,
+                );
+                assert_ne!(app.global_accounts_generation, generation);
+                app.handle_app_event(AppEvent::GlobalAccountsDiscovered {
+                    generation: app.global_accounts_generation,
+                    result: Ok(AccountDiscovery {
+                        viewer: "viewer".into(),
+                        accounts: vec![crate::services::global_dashboard::github::GitHubAccount {
+                            login: "viewer".into(),
+                            kind: crate::services::global_dashboard::github::AccountKind::User,
+                        }],
+                        warnings: vec![],
+                    }),
+                }, &tx);
+                app.handle_paste("viewer".into(), &tx);
+                app.handle_key(key(KeyCode::Char(' ')), &tx);
+                app.handle_key(key(KeyCode::Enter), &tx);
+                assert_eq!(app.screen, Screen::Dashboard);
+                assert_eq!(
+                    app.dashboard_scope,
+                    AppDashboardScope::Global(vec!["saved-owner".into(), "viewer".into()])
+                );
+                assert_eq!(
+                    ConfigService::load_global_dashboard_preferences()
+                        .unwrap()
+                        .selected_accounts,
+                    ["saved-owner", "viewer"]
+                );
+                app.dashboard.as_mut().unwrap().set_rows(vec![]);
+                app.handle_key(key(KeyCode::Esc), &tx);
+                assert_eq!(app.screen, Screen::GlobalAccounts);
+                assert!(app.dashboard_watch.is_none());
+                // First Esc clears the retained query. Change a checkbox, then cancel.
+                app.handle_key(key(KeyCode::Esc), &tx);
+                app.handle_key(key(KeyCode::Char(' ')), &tx);
+                app.handle_key(key(KeyCode::Esc), &tx);
+                assert_eq!(app.screen, Screen::Menu);
+                assert!(!app.is_global_dashboard());
+                assert_eq!(
+                    ConfigService::load_global_dashboard_preferences()
+                        .unwrap()
+                        .selected_accounts,
+                    ["saved-owner", "viewer"]
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn global_accounts_save_error_keeps_selection_screen() {
+        with_home(|_| {
+            let mut app = initialized_menu_app();
+            app.screen = Screen::GlobalAccounts;
+            let mut accounts = GlobalAccountsScreen::new(vec!["saved-owner".into()]);
+            accounts.set_discovery(Err(GitHubError::NotInstalled));
+            app.global_accounts = Some(accounts);
+            let path = global_config_file();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "{invalid").unwrap();
+            app.handle_key(key(KeyCode::Enter), &app_event_tx());
+            assert_eq!(app.screen, Screen::GlobalAccounts);
+            assert!(!app.is_global_dashboard());
+            assert_eq!(fs::read_to_string(path).unwrap(), "{invalid");
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let output: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(output.contains(crate::messages::GLOBAL_ACCOUNTS_SAVE_FAILED));
+        });
     }
 }

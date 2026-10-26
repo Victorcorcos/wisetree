@@ -19,6 +19,21 @@ const BASIC_CONFIG_KEYS: &[&str] = &[
     "worktreePathTemplate",
 ];
 const BASIC_DASHBOARD_KEYS: &[&str] = &["columns", "refreshIntervalMs", "showPullRequests"];
+/// The schema also documents `globalDashboard`, which only the global config
+/// stores and default or project saves omit.
+const SCHEMA_CONFIG_KEYS: &[&str] = &[
+    "dashboard",
+    "deleteBranchWithWorktree",
+    "globalDashboard",
+    "postCreateCmd",
+    "terminalCommand",
+    "worktreeCopyIgnores",
+    "worktreeCopyPatterns",
+    "worktreeLinkCacheDir",
+    "worktreeLinkPatterns",
+    "worktreeLinkStrategy",
+    "worktreePathTemplate",
+];
 
 fn assert_keys(value: &serde_json::Value, expected: &[&str]) {
     let mut actual: Vec<_> = value
@@ -370,7 +385,7 @@ fn saving_legacy_config_keeps_only_basic_fields_in_both_scopes() {
 #[test]
 fn published_schema_contains_only_basic_config_keys() {
     let schema: serde_json::Value = serde_json::from_str(include_str!("../schema.json")).unwrap();
-    assert_keys(&schema["properties"], BASIC_CONFIG_KEYS);
+    assert_keys(&schema["properties"], SCHEMA_CONFIG_KEYS);
     assert_keys(
         &schema["definitions"]["DashboardConfig"]["properties"],
         BASIC_DASHBOARD_KEYS,
@@ -393,4 +408,234 @@ fn from_column_loads_from_config() {
         assert_eq!(config.dashboard.columns, vec!["branch", "from", "status"]);
         assert!(service.warnings().is_empty());
     });
+}
+
+#[test]
+fn global_dashboard_selection_patches_only_accounts_and_preserves_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("state/config.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut document = serde_json::json!({
+        "terminalCommand": "editor",
+        "unknownFutureKey": { "kept": true },
+        "modelPicker": { "favorites": ["openai/model"] },
+        "globalDashboard": { "selectedAccounts": ["old"], "future": 7 }
+    });
+    fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let saved = ConfigService::update_global_dashboard_selected_accounts_at(
+        &path,
+        ["oxeanbits", "Victorcorcos", "OXEANBITS", "victorcorcos"]
+            .map(str::to_string)
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(saved.selected_accounts, ["oxeanbits", "Victorcorcos"]);
+    document["globalDashboard"]["selectedAccounts"] =
+        serde_json::json!(["oxeanbits", "Victorcorcos"]);
+    let actual: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(actual, document);
+    // The selection reader only needs the selectedAccounts field; unrelated
+    // future keys are preserved by the patch, as are unknown top-level keys.
+    document["globalDashboard"]
+        .as_object_mut()
+        .unwrap()
+        .remove("future");
+    fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    assert_eq!(
+        ConfigService::load_global_dashboard_preferences_at(&path).unwrap(),
+        saved
+    );
+}
+
+#[test]
+fn global_dashboard_settings_save_keeps_latest_selection_and_project_save_omits_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("global/config.json");
+    let mut service = ConfigService::with_global_config_path(path.clone());
+    let mut stale = service.load_global().unwrap();
+    assert!(stale.global_dashboard.is_none());
+    ConfigService::update_global_dashboard_selected_accounts_at(&path, vec!["old".into()]).unwrap();
+    stale.global_dashboard = service.load_global().unwrap().global_dashboard;
+    let latest = ConfigService::update_global_dashboard_selected_accounts_at(
+        &path,
+        vec!["new".into(), "other".into(), "NEW".into()],
+    )
+    .unwrap();
+    stale.terminal_command = "new editor".into();
+    service.save(&stale, None).unwrap();
+    let loaded = service.load_global().unwrap();
+    assert_eq!(loaded.global_dashboard.as_ref(), Some(&latest));
+    assert_eq!(loaded.terminal_command, "new editor");
+    let local = tmp.path().join("project/.wisetree/config.json");
+    service.save(&loaded, Some(&local)).unwrap();
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(local).unwrap()).unwrap();
+    assert!(document.get("globalDashboard").is_none());
+    assert_eq!(
+        ConfigService::load_global_dashboard_preferences_at(&path).unwrap(),
+        latest
+    );
+}
+
+#[test]
+fn global_dashboard_selection_supports_missing_file_empty_selection_and_invalid_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("global/config.json");
+    assert!(ConfigService::load_global_dashboard_preferences_at(&path)
+        .unwrap()
+        .selected_accounts
+        .is_empty());
+    ConfigService::update_global_dashboard_selected_accounts_at(&path, vec!["account".into()])
+        .unwrap();
+    let cleared =
+        ConfigService::update_global_dashboard_selected_accounts_at(&path, vec![]).unwrap();
+    assert!(cleared.selected_accounts.is_empty());
+    assert_eq!(
+        ConfigService::load_global_dashboard_preferences_at(&path).unwrap(),
+        cleared
+    );
+    fs::write(&path, "invalid JSON").unwrap();
+    assert!(ConfigService::update_global_dashboard_selected_accounts_at(&path, vec![]).is_err());
+    assert_eq!(fs::read_to_string(path).unwrap(), "invalid JSON");
+}
+
+#[test]
+fn global_dashboard_config_is_backward_compatible_and_documented_in_schema() {
+    let legacy: WorktreeConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(legacy, WorktreeConfig::default());
+    let parsed: WorktreeConfig = serde_json::from_str(
+        r#"{"globalDashboard":{"selectedAccounts":["oxeanbits","Victorcorcos"]}}"#,
+    )
+    .unwrap();
+    let value = serde_json::to_value(&parsed).unwrap();
+    assert_eq!(
+        value["globalDashboard"]["selectedAccounts"],
+        serde_json::json!(["oxeanbits", "Victorcorcos"])
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!("../schema.json")).unwrap();
+    assert_eq!(
+        schema["definitions"]["GlobalDashboardConfig"]["properties"]["selectedAccounts"]["type"],
+        "array"
+    );
+}
+
+#[test]
+fn global_filter_defaults_normalization_and_empty_reload() {
+    use wisetree::config::schema::{DashboardFilter, GlobalDashboardConfig};
+    let missing: GlobalDashboardConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(missing.filter, DashboardFilter::default());
+    let normalized: DashboardFilter =
+        serde_json::from_value(serde_json::json!({"groups":[{"rules":[
+            {"field":"status","operator":"isNoneOf","values":["Mother","Mother"]},
+            {"field":"branch","operator":"contains","values":[]}
+        ]}]}))
+        .unwrap();
+    assert_eq!(normalized, DashboardFilter::default());
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    ConfigService::update_global_dashboard_filter_at(&path, DashboardFilter { groups: vec![] })
+        .unwrap();
+    let loaded = ConfigService::load_global_dashboard_preferences_at(&path).unwrap();
+    assert!(loaded.filter.groups.is_empty());
+    let mut service = ConfigService::with_global_config_path(path);
+    let config = service.load_global().unwrap();
+    service.save(&config, None).unwrap();
+    assert!(service
+        .load_global()
+        .unwrap()
+        .global_dashboard
+        .unwrap()
+        .filter
+        .groups
+        .is_empty());
+}
+
+#[test]
+fn invalid_global_filters_fall_back_without_losing_accounts_and_warn() {
+    use wisetree::config::schema::DashboardFilter;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    for filter in [
+        serde_json::json!({"unknown":true}),
+        serde_json::json!({"groups":[{"rules":[{"field":"unknown","operator":"isAnyOf","values":["x"]}]}]}),
+        serde_json::json!({"groups":[{"rules":[{"field":"status","operator":"contains","values":["Mother"]}]}]}),
+        serde_json::json!({"groups":[{"rules":[{"field":"status","operator":"isAnyOf","values":["invalid"]}]}]}),
+        serde_json::json!({"groups":[{"rules":[{"field":"ahead","operator":"equal","values":["NaN"]}]}]}),
+        serde_json::Value::Null,
+    ] {
+        fs::write(&path, serde_json::to_vec(&serde_json::json!({"globalDashboard":{"selectedAccounts":["Alice"],"filter":filter}})).unwrap()).unwrap();
+        let loaded = ConfigService::load_global_dashboard_preferences_at(&path).unwrap();
+        assert_eq!(loaded.selected_accounts, ["Alice"]);
+        assert_eq!(loaded.filter, DashboardFilter::default());
+        let mut service = ConfigService::with_global_config_path(path.clone());
+        assert_eq!(
+            service.load_global().unwrap().global_dashboard.unwrap(),
+            loaded
+        );
+        assert!(service
+            .warnings()
+            .iter()
+            .any(|s| s.contains("globalDashboard.filter")));
+        ConfigService::update_global_dashboard_selected_accounts_at(&path, vec!["Bob".into()])
+            .unwrap();
+        assert_eq!(
+            ConfigService::load_global_dashboard_preferences_at(&path)
+                .unwrap()
+                .selected_accounts,
+            ["Bob"]
+        );
+    }
+}
+
+#[test]
+fn filter_patch_preserves_other_keys_and_settings_keeps_latest_filter() {
+    use wisetree::config::schema::DashboardFilter;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let document = serde_json::json!({
+        "terminalCommand":"editor", "future": {"kept":true},
+        "globalDashboard":{"selectedAccounts":["Alice"],"future":7}
+    });
+    fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let empty = DashboardFilter { groups: vec![] };
+    let saved = ConfigService::update_global_dashboard_filter_at(&path, empty.clone()).unwrap();
+    assert_eq!(saved.selected_accounts, ["Alice"]);
+    let mut expected = document;
+    expected["globalDashboard"]["filter"] = serde_json::to_value(&empty).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap(),
+        expected
+    );
+    // A selection patch leaves an explicitly empty filter intact.
+    let updated =
+        ConfigService::update_global_dashboard_selected_accounts_at(&path, vec!["Bob".into()])
+            .unwrap();
+    assert_eq!(updated.filter, empty);
+    fs::write(
+        &path,
+        r#"{"globalDashboard":{"selectedAccounts":["Alice"]}}"#,
+    )
+    .unwrap();
+    let mut service = ConfigService::with_global_config_path(path.clone());
+    let stale = service.load_global().unwrap();
+    ConfigService::update_global_dashboard_filter_at(&path, empty.clone()).unwrap();
+    service.save(&stale, None).unwrap();
+    assert_eq!(
+        service
+            .load_global()
+            .unwrap()
+            .global_dashboard
+            .unwrap()
+            .filter,
+        empty
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!("../schema.json")).unwrap();
+    let filter = &schema["definitions"]["GlobalDashboardConfig"]["properties"]["filter"];
+    assert_eq!(
+        schema["definitions"]["DashboardFilter"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        filter["default"],
+        serde_json::to_value(DashboardFilter::default()).unwrap()
+    );
 }

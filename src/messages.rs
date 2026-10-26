@@ -29,6 +29,9 @@ pub const CREATE_NAVIGATE_PROMPT: &str =
 pub const CREATE_SUCCESS: &str = "Worktree created successfully!";
 pub const CREATE_CREATING: &str = "Creating worktree...";
 
+// Dashboard shortcuts
+pub const DASHBOARD_DELETE_SHORTCUT: &str = "Ctrl+X Delete";
+
 // Delete flow
 pub const DELETE_CONFIRM_TITLE: &str = "Delete Worktree Confirmation";
 pub const DELETE_WARNING: &str = "This action cannot be undone.";
@@ -150,6 +153,20 @@ pub mod colors {
     /// Creative accent for moments worth a splash of color.
     pub const ACCENT: Color = ORANGE;
 
+    // ── Global Dashboard filter syntax ─────────────────────────────────
+    //
+    // A rule reads like highlighted code wherever it is shown (dashboard
+    // tooltip and filter editor): `Status is any of Merged AND …`.
+
+    /// Dashboard field names (`Status`, `Profile`), like a type name.
+    pub const FILTER_FIELD: Color = TEAL;
+    /// Comparison operators (`is any of`, `contains`, `>=`).
+    pub const FILTER_OPERATOR: Color = BRAND;
+    /// Compared values (`Mother`, `alice`), like a string literal.
+    pub const FILTER_VALUE: Color = YELLOW;
+    /// `AND` / `OR` connectives between rules and groups.
+    pub const FILTER_KEYWORD: Color = ORANGE;
+
     /// Welcome header backdrop.
     pub const HEADER_BG: Color = BG;
     /// Welcome header border — uses the focus brown so the panel frame
@@ -176,3 +193,150 @@ pub mod colors {
     /// Status bar foreground.
     pub const STATUS_TEXT: Color = GRAY_LIGHT;
 }
+
+// Global Dashboard GitHub setup
+pub const GLOBAL_GH_INSTALL: &str = "Install gh (GitHub CLI) to use Global Dashboard.";
+pub const GLOBAL_GH_AUTH: &str = "GitHub authentication failed; run gh auth login";
+
+// Shared Dashboard in global scope
+pub const GLOBAL_PROFILE_COLUMN: &str = "Profile";
+pub const GLOBAL_REPOSITORY_COLUMN: &str = "Repository";
+pub const GLOBAL_NOT_CLONED: &str = "Not cloned locally";
+pub const GLOBAL_UNAVAILABLE: &str = "-";
+pub const GLOBAL_NO_LOCAL_WORKTREE: &str = "No local worktree is available for this pull request.";
+pub const GLOBAL_DASHBOARD_EMPTY: &str =
+    "No worktrees or pull requests found for the selected accounts.";
+pub const GLOBAL_DASHBOARD_NO_MATCHES: &str =
+    "No worktrees or pull requests match the current filter.";
+
+// Global Dashboard repository context
+pub const GLOBAL_DASHBOARD_TITLE: &str = "Global Dashboard";
+pub const GLOBAL_CONTEXT_FAILED: &str = "Could not open the row's local repository";
+pub const GLOBAL_CONTEXT_RESTORE_FAILED: &str = "Could not restore the launch directory";
+
+// Global Dashboard account selection
+pub const MENU_GLOBAL_DASHBOARD: &str = "Global Dashboard";
+pub const GLOBAL_ACCOUNTS_TITLE: &str = "Select GitHub Organizations / Accounts";
+pub const GLOBAL_ACCOUNTS_LOADING: &str = "Discovering GitHub accounts…";
+pub const GLOBAL_ACCOUNTS_REQUIRED: &str = "Select at least one account to open Global Dashboard.";
+pub const GLOBAL_ACCOUNTS_HINT: &str =
+    "Space toggle · ↑↓ navigate · Enter open · Esc back · Ctrl+R retry";
+pub const GLOBAL_ACCOUNTS_SAVE_FAILED: &str = "Could not save selected accounts";
+
+/// Labels for the shared worktree deletion progress panel.
+pub mod delete_progress {
+    pub const BRANCH_DELETED: &str = "branch deleted";
+    pub const BRANCH_KEPT: &str = "branch kept";
+    pub const SKIPPED: &str = "skipped";
+    pub const ERROR_HINT: &str = "Press any key to try again...";
+
+    pub fn header(count: usize) -> String {
+        let label = if count == 1 { "worktree" } else { "worktrees" };
+        format!("Deleting {count} {label}")
+    }
+
+    pub fn tally(deleted: usize, warnings: usize, remaining: usize) -> String {
+        let label = if warnings == 1 { "warning" } else { "warnings" };
+        format!("{deleted} deleted · {warnings} {label} · {remaining} remaining")
+    }
+
+    pub fn more(count: usize, above: bool) -> String {
+        let arrow = if above { "↑" } else { "↓" };
+        format!("{arrow} {count} more")
+    }
+}
+
+// Global Dashboard filter preview
+pub const GLOBAL_FILTER_BUTTON: &str = "Filter";
+pub const GLOBAL_FILTER_NONE: &str = "No filters — showing all worktrees";
+pub const GLOBAL_DASHBOARD_FILTER_HIDDEN: &str = "All worktrees are hidden by the active filter.";
+/// `Showing {visible} of {total} worktrees · {hidden} hidden`, split around
+/// the three counts so each one can be colored.
+pub const GLOBAL_FILTER_SUMMARY: [&str; 4] = ["Showing ", " of ", " worktrees · ", " hidden"];
+
+// Global Dashboard filter editor
+pub const GLOBAL_FILTER_TITLE: &str = "Global Dashboard · Filter";
+/// `Match ALL of`, split so the `ALL` keyword can be highlighted.
+pub const GLOBAL_FILTER_ALL: [&str; 3] = ["Match ", "ALL", " of"];
+pub const GLOBAL_FILTER_BUTTONS: [&str; 6] = [
+    "+ Rule",
+    "+ OR group",
+    "Reset to default",
+    "Clear all",
+    "Apply",
+    "Cancel",
+];
+/// Hover help for [`GLOBAL_FILTER_BUTTONS`], in the same order.
+pub const GLOBAL_FILTER_BUTTON_TIPS: [&str; 6] = [
+    "Add a rule to the current group; a worktree must match every rule in a group (AND).",
+    "Start a new group; a worktree is shown when any group matches (OR).",
+    "Restore the default filter, which hides Mother worktrees.",
+    "Remove every rule to show all worktrees.",
+    "Save this filter and return to the Global Dashboard.",
+    "Discard your changes and return to the Global Dashboard.",
+];
+pub const GLOBAL_FILTER_FIELD_STEP: &str = "1/3 · Choose a field (type to search)";
+pub const GLOBAL_FILTER_OPERATOR_STEP: &str = "2/3 · Choose an operator";
+pub const GLOBAL_FILTER_VALUE_STEP: &str = "3/3 · Choose values";
+/// `(key, action)` hints while a rule is focused.
+pub const GLOBAL_FILTER_RULES_HINT: [(&str, &str); 8] = [
+    ("↑↓", "Move"),
+    ("Enter", "Edit"),
+    ("Space", "Apply"),
+    ("a", "Add rule"),
+    ("o", "Add OR group"),
+    ("Delete", "Remove"),
+    ("Tab/⇧Tab", "Sections"),
+    ("Esc", "Cancel"),
+];
+/// `(key, action)` hints while a button is focused.
+pub const GLOBAL_FILTER_BUTTONS_HINT: [(&str, &str); 5] = [
+    ("←→", "Move"),
+    ("Enter", "Select"),
+    ("Space", "Apply"),
+    ("Tab/⇧Tab", "Sections"),
+    ("Esc", "Cancel"),
+];
+pub const GLOBAL_FILTER_VALUE_HINT: [(&str, &str); 6] = [
+    ("↑↓", "Choose"),
+    ("Space", "Toggle"),
+    ("Type", "Search / Custom value"),
+    ("Tab", "Complete text"),
+    ("Enter", "Next"),
+    ("Esc", "Back"),
+];
+pub const GLOBAL_FILTER_NEXT: &str = "Next";
+pub const GLOBAL_FILTER_SAVE: &str = "Save";
+pub const GLOBAL_FILTER_BACK: &str = "Back";
+pub const GLOBAL_FILTER_INTEGER_ERROR: &str = "Enter a valid integer.";
+pub const GLOBAL_FILTER_VALUE_ERROR: &str = "Select at least one value or enter a nonempty value.";
+pub const GLOBAL_FILTER_SAVE_FAILED: &str =
+    "Filter applied for this session, but could not be saved";
+pub const GLOBAL_FILTER_SHORTCUT: &str = "  Ctrl+F Filter";
+
+pub const GLOBAL_FILTER_FIELD_DESCRIPTIONS: [&str; 17] = [
+    "Owning GitHub organization or user",
+    "Repository name",
+    "Local checkout or remote PR",
+    "Mother, PR state or checkout cleanliness",
+    "Pull request CI checks",
+    "Pull request review decision",
+    "Pull request merge readiness",
+    "Checkout directory name",
+    "Worktree branch name",
+    "Source branch",
+    "Commit message, author or SHA",
+    "Pull request title",
+    "Commits ahead of the base",
+    "Commits behind the base",
+    "Added lines",
+    "Removed lines",
+    "Pull request number",
+];
+
+pub const GLOBAL_FILTER_FIELD_INPUT: &str = "Search fields...";
+pub const GLOBAL_FILTER_ENUM_INPUT: &str =
+    "Search values (profiles / repositories also accept custom values)...";
+pub const GLOBAL_FILTER_TEXT_INPUT: &str = "Enter text, or choose a suggestion and press Tab...";
+pub const GLOBAL_FILTER_NUMBER_INPUT: &str = "Enter an integer...";
+pub const GLOBAL_FILTER_SELECTED: &str = "Selected: ";

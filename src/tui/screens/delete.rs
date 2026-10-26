@@ -4,7 +4,7 @@
 //!   (bulk delete). Color=ERROR when the worktree is dirty or the branch
 //!   will be deleted alongside it; WARNING otherwise. The confirm label
 //!   flips to "Force Delete" when the worktree is dirty.
-//! - `Deleting`: spinner with `Deleting worktree... (<branch>)`.
+//! - `Deleting`: per-worktree checklist, elapsed time and determinate progress.
 //! - `Success` : success message — varies based on whether the branch was
 //!   also deleted, kept, or never targeted (mirrors upstream wording).
 //!
@@ -12,6 +12,9 @@
 //! `set_worktrees` / `set_error`, reacts to `DeleteAction::Confirmed`
 //! by invoking `WorktreeService::delete_worktree`, then calls
 //! `mark_complete(outcome)` (or `set_error`) when done.
+
+use std::collections::HashMap;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -22,8 +25,12 @@ use ratatui::Frame;
 
 use crate::git::types::GitWorktree;
 use crate::messages::{
-    colors, DELETE_CONFIRM_TITLE, DELETE_DELETING, DELETE_SUCCESS, DELETE_UNMERGED_TITLE,
-    DELETE_UNMERGED_WARNING, DELETE_WARNING, LOADING_WORKTREES,
+    colors, delete_progress as progress_messages, DELETE_CONFIRM_TITLE, DELETE_SUCCESS,
+    DELETE_UNMERGED_TITLE, DELETE_UNMERGED_WARNING, DELETE_WARNING, LOADING_WORKTREES,
+};
+use crate::services::DashboardRepository;
+use crate::tui::widgets::delete_progress::{
+    DeleteProgress, DeleteProgressItem, DeleteProgressStatus,
 };
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
@@ -72,6 +79,7 @@ pub enum DeleteAction {
 pub struct DeleteScreen {
     step: DeleteStep,
     worktrees: Vec<GitWorktree>,
+    repositories: HashMap<String, DashboardRepository>,
     selected_path: Option<String>,
     delete_branch_with_worktree: bool,
     loading: bool,
@@ -83,14 +91,15 @@ pub struct DeleteScreen {
     /// Paths queued for a bulk delete from the dashboard. Empty for
     /// single-target deletions.
     bulk_paths: Vec<String>,
-    /// Total worktrees in the active bulk run — used to render
-    /// "Deleting (i of N)" progress.
+    /// Total worktrees in the active bulk run.
     bulk_total: usize,
     /// Number of bulk items already deleted in the active run.
     bulk_completed: usize,
     /// Bulk-delete sub-failures (e.g. "branch X could not be removed")
     /// that should be surfaced after the run completes.
     bulk_warnings: Vec<String>,
+    progress_started: Option<Instant>,
+    finished_items: Vec<(DeleteOutcome, Option<String>)>,
     pub tick: usize,
 }
 
@@ -99,6 +108,7 @@ impl DeleteScreen {
         Self {
             step: DeleteStep::Confirm,
             worktrees: Vec::new(),
+            repositories: HashMap::new(),
             selected_path: None,
             delete_branch_with_worktree,
             loading: true,
@@ -111,6 +121,8 @@ impl DeleteScreen {
             bulk_total: 0,
             bulk_completed: 0,
             bulk_warnings: Vec::new(),
+            progress_started: None,
+            finished_items: Vec::new(),
             tick: 0,
         }
     }
@@ -187,13 +199,38 @@ impl DeleteScreen {
         self.error = None;
     }
 
+    /// Preserve each local row's repository through confirmation and execution.
+    pub fn set_repository_worktrees(&mut self, rows: Vec<(DashboardRepository, GitWorktree)>) {
+        self.repositories = rows
+            .iter()
+            .map(|(repository, worktree)| (worktree.path.clone(), repository.clone()))
+            .collect();
+        self.set_worktrees(rows.into_iter().map(|(_, worktree)| worktree).collect());
+    }
+
+    pub fn repository(&self, path: &str) -> Option<&DashboardRepository> {
+        self.repositories.get(path)
+    }
+
+    pub fn bulk_current_path(&self) -> Option<&str> {
+        self.bulk_paths.get(self.bulk_completed).map(String::as_str)
+    }
+
+    pub fn bulk_item_label(&self) -> String {
+        let path = self.bulk_current_path().unwrap_or_default();
+        match self.repository(path) {
+            Some(repository) => format!("{}/{}: {}", repository.owner, repository.name, path),
+            None => path.to_string(),
+        }
+    }
+
     pub fn preselect_path(&mut self, _path: &str) {
         // No-op: Select step is gone.
     }
 
     /// Like `preselect_path`, but also bypasses the worktree picker and
     /// advances straight to the per-worktree confirmation dialog. Used by
-    /// the dashboard's Backspace shortcut to make deletion a one-key action.
+    /// the dashboard's Ctrl+X shortcut to make deletion a one-key action.
     pub fn jump_to_confirm_path(&mut self, path: &str) {
         if !self.worktrees.iter().any(|worktree| worktree.path == path) {
             return;
@@ -234,6 +271,9 @@ impl DeleteScreen {
     }
 
     pub fn start_deleting(&mut self) {
+        self.progress_started.get_or_insert_with(Instant::now);
+        self.confirm = None;
+        self.bulk_confirm = None;
         self.step = DeleteStep::Deleting;
     }
 
@@ -274,6 +314,9 @@ impl DeleteScreen {
     }
 
     pub fn mark_complete(&mut self, outcome: DeleteOutcome) {
+        if self.finished_items.is_empty() {
+            self.record_item_outcome(outcome.clone(), None);
+        }
         self.outcome = Some(outcome);
         self.step = DeleteStep::Success;
         self.loading = false;
@@ -282,14 +325,93 @@ impl DeleteScreen {
     /// Records one finished sub-deletion in an active bulk run. The
     /// optional `warning` is surfaced after the run finishes (e.g. when
     /// the worktree was removed but its branch could not be deleted).
-    pub fn bulk_record_progress(&mut self, warning: Option<String>) {
+    pub fn bulk_record_progress(&mut self, outcome: DeleteOutcome, warning: Option<String>) {
         if self.bulk_total == 0 {
             return;
         }
+        self.record_item_outcome(outcome, warning.clone());
         self.bulk_completed = self.bulk_completed.saturating_add(1);
         if let Some(message) = warning {
             self.bulk_warnings.push(message);
         }
+    }
+
+    /// Keep the service result for every finished target, including branch warnings.
+    pub fn record_item_outcome(&mut self, outcome: DeleteOutcome, warning: Option<String>) {
+        self.finished_items.push((outcome, warning));
+    }
+
+    fn progress_items(&self) -> Vec<DeleteProgressItem> {
+        let paths: Vec<&str> = if self.is_bulk() {
+            self.bulk_paths.iter().map(String::as_str).collect()
+        } else {
+            self.selected_path.as_deref().into_iter().collect()
+        };
+        paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let label = self
+                    .worktrees
+                    .iter()
+                    .find(|wt| wt.path == path)
+                    .map(|wt| {
+                        let name = std::path::Path::new(path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| fold_home(path));
+                        format!("{name} [{}]", wt.branch)
+                    })
+                    .unwrap_or_else(|| fold_home(path));
+                let label = match self.repository(path) {
+                    Some(repository) => {
+                        format!("{}/{}: {label}", repository.owner, repository.name)
+                    }
+                    None => label,
+                };
+                let status = if let Some((outcome, warning)) = self.finished_items.get(index) {
+                    if outcome.worktree_deleted {
+                        DeleteProgressStatus::Deleted {
+                            note: warning.clone().unwrap_or_else(|| {
+                                if outcome.branch_deleted {
+                                    progress_messages::BRANCH_DELETED
+                                } else {
+                                    progress_messages::BRANCH_KEPT
+                                }
+                                .to_string()
+                            }),
+                            warning: warning.is_some(),
+                        }
+                    } else {
+                        DeleteProgressStatus::Failed(warning.clone().unwrap_or_default())
+                    }
+                } else if let Some(error) = &self.error {
+                    if index == self.finished_items.len() {
+                        DeleteProgressStatus::Failed(error.clone())
+                    } else {
+                        DeleteProgressStatus::Skipped
+                    }
+                } else if index == self.finished_items.len() {
+                    DeleteProgressStatus::Running
+                } else {
+                    DeleteProgressStatus::Pending
+                };
+                DeleteProgressItem { label, status }
+            })
+            .collect()
+    }
+
+    fn render_progress(&self, frame: &mut Frame, area: Rect) {
+        DeleteProgress {
+            items: &self.progress_items(),
+            elapsed: self
+                .progress_started
+                .map(|start| start.elapsed())
+                .unwrap_or_default(),
+            tick: self.tick,
+            error: self.error.as_deref(),
+        }
+        .render(frame, area);
     }
 
     /// Marks the bulk run as finished. Transitions to `Success` and
@@ -390,6 +512,12 @@ impl DeleteScreen {
                     .find(|w| &w.path == path)
                     .map(|w| format!("{} [{}]", fold_home(&w.path), w.branch))
                     .unwrap_or_else(|| fold_home(path));
+                let label = match self.repository(path) {
+                    Some(repository) => {
+                        format!("{}/{}: {label}", repository.owner, repository.name)
+                    }
+                    None => label,
+                };
                 BulkConfirmItem::new(label)
             })
             .collect();
@@ -430,6 +558,8 @@ impl DeleteScreen {
         }
         if self.error.is_some() {
             self.error = None;
+            self.progress_started = None;
+            self.finished_items.clear();
             if self.worktrees.is_empty()
                 || (self.selected_path.is_none() && self.bulk_paths.is_empty())
             {
@@ -577,6 +707,14 @@ impl DeleteScreen {
     /// Inner content height for the framed panel (excludes the rounded
     /// border).
     pub fn preferred_content_height(&self) -> u16 {
+        if self.progress_started.is_some()
+            && (self.step == DeleteStep::Deleting || self.error.is_some())
+        {
+            return DeleteProgress::preferred_content_height(
+                self.progress_items().len(),
+                self.error.is_some(),
+            );
+        }
         if self.loading || self.error.is_some() {
             return 4;
         }
@@ -603,6 +741,12 @@ impl DeleteScreen {
             StatusIndicator::new(Status::Loading, LOADING_WORKTREES)
                 .with_tick(self.tick)
                 .render(frame, area);
+            return;
+        }
+        if self.progress_started.is_some()
+            && (self.step == DeleteStep::Deleting || self.error.is_some())
+        {
+            self.render_progress(frame, area);
             return;
         }
         if let Some(err) = &self.error {
@@ -651,31 +795,7 @@ impl DeleteScreen {
                     c.render(frame, area);
                 }
             }
-            DeleteStep::Deleting => {
-                let msg = if let Some((completed, total)) = self.bulk_progress() {
-                    let current_index = completed.saturating_add(1).min(total);
-                    let branch = self
-                        .bulk_paths
-                        .get(completed)
-                        .and_then(|p| self.worktrees.iter().find(|w| &w.path == p))
-                        .map(|w| w.branch.clone())
-                        .unwrap_or_default();
-                    if branch.is_empty() {
-                        format!("{DELETE_DELETING} ({current_index} of {total})")
-                    } else {
-                        format!("{DELETE_DELETING} ({current_index} of {total}: {branch})")
-                    }
-                } else {
-                    let branch = self
-                        .selected()
-                        .map(|w| w.branch.clone())
-                        .unwrap_or_default();
-                    format!("{DELETE_DELETING} ({branch})")
-                };
-                StatusIndicator::new(Status::Loading, msg)
-                    .with_tick(self.tick)
-                    .render(frame, area);
-            }
+            DeleteStep::Deleting => self.render_progress(frame, area),
             DeleteStep::Success => {
                 let message = self.success_message();
                 let chunks = Layout::default()

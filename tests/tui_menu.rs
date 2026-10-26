@@ -72,14 +72,16 @@ fn assert_text_style(buffer: &Buffer, text: &str, fg: Color, bg: Color) {
 }
 
 #[test]
-fn menu_default_shows_five_entries_when_cache_enabled() {
+fn menu_default_shows_six_entries_when_cache_enabled() {
     let menu = MenuScreen::new(0, None, None, true);
     assert!(!menu.has_setup_entry());
     let dumped = dump(80, 18, |f| menu.render(f, f.area()));
     assert!(dumped.contains("Create"));
     assert!(!dumped.contains("Create new worktree"));
     assert!(!dumped.contains("List worktrees"));
-    assert!(dumped.contains("Dashboard"));
+    assert!(dumped.contains("2. Dashboard"));
+    assert!(dumped.contains("3. Global Dashboard"));
+    assert!(dumped.contains("4. Shared cache"));
     assert!(dumped.contains("Shared cache"));
     assert!(!dumped.contains("Delete"));
     assert!(!dumped.contains("Delete worktree"));
@@ -119,6 +121,7 @@ fn menu_arrow_navigation_then_enter_picks_settings() {
     let mut menu = MenuScreen::new(0, None, None, false);
     menu.handle_key(key(KeyCode::Down));
     menu.handle_key(key(KeyCode::Down));
+    menu.handle_key(key(KeyCode::Down));
     match menu.handle_key(key(KeyCode::Enter)) {
         MenuOutcome::Selected(MenuChoice::Settings, _) => {}
         other => panic!("expected Settings, got {:?}", as_choice(other)),
@@ -150,7 +153,7 @@ fn menu_setup_entry_is_first_when_present() {
 #[test]
 fn menu_default_index_clamped_when_no_setup() {
     let menu = MenuScreen::new(99, None, None, false);
-    assert!(menu.selected_index() < 4);
+    assert_eq!(menu.selected_index(), 4);
 }
 
 #[test]
@@ -228,4 +231,20 @@ fn fold_home_substitutes_home_prefix_with_tilde() {
     assert_eq!(fold_home("/Users/me/code/wisetree"), "~/code/wisetree");
     assert_eq!(fold_home("/Users/me"), "~");
     assert_eq!(fold_home("/var/log"), "/var/log");
+}
+
+#[test]
+fn global_dashboard_follows_dashboard_with_or_without_setup_and_cache() {
+    for setup in [false, true] {
+        for cache in [false, true] {
+            let index = if setup { 3 } else { 2 };
+            let mut menu = MenuScreen::new(index, None, Some(!setup), cache);
+            assert!(
+                matches!(menu.handle_key(key(KeyCode::Enter)), MenuOutcome::Selected(MenuChoice::GlobalDashboard, selected) if selected == index)
+            );
+            let output = dump(100, 24, |frame| menu.render(frame, frame.area()));
+            assert!(output.contains(&format!("{}. Dashboard", index)));
+            assert!(output.contains(&format!("{}. Global Dashboard", index + 1)));
+        }
+    }
 }
