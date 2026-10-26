@@ -282,7 +282,7 @@ pub const GLOBAL_FILTER_VALUE_STEP: &str = "3/3 · Choose values";
 pub const GLOBAL_FILTER_RULES_HINT: [(&str, &str); 8] = [
     ("↑↓", "Move"),
     ("Enter", "Edit"),
-    ("Ctrl+Enter", "Apply"),
+    ("Space", "Apply"),
     ("a", "Add rule"),
     ("o", "Add OR group"),
     ("Delete", "Remove"),
@@ -293,7 +293,7 @@ pub const GLOBAL_FILTER_RULES_HINT: [(&str, &str); 8] = [
 pub const GLOBAL_FILTER_BUTTONS_HINT: [(&str, &str); 5] = [
     ("←→", "Move"),
     ("Enter", "Select"),
-    ("Ctrl+Enter", "Apply"),
+    ("Space", "Apply"),
     ("Tab/⇧Tab", "Sections"),
     ("Esc", "Cancel"),
 ];

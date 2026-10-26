@@ -536,11 +536,8 @@ impl DashboardFilterEditor {
         key: crossterm::event::KeyEvent,
         rows: &[DashboardRow],
     ) -> FilterEditorOutcome {
-        use crossterm::event::{KeyCode, KeyModifiers};
-        if self.step == EditorStep::Overview
-            && key.code == KeyCode::Enter
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        use crossterm::event::KeyCode;
+        if self.step == EditorStep::Overview && key.code == KeyCode::Char(' ') {
             return self.apply();
         }
         if key.code == KeyCode::Esc {
@@ -1300,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_enter_applies_from_every_overview_focus() {
+    fn space_applies_from_every_overview_focus() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         for filter in [
             DashboardFilter::default(),
@@ -1310,9 +1307,9 @@ mod tests {
             for focus in 0..filter.rule_count() + messages::GLOBAL_FILTER_BUTTONS.len() {
                 editor.focus = focus;
                 let outcome =
-                    editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &[]);
+                    editor.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &[]);
                 let FilterEditorOutcome::Apply(applied) = outcome else {
-                    panic!("Ctrl+Enter should apply from focus {focus}");
+                    panic!("Space should apply from focus {focus}");
                 };
                 assert_eq!(applied, filter);
             }

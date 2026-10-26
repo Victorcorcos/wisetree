@@ -2536,7 +2536,7 @@ fn global_filter_editor_cancel_unchanged_apply_clear_and_reset() {
 }
 
 #[test]
-fn global_filter_ctrl_enter_matches_apply_button() {
+fn global_filter_space_matches_apply_button() {
     use wisetree::config::schema::DashboardFilter;
     let mut mouse = global_screen(vec![]);
     let mut keyboard = global_screen(vec![]);
@@ -2544,17 +2544,14 @@ fn global_filter_ctrl_enter_matches_apply_button() {
         filter_ctrl_f(screen);
         filter_button(screen, "Clear all");
         let rendered = dump(160, 35, |f| screen.render(f, f.area()));
-        assert!(rendered.contains("Ctrl+Enter"));
+        assert!(rendered.contains("Space"));
     }
     let expected = filter_button(&mut mouse, "Apply");
     assert_eq!(
         expected,
         DashboardAction::PersistFilter(DashboardFilter { groups: vec![] })
     );
-    assert_eq!(
-        keyboard.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
-        expected
-    );
+    assert_eq!(keyboard.handle_key(key(KeyCode::Char(' '))), expected);
     assert_eq!(keyboard.filter(), mouse.filter());
     assert!(!dump(160, 35, |f| keyboard.render(f, f.area())).contains("Global Dashboard · Filter"));
 }
