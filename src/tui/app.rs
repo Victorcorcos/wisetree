@@ -5554,10 +5554,7 @@ mod tests {
                     error: None,
                 }]);
                 let cached_service = app.global_dashboard_service.as_ref().unwrap() as *const _;
-                app.handle_dashboard_key(
-                    KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
-                    &tx,
-                );
+                app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL), &tx);
                 let event = next_global_event(&mut rx).await;
                 assert!(matches!(event, AppEvent::DashboardContextReady { .. }));
                 app.handle_app_event(event, &tx);
@@ -5578,11 +5575,8 @@ mod tests {
                     app.header_label_override(),
                     Some(crate::messages::GLOBAL_DASHBOARD_TITLE)
                 );
-                // Repeat Ctrl+Backspace, then confirm through the existing safety UI.
-                app.handle_dashboard_key(
-                    KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
-                    &tx,
-                );
+                // Repeat Ctrl+Delete, then confirm through the existing safety UI.
+                app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL), &tx);
                 app.handle_app_event(next_global_event(&mut rx).await, &tx);
                 app.handle_delete_key(key(KeyCode::Left), &tx);
                 app.handle_delete_key(key(KeyCode::Enter), &tx);

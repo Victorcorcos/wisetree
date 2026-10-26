@@ -30,8 +30,13 @@ const BLANK_SELECT_MARKER: &str = "   ";
 
 fn is_delete_shortcut(key: KeyEvent) -> bool {
     // Legacy terminals encode Ctrl+Backspace as Ctrl+H (0x08).
+    // macOS calls the forward-delete key Delete; Terminal.app reports its
+    // Control chord as Ctrl+Delete (CSI 3;5~). Accept both delete key codes.
     key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Backspace | KeyCode::Char('h'))
+        && matches!(
+            key.code,
+            KeyCode::Backspace | KeyCode::Delete | KeyCode::Char('h')
+        )
 }
 
 pub(super) fn remote_only(row: &DashboardRow) -> bool {

@@ -277,10 +277,10 @@ Press **Enter** on a row to open its action menu. **General Commands** is a sear
 
 #### Quick delete and bulk delete
 
-- **Ctrl+Backspace** (legacy alias **Ctrl+H**) on a row jumps straight to the delete confirmation in Dashboard and Global Dashboard, with or without search text. The query stays unchanged. Plain Backspace/Delete edit the query; Ctrl+W and Alt+Backspace delete a word.
+- **Ctrl+Backspace** (aliases **Ctrl+H** and **Ctrl+Delete**) on a row jumps straight to the delete confirmation in Dashboard and Global Dashboard, with or without search text. The query stays unchanged. Plain Backspace/Delete edit the query; Ctrl+W and Alt+Backspace delete a word.
 - Press **Tab** to focus the footer row **Delete worktrees with status: Merged · Closed · Drafted · Opened · Clean · Dirty**. Use **← / →** to pick a status and press **Enter**. Wisetree lists every worktree with that status and asks you to confirm. The main worktree is never included.
 
-Some terminals send the same byte for Backspace and Ctrl+Backspace, so Wisetree cannot distinguish them. Use **Enter → Delete worktree** from the row actions menu when needed. Legacy terminals can send Ctrl+Backspace as `0x08` (Ctrl+H), which Wisetree accepts as the delete shortcut. If your terminal configures plain Backspace to send `^H`, it also opens the delete confirmation; the confirmation defaults to **No**.
+Some terminals send the same byte for Backspace and Ctrl+Backspace, so Wisetree cannot distinguish them. Configure your terminal to send `0x08` (Ctrl+H) for Ctrl+Backspace and `0x7f` for plain Backspace, or use **Enter → Delete worktree** from the row actions menu. On Mac keyboards, the backward-delete key is labelled **delete**; **fn+delete** is forward-delete. Wisetree also accepts **Ctrl+Delete** (forward-delete), including Terminal.app’s `ESC [ 3 ; 5 ~` encoding. Legacy terminals can send Ctrl+Backspace as `0x08` (Ctrl+H), which Wisetree accepts as the delete shortcut. If your terminal configures plain Backspace to send `^H`, it also opens the delete confirmation; the confirmation defaults to **No**.
 
 ### Global Dashboard
 

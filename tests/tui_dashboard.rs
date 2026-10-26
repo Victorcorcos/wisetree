@@ -1856,9 +1856,10 @@ fn global_checkout_dependent_pr_action_keeps_its_repository() {
     }
 }
 
-fn delete_shortcuts() -> [KeyEvent; 2] {
+fn delete_shortcuts() -> [KeyEvent; 3] {
     [
         KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL),
         KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
     ]
 }
@@ -2004,7 +2005,9 @@ fn plain_deletion_keys_only_edit_search_and_word_deletion_still_works() {
             let mut screen = shortcut_screen(global, vec![]);
             type_query(&mut screen, "feat bug");
             assert_eq!(screen.handle_key(shortcut), DashboardAction::Continue);
-            assert_eq!(rendered_query(&mut screen).trim_end(), "Search: feat");
+            // The Global Dashboard can render its Filter button beside the query.
+            let rendered = rendered_query(&mut screen);
+            assert_eq!(rendered.split("  ").next().unwrap().trim_end(), "Search: feat");
         }
     }
 }
