@@ -460,7 +460,7 @@ impl App {
                     .filter(|d| matches!(d.step(), DeleteStep::Confirm))
                     .and_then(|d| d.overlay_modal());
                 // While the worktree list is still loading for a single-path
-                // delete (Ctrl+Backspace shortcut), the confirm modal isn't built
+                // delete (Ctrl+X shortcut), the confirm modal isn't built
                 // yet, so overlay_modal is None. Keep the dashboard visible
                 // during that window to avoid a ~1 s blink before the modal
                 // appears.
@@ -1788,7 +1788,7 @@ impl App {
                 }
             } else {
                 // No preserved dashboard (e.g. delete was opened from the menu
-                // rather than the Ctrl+Backspace shortcut). Fall back to a fresh one.
+                // rather than the Ctrl+X shortcut). Fall back to a fresh one.
                 self.enter_screen(Screen::Dashboard, tx);
             }
         } else {
@@ -5549,7 +5549,10 @@ mod tests {
                     error: None,
                 }]);
                 let cached_service = app.global_dashboard_service.as_ref().unwrap() as *const _;
-                app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL), &tx);
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                    &tx,
+                );
                 let event = next_global_event(&mut rx).await;
                 assert!(matches!(event, AppEvent::DashboardContextReady { .. }));
                 app.handle_app_event(event, &tx);
@@ -5563,15 +5566,30 @@ mod tests {
                     app.delete.as_ref().unwrap().selected_path(),
                     checkout.to_str()
                 );
-                app.cancel_delete_screen(&tx);
+                assert_eq!(
+                    app.delete
+                        .as_ref()
+                        .unwrap()
+                        .overlay_modal()
+                        .unwrap()
+                        .selected(),
+                    crate::tui::widgets::ConfirmationChoice::Cancel
+                );
+                // Enter accepts the default No and preserves the real worktree.
+                app.handle_key(key(KeyCode::Enter), &tx);
+                assert!(checkout.exists());
+                assert_eq!(app.screen, Screen::Dashboard);
                 assert!(app.is_global_dashboard());
                 assert!(app.dashboard_watch.is_some());
                 assert_eq!(
                     app.header_label_override(),
                     Some(crate::messages::GLOBAL_DASHBOARD_TITLE)
                 );
-                // Repeat Ctrl+Delete, then confirm through the existing safety UI.
-                app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL), &tx);
+                // Repeat Ctrl+X, then confirm through the existing safety UI.
+                app.handle_key(
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                    &tx,
+                );
                 app.handle_app_event(next_global_event(&mut rx).await, &tx);
                 app.handle_delete_key(key(KeyCode::Left), &tx);
                 app.handle_delete_key(key(KeyCode::Enter), &tx);

@@ -29,6 +29,9 @@ pub const CREATE_NAVIGATE_PROMPT: &str =
 pub const CREATE_SUCCESS: &str = "Worktree created successfully!";
 pub const CREATE_CREATING: &str = "Creating worktree...";
 
+// Dashboard shortcuts
+pub const DASHBOARD_DELETE_SHORTCUT: &str = "Ctrl+X Delete";
+
 // Delete flow
 pub const DELETE_CONFIRM_TITLE: &str = "Delete Worktree Confirmation";
 pub const DELETE_WARNING: &str = "This action cannot be undone.";

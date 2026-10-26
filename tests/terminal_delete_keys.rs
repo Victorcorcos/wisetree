@@ -22,6 +22,7 @@ fn terminal_delete_key_reader() {
     std::io::stdout().flush().unwrap();
     let mut events = EventLoop::new(Duration::from_millis(50));
     let expected = [
+        (KeyCode::Char('x'), KeyModifiers::CONTROL),
         (KeyCode::Backspace, KeyModifiers::NONE),
         (KeyCode::Delete, KeyModifiers::NONE),
         (KeyCode::Char('h'), KeyModifiers::CONTROL),
@@ -40,7 +41,7 @@ fn terminal_delete_key_reader() {
 }
 
 #[test]
-fn terminal_decodes_legacy_and_enhanced_delete_keys() {
+fn terminal_distinguishes_ctrl_x_from_search_editing_keys() {
     let mut master = -1;
     let mut slave = -1;
     // SAFETY: openpty initializes the two file descriptors. Optional name,
@@ -75,10 +76,10 @@ fn terminal_decodes_legacy_and_enhanced_delete_keys() {
             break;
         }
     }
-    // DEL, forward Delete, legacy Ctrl+H, CSI-u Ctrl+Backspace, and the
-    // Control+Delete sequence used by macOS Terminal's keyboard mapping.
+    // Default Ctrl+X (0x18) is distinct from all the search editing keys:
+    // Backspace, Delete, Ctrl+H, Ctrl+Backspace, and Ctrl+Delete.
     master
-        .write_all(b"\x7f\x1b[3~\x08\x1b[127;5u\x1b[3;5~")
+        .write_all(b"\x18\x7f\x1b[3~\x08\x1b[127;5u\x1b[3;5~")
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {

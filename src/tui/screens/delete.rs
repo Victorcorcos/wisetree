@@ -230,7 +230,7 @@ impl DeleteScreen {
 
     /// Like `preselect_path`, but also bypasses the worktree picker and
     /// advances straight to the per-worktree confirmation dialog. Used by
-    /// the dashboard's Ctrl+Backspace shortcut to make deletion a one-key action.
+    /// the dashboard's Ctrl+X shortcut to make deletion a one-key action.
     pub fn jump_to_confirm_path(&mut self, path: &str) {
         if !self.worktrees.iter().any(|worktree| worktree.path == path) {
             return;

@@ -300,23 +300,23 @@ fn action_menu_only_shows_navigate_when_wrapper_mode_enabled() {
 }
 
 #[test]
-fn ctrl_backspace_with_empty_search_jumps_to_delete_for_selected_row() {
+fn ctrl_x_with_empty_search_jumps_to_delete_for_selected_row() {
     let mut screen = ready_screen(true);
     // First row is the mother worktree (protected) — move onto the
     // second row, which is a regular deletable worktree.
     screen.handle_key(key(KeyCode::Down));
-    match screen.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)) {
+    match screen.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)) {
         DashboardAction::JumpToDelete(path) => assert_eq!(path, "/tmp/repo-bug"),
         other => panic!("expected JumpToDelete, got {other:?}"),
     }
 }
 
 #[test]
-fn ctrl_backspace_on_mother_worktree_emits_protected_action() {
+fn ctrl_x_on_mother_worktree_emits_protected_action() {
     let mut screen = ready_screen(true);
     // Default selection is the first row, which is the mother worktree.
     assert_eq!(
-        screen.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+        screen.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
         DashboardAction::MotherWorktreeProtected
     );
 }
@@ -1665,7 +1665,7 @@ fn global_rows_with_same_names_keep_distinct_paths_and_protect_each_mother() {
     ])
     .with_filter(wisetree::config::schema::DashboardFilter { groups: vec![] });
     for (owner, name) in [("alpha", "api"), ("beta", "web")] {
-        match screen.handle_scoped_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)) {
+        match screen.handle_scoped_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)) {
             ScopedDashboardAction::Row {
                 repository,
                 action: DashboardAction::MotherWorktreeProtected,
@@ -1680,7 +1680,7 @@ fn global_rows_with_same_names_keep_distinct_paths_and_protect_each_mother() {
         screen.handle_scoped_key(key(KeyCode::Down));
     }
     for owner in ["alpha", "beta"] {
-        match screen.handle_scoped_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)) {
+        match screen.handle_scoped_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)) {
             ScopedDashboardAction::Row {
                 repository,
                 action: DashboardAction::JumpToDelete(path),
@@ -1856,11 +1856,10 @@ fn global_checkout_dependent_pr_action_keeps_its_repository() {
     }
 }
 
-fn delete_shortcuts() -> [KeyEvent; 3] {
+fn delete_shortcuts() -> [KeyEvent; 2] {
     [
-        KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
-        KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL),
-        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('X'), KeyModifiers::CONTROL),
     ]
 }
 
@@ -2018,6 +2017,69 @@ fn plain_deletion_keys_only_edit_search_and_word_deletion_still_works() {
 }
 
 #[test]
+fn former_delete_shortcuts_only_edit_search_in_both_scopes() {
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    for global in [false, true] {
+        for (shortcut, move_left, expected) in [
+            (
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+                false,
+                "feat",
+            ),
+            (
+                KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL),
+                true,
+                "feat bu",
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+                false,
+                "feat bu",
+            ),
+        ] {
+            let mut screen = shortcut_screen(global, vec![row("/tmp/repo-feat", "feat", true)]);
+            let empty = rendered_query(&mut screen);
+            assert_eq!(
+                screen.handle_scoped_key(shortcut),
+                ScopedDashboardAction::Dashboard(DashboardAction::Continue)
+            );
+            assert_eq!(rendered_query(&mut screen), empty);
+            type_query(&mut screen, "feat bug");
+            if move_left {
+                screen.handle_key(key(KeyCode::Left));
+            }
+            assert_eq!(
+                screen.handle_scoped_key(shortcut),
+                ScopedDashboardAction::Dashboard(DashboardAction::Continue)
+            );
+            assert_eq!(
+                rendered_query(&mut screen).trim_end(),
+                format!("Search: {expected}")
+            );
+        }
+    }
+}
+
+#[test]
+fn plain_x_edits_search_in_both_scopes() {
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    for global in [false, true] {
+        for ch in ['x', 'X'] {
+            let mut screen = shortcut_screen(global, vec![row("/tmp/repo-feat", "feat", true)]);
+            type_query(&mut screen, "feat");
+            assert_eq!(
+                screen.handle_scoped_key(key(KeyCode::Char(ch))),
+                ScopedDashboardAction::Dashboard(DashboardAction::Continue)
+            );
+            assert_eq!(
+                rendered_query(&mut screen).trim_end(),
+                format!("Search: feat{ch}")
+            );
+        }
+    }
+}
+
+#[test]
 fn delete_shortcuts_do_nothing_without_table_focus_or_visible_rows() {
     use wisetree::tui::screens::dashboard::ScopedDashboardAction;
     for global in [false, true] {
@@ -2095,7 +2157,7 @@ fn global_default_filter_hides_mothers_but_repository_scope_does_not_filter() {
     ];
     let mut screen = global_screen(rows.clone());
     assert_eq!(
-        screen.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+        screen.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
         DashboardAction::JumpToDelete("/tmp/alpha/bug".into())
     );
     screen.set_rows(vec![rows[0].clone()]);
@@ -2153,7 +2215,7 @@ fn global_filter_and_search_limit_batch_actions_selection_and_row_clicks() {
     // A refresh hides the selected row and clamps to the remaining visible row.
     screen.set_rows(rows[..2].to_vec());
     assert_eq!(
-        screen.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+        screen.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
         DashboardAction::JumpToDelete("/tmp/alpha/bug".into())
     );
     let rendered = dump_lines(160, 32, |f| screen.render(f, f.area()));

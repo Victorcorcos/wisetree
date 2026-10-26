@@ -87,6 +87,25 @@ fn jump_to_confirm_advances_to_confirm_step() {
 }
 
 #[test]
+fn worktree_confirmation_defaults_to_no_for_clean_and_dirty_worktrees() {
+    for delete_branch in [false, true] {
+        for clean in [false, true] {
+            let mut screen = DeleteScreen::new(delete_branch);
+            screen.set_worktrees(vec![wt("/tmp/repo-feat", "feat", false, clean)]);
+            screen.jump_to_confirm_path("/tmp/repo-feat");
+            assert_eq!(
+                screen.overlay_modal().unwrap().selected(),
+                wisetree::tui::widgets::ConfirmationChoice::Cancel
+            );
+            assert_eq!(
+                screen.handle_key(key(KeyCode::Enter)),
+                DeleteAction::Cancelled
+            );
+        }
+    }
+}
+
+#[test]
 fn esc_in_confirm_cancels() {
     let mut s = DeleteScreen::new(false);
     s.set_worktrees(worktrees());
