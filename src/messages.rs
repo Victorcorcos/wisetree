@@ -205,3 +205,88 @@ pub const GLOBAL_ACCOUNTS_REQUIRED: &str = "Select at least one account to open 
 pub const GLOBAL_ACCOUNTS_HINT: &str =
     "Space toggle · ↑↓ navigate · Enter open · Esc back · Ctrl+R retry";
 pub const GLOBAL_ACCOUNTS_SAVE_FAILED: &str = "Could not save selected accounts";
+
+/// Labels for the shared worktree deletion progress panel.
+pub mod delete_progress {
+    pub const BRANCH_DELETED: &str = "branch deleted";
+    pub const BRANCH_KEPT: &str = "branch kept";
+    pub const SKIPPED: &str = "skipped";
+    pub const ERROR_HINT: &str = "Press any key to try again...";
+
+    pub fn header(count: usize) -> String {
+        let label = if count == 1 { "worktree" } else { "worktrees" };
+        format!("Deleting {count} {label}")
+    }
+
+    pub fn tally(deleted: usize, warnings: usize, remaining: usize) -> String {
+        let label = if warnings == 1 { "warning" } else { "warnings" };
+        format!("{deleted} deleted · {warnings} {label} · {remaining} remaining")
+    }
+
+    pub fn more(count: usize, above: bool) -> String {
+        let arrow = if above { "↑" } else { "↓" };
+        format!("{arrow} {count} more")
+    }
+}
+
+// Global Dashboard filter preview
+pub const GLOBAL_FILTER_BUTTON: &str = "Filter";
+pub const GLOBAL_FILTER_NONE: &str = "No filters — showing all worktrees";
+pub const GLOBAL_DASHBOARD_FILTER_HIDDEN: &str = "All worktrees are hidden by the active filter.";
+pub fn global_filter_summary(visible: usize, total: usize) -> String {
+    format!(
+        "Showing {visible} of {total} worktrees · {} hidden",
+        total.saturating_sub(visible)
+    )
+}
+
+// Global Dashboard filter editor
+pub const GLOBAL_FILTER_TITLE: &str = "Global Dashboard · Filter";
+pub const GLOBAL_FILTER_ALL: &str = "Match ALL of";
+pub const GLOBAL_FILTER_BUTTONS: [&str; 6] = [
+    "+ Rule",
+    "+ OR group",
+    "Reset to default",
+    "Clear all",
+    "Apply",
+    "Cancel",
+];
+pub const GLOBAL_FILTER_FIELD_STEP: &str = "1/3 · Choose a field (type to search)";
+pub const GLOBAL_FILTER_OPERATOR_STEP: &str = "2/3 · Choose an operator";
+pub const GLOBAL_FILTER_VALUE_STEP: &str = "3/3 · Choose values";
+pub const GLOBAL_FILTER_OVERVIEW_HINT: &str =
+    "↑↓ Move · Enter Edit · a Rule · o OR group · Delete Remove · Tab Buttons · Esc Cancel";
+pub const GLOBAL_FILTER_VALUE_HINT: &str = "↑↓ Choose · Space Toggle · Type Search / Custom value · Tab Complete text · Enter Next · Esc Back";
+pub const GLOBAL_FILTER_NEXT: &str = "[ Next / Save ]  [ Back ]";
+pub const GLOBAL_FILTER_INTEGER_ERROR: &str = "Enter a valid integer.";
+pub const GLOBAL_FILTER_VALUE_ERROR: &str = "Select at least one value or enter a nonempty value.";
+pub const GLOBAL_FILTER_SAVE_FAILED: &str =
+    "Filter applied for this session, but could not be saved";
+pub const GLOBAL_FILTER_SHORTCUT: &str = "  Ctrl+F Filter";
+
+pub const GLOBAL_FILTER_FIELD_DESCRIPTIONS: [&str; 17] = [
+    "Owning GitHub organization or user",
+    "Repository name",
+    "Local checkout or remote PR",
+    "Mother, PR state or checkout cleanliness",
+    "Pull request CI checks",
+    "Pull request review decision",
+    "Pull request merge readiness",
+    "Checkout directory name",
+    "Worktree branch name",
+    "Source branch",
+    "Commit message, author or SHA",
+    "Pull request title",
+    "Commits ahead of the base",
+    "Commits behind the base",
+    "Added lines",
+    "Removed lines",
+    "Pull request number",
+];
+
+pub const GLOBAL_FILTER_FIELD_INPUT: &str = "Search fields...";
+pub const GLOBAL_FILTER_ENUM_INPUT: &str =
+    "Search values (profiles / repositories also accept custom values)...";
+pub const GLOBAL_FILTER_TEXT_INPUT: &str = "Enter text, or choose a suggestion and press Tab...";
+pub const GLOBAL_FILTER_NUMBER_INPUT: &str = "Enter an integer...";
+pub const GLOBAL_FILTER_SELECTED: &str = "Selected: ";

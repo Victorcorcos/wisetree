@@ -16,7 +16,7 @@ Narrow view: 1 hidden  •  PR #42 Open: Improve dashboard footer details for li
                                          ┌────────┐  ┌────────┐  ┌─────────┐  ┌────────┐  ┌───────┐  ┌───────┐
            Delete worktrees with status: │ Merged │  │ Closed │  │ Drafted │  │ Opened │  │ Clean │  │ Dirty │
                                          └────────┘  └────────┘  └─────────┘  └────────┘  └───────┘  └───────┘
-↑↓ Navigate  ↵ Actions  ⌫ Delete (empty search)  Tab Bulk Delete  Type to Search  Ctrl+R Refresh  Esc Clear /
+↑↓ Navigate  ↵ Actions  Ctrl+⌫ Delete  Tab Bulk Delete  Type to Search  Ctrl+R Refresh  Esc Clear / Back
 Status: Mother = main worktree (protected)  Dirty = has uncommitted changes  Clean = no uncommitted changes  O
 PR Checks: ⚪  (Pending)  🟡  (Running)  ⚠️  (Errored)  🔴  (Failed)  🟢  (Passed)
 PR Reviews: ✋  (Pending)  👎  (Changes Requested)  👍  (Approved)

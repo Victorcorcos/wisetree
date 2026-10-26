@@ -8,6 +8,7 @@ pub mod bulk_confirm_dialog;
 pub mod command_list_progress;
 pub mod command_progress;
 pub mod confirmation_modal;
+pub mod delete_progress;
 pub mod input_prompt;
 pub mod pr_confirm;
 pub mod scrollbar;

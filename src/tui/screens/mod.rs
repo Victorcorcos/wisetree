@@ -4,6 +4,7 @@
 pub mod cache;
 pub mod create;
 pub mod dashboard;
+pub mod dashboard_filter;
 pub mod delete;
 pub mod error;
 pub mod global_accounts;

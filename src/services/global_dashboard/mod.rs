@@ -93,13 +93,34 @@ impl GlobalDashboardService {
         self
     }
 
+    /// Remove confirmed local deletions before a subsequent watch can replay them.
+    /// Snapshot persistence is best-effort, just like ordinary refreshes.
+    pub async fn forget_worktrees(&self, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().await;
+        let mut rows = state.rows.clone().or_else(|| self.load_rows_snapshot());
+        if let Some(rows) = rows.as_mut() {
+            rows.retain(|row| !paths.contains(&row.worktree.path));
+            self.save_rows_snapshot(&mut state, rows);
+        }
+        state.rows = rows;
+    }
+
     pub fn watch(&self) -> DashboardWatch {
+        self.watch_forgetting(Vec::new())
+    }
+
+    /// Forget completed deletions before this watch's first cached update.
+    pub fn watch_forgetting(&self, paths: Vec<String>) -> DashboardWatch {
         let (tx, rx) = mpsc::channel(8);
         let (notice_tx, notice_rx) = mpsc::channel(8);
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         let service = self.clone();
         tokio::spawn(async move {
+            service.forget_worktrees(&paths).await;
             {
                 let state = service.state.lock().await;
                 if let Some(rows) = &state.rows {

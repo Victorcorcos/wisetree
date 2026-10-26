@@ -8,7 +8,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::schema::{GlobalDashboardConfig, WorktreeConfig};
+use crate::config::schema::{DashboardFilter, GlobalDashboardConfig, WorktreeConfig};
 use crate::constants::{global_config_file, local_config_file};
 use crate::errors::{Result, WisetreeError};
 
@@ -194,6 +194,12 @@ impl ConfigService {
         };
         let mut preferences = GlobalDashboardConfig {
             selected_accounts: accounts,
+            filter: document
+                .get("globalDashboard")
+                .and_then(|v| v.get("filter"))
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
         };
         preferences.deduplicate();
         let invalid = || {
@@ -210,6 +216,58 @@ impl ConfigService {
             "selectedAccounts".to_string(),
             serde_json::to_value(&preferences.selected_accounts)?,
         );
+        let parent = path.parent().unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        std::io::Write::write_all(&mut file, serialize_pretty(&document)?.as_bytes())?;
+        file.persist(path).map_err(|err| err.error)?;
+        Ok(preferences)
+    }
+
+    /// Atomically patch only the filter, preserving account selection and unrelated keys.
+    pub fn update_global_dashboard_filter(
+        filter: DashboardFilter,
+    ) -> Result<GlobalDashboardConfig> {
+        Self::update_global_dashboard_filter_at(&global_config_file(), filter)
+    }
+
+    pub fn update_global_dashboard_filter_at(
+        path: &Path,
+        mut filter: DashboardFilter,
+    ) -> Result<GlobalDashboardConfig> {
+        filter
+            .normalize()
+            .map_err(|message| WisetreeError::config(message, Some(path.to_path_buf())))?;
+        let mut document: serde_json::Value = match fs::read_to_string(path) {
+            Ok(raw) => serde_json::from_str(&raw)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::to_value(WorktreeConfig::default())?
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let invalid = || {
+            WisetreeError::config(
+                "Global configuration and globalDashboard must be objects",
+                Some(path.to_path_buf()),
+            )
+        };
+        let dashboard = document
+            .as_object_mut()
+            .ok_or_else(invalid)?
+            .entry("globalDashboard")
+            .or_insert_with(|| serde_json::json!({}));
+        let dashboard = dashboard.as_object_mut().ok_or_else(invalid)?;
+        dashboard.insert("filter".into(), serde_json::to_value(&filter)?);
+        let mut preferences = GlobalDashboardConfig {
+            selected_accounts: dashboard
+                .get("selectedAccounts")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+            filter,
+        };
+        preferences.deduplicate();
         let parent = path.parent().unwrap_or(Path::new("."));
         fs::create_dir_all(parent)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
@@ -261,6 +319,17 @@ impl ConfigService {
         }
         parsed.dashboard.clamp();
         self.warnings = parsed.dashboard.normalize_columns();
+        let document: serde_json::Value = serde_json::from_str(&raw)?;
+        if let Some(filter) = document
+            .get("globalDashboard")
+            .and_then(|v| v.get("filter"))
+        {
+            if let Err(err) = serde_json::from_value::<DashboardFilter>(filter.clone()) {
+                self.warnings.push(format!(
+                    "Invalid globalDashboard.filter; using default: {err}"
+                ));
+            }
+        }
 
         self.config = parsed;
         self.config_path = Some(path);

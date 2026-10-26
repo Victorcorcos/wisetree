@@ -579,3 +579,64 @@ async fn ticks_reuse_the_resolved_registry_until_a_manual_refresh() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn forgotten_worktrees_are_absent_from_warm_and_cold_watch_replays() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service(&["Alpha"], true);
+    let mut watch = service.watch();
+    let (rows, _) = enriched(&mut watch).await;
+    let path = rows
+        .iter()
+        .find(|row| !row.worktree.is_main && !row.worktree.path.is_empty())
+        .unwrap()
+        .worktree
+        .path
+        .clone();
+    drop(watch);
+    git(&fixture.roots[0], &["worktree", "remove", &path]);
+    service.forget_worktrees(std::slice::from_ref(&path)).await;
+
+    // Read the persisted snapshot before a live refresh can replace it.
+    let mut cold = fixture.service(&["Alpha"], true).watch();
+    let first = next_update(&mut cold).await;
+    assert_eq!(first.rows().len(), 1);
+    assert!(first.rows().iter().all(|row| row.worktree.path != path));
+    drop(cold);
+
+    let mut warm = service.watch();
+    let first = next_update(&mut warm).await;
+    assert_eq!(first.rows().len(), rows.len() - 1);
+    assert!(first.rows().iter().all(|row| row.worktree.path != path));
+    // The still-open authored PR can return only as a live remote row.
+    let (live, _) = enriched(&mut warm).await;
+    let pr = live
+        .iter()
+        .find(|row| row.pull_request.as_ref().is_some_and(|pr| pr.number == 1))
+        .unwrap();
+    assert!(pr.worktree.path.is_empty());
+}
+
+#[tokio::test]
+async fn watch_forgets_before_its_first_replay_even_when_snapshot_cannot_be_written() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service(&["Alpha"], false);
+    let rows = service.snapshot().await;
+    let path = rows
+        .iter()
+        .find(|row| !row.worktree.is_main)
+        .unwrap()
+        .worktree
+        .path
+        .clone();
+    let snapshot = fixture
+        .tmp
+        .path()
+        .join(wisetree::constants::GLOBAL_DASHBOARD_ROWS_FILE_NAME);
+    fs::remove_file(&snapshot).unwrap();
+    fs::create_dir(&snapshot).unwrap();
+    let mut watch = service.watch_forgetting(vec![path.clone()]);
+    let first = next_update(&mut watch).await;
+    assert_eq!(first.rows().len(), rows.len() - 1);
+    assert!(first.rows().iter().all(|row| row.worktree.path != path));
+}

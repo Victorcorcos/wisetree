@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::backend::TestBackend;
+use ratatui::layout::Position;
 use ratatui::Terminal;
 
 use wisetree::git::types::{BranchStatus, GitWorktree};
@@ -299,23 +300,23 @@ fn action_menu_only_shows_navigate_when_wrapper_mode_enabled() {
 }
 
 #[test]
-fn backspace_with_empty_search_jumps_to_delete_for_selected_row() {
+fn ctrl_backspace_with_empty_search_jumps_to_delete_for_selected_row() {
     let mut screen = ready_screen(true);
     // First row is the mother worktree (protected) — move onto the
     // second row, which is a regular deletable worktree.
     screen.handle_key(key(KeyCode::Down));
-    match screen.handle_key(key(KeyCode::Backspace)) {
+    match screen.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)) {
         DashboardAction::JumpToDelete(path) => assert_eq!(path, "/tmp/repo-bug"),
         other => panic!("expected JumpToDelete, got {other:?}"),
     }
 }
 
 #[test]
-fn backspace_on_mother_worktree_emits_protected_action() {
+fn ctrl_backspace_on_mother_worktree_emits_protected_action() {
     let mut screen = ready_screen(true);
     // Default selection is the first row, which is the mother worktree.
     assert_eq!(
-        screen.handle_key(key(KeyCode::Backspace)),
+        screen.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
         DashboardAction::MotherWorktreeProtected
     );
 }
@@ -1608,7 +1609,7 @@ fn remote_row_renders_pr_metadata_and_unavailable_local_columns() {
         assert_eq!(data.chars().nth(start), Some('-'), "{title}: {data}");
     }
     assert!(!data.contains("=0"));
-    assert!(rendered.contains("0 worktrees, 0 dirty, 1 PR open"));
+    assert!(rendered.contains("1 worktrees, 0 dirty, 1 PR open"));
 }
 
 #[test]
@@ -1654,30 +1655,6 @@ fn remote_action_menu_only_offers_open_and_focuses_it_immediately() {
 }
 
 #[test]
-fn remote_backspace_reports_no_local_worktree_but_still_edits_search() {
-    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
-    let mut screen = global_screen(vec![global_row(
-        row_with_pr("", "bug", true),
-        "alpha",
-        "api",
-        false,
-    )]);
-    for code in [KeyCode::Backspace, KeyCode::Delete] {
-        assert_eq!(
-            screen.handle_scoped_key(key(code)),
-            ScopedDashboardAction::NoLocalWorktree
-        );
-        // Even the legacy entry point cannot issue a delete for a remote row.
-        assert_eq!(screen.handle_key(key(code)), DashboardAction::Continue);
-    }
-    screen.handle_scoped_key(key(KeyCode::Char('b')));
-    assert_eq!(
-        screen.handle_scoped_key(key(KeyCode::Backspace)),
-        ScopedDashboardAction::Dashboard(DashboardAction::Continue)
-    );
-}
-
-#[test]
 fn global_rows_with_same_names_keep_distinct_paths_and_protect_each_mother() {
     use wisetree::tui::screens::dashboard::ScopedDashboardAction;
     let mut screen = global_screen(vec![
@@ -1685,9 +1662,10 @@ fn global_rows_with_same_names_keep_distinct_paths_and_protect_each_mother() {
         global_row(row("/tmp/beta/web", "main", true), "beta", "web", true),
         global_row(row("/tmp/alpha/bug", "bug", false), "alpha", "api", true),
         global_row(row("/tmp/beta/bug", "bug", false), "beta", "web", true),
-    ]);
+    ])
+    .with_filter(wisetree::config::schema::DashboardFilter { groups: vec![] });
     for (owner, name) in [("alpha", "api"), ("beta", "web")] {
-        match screen.handle_scoped_key(key(KeyCode::Backspace)) {
+        match screen.handle_scoped_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)) {
             ScopedDashboardAction::Row {
                 repository,
                 action: DashboardAction::MotherWorktreeProtected,
@@ -1702,7 +1680,7 @@ fn global_rows_with_same_names_keep_distinct_paths_and_protect_each_mother() {
         screen.handle_scoped_key(key(KeyCode::Down));
     }
     for owner in ["alpha", "beta"] {
-        match screen.handle_scoped_key(key(KeyCode::Backspace)) {
+        match screen.handle_scoped_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)) {
             ScopedDashboardAction::Row {
                 repository,
                 action: DashboardAction::JumpToDelete(path),
@@ -1876,4 +1854,714 @@ fn global_checkout_dependent_pr_action_keeps_its_repository() {
         }
         other => panic!("expected scoped Merge action, got {other:?}"),
     }
+}
+
+fn delete_shortcuts() -> [KeyEvent; 2] {
+    [
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+    ]
+}
+
+fn shortcut_screen(global: bool, rows: Vec<DashboardRow>) -> DashboardScreen {
+    if global {
+        global_screen(
+            rows.into_iter()
+                .map(|row| global_row(row, "alpha", "api", true))
+                .collect(),
+        )
+        .with_filter(wisetree::config::schema::DashboardFilter { groups: vec![] })
+    } else {
+        let mut screen = ready_screen(true);
+        screen.set_rows(rows);
+        screen
+    }
+}
+
+fn type_query(screen: &mut DashboardScreen, query: &str) {
+    for c in query.chars() {
+        screen.handle_key(key(KeyCode::Char(c)));
+    }
+}
+
+fn rendered_query(screen: &mut DashboardScreen) -> String {
+    dump_lines(160, 30, |f| screen.render(f, f.area()))
+        .lines()
+        .find(|line| line.starts_with("Search:"))
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn delete_shortcuts_target_visible_row_and_preserve_query_in_both_scopes() {
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    for global in [false, true] {
+        for shortcut in delete_shortcuts() {
+            for query in ["", "feat"] {
+                let mut screen = shortcut_screen(
+                    global,
+                    vec![
+                        row("/tmp/repo", "main", true),
+                        row("/tmp/repo-bug", "bug", true),
+                        row("/tmp/repo-feat", "feat", true),
+                    ],
+                );
+                type_query(&mut screen, query);
+                if query.is_empty() {
+                    screen.handle_key(key(KeyCode::Down));
+                    screen.handle_key(key(KeyCode::Down));
+                }
+                let before = rendered_query(&mut screen);
+                let expected = DashboardAction::JumpToDelete("/tmp/repo-feat".into());
+                if global {
+                    match screen.handle_scoped_key(shortcut) {
+                        ScopedDashboardAction::Row { repository, action } => {
+                            assert_eq!(repository.owner, "alpha");
+                            assert_eq!(action, expected);
+                        }
+                        other => panic!("expected scoped delete, got {other:?}"),
+                    }
+                } else {
+                    assert_eq!(screen.handle_key(shortcut), expected);
+                }
+                assert_eq!(rendered_query(&mut screen), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn delete_shortcuts_protect_mothers_and_reject_remote_rows_with_any_query() {
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    for shortcut in delete_shortcuts() {
+        for query in ["", "main"] {
+            for global in [false, true] {
+                let mut screen = shortcut_screen(global, vec![row("/tmp/repo", "main", true)]);
+                type_query(&mut screen, query);
+                let before = rendered_query(&mut screen);
+                if global {
+                    assert!(matches!(
+                        screen.handle_scoped_key(shortcut),
+                        ScopedDashboardAction::Row {
+                            action: DashboardAction::MotherWorktreeProtected,
+                            ..
+                        }
+                    ));
+                } else {
+                    assert_eq!(
+                        screen.handle_key(shortcut),
+                        DashboardAction::MotherWorktreeProtected
+                    );
+                }
+                assert_eq!(rendered_query(&mut screen), before);
+            }
+        }
+        for query in ["", "bug"] {
+            let mut screen = global_screen(vec![global_row(
+                row_with_pr("", "bug", true),
+                "alpha",
+                "api",
+                false,
+            )]);
+            type_query(&mut screen, query);
+            let before = rendered_query(&mut screen);
+            assert_eq!(
+                screen.handle_scoped_key(shortcut),
+                ScopedDashboardAction::NoLocalWorktree
+            );
+            assert_eq!(screen.handle_key(shortcut), DashboardAction::Continue);
+            assert_eq!(rendered_query(&mut screen), before);
+        }
+    }
+}
+
+#[test]
+fn plain_deletion_keys_only_edit_search_and_word_deletion_still_works() {
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    for global in [false, true] {
+        for code in [KeyCode::Backspace, KeyCode::Delete] {
+            let mut screen = shortcut_screen(global, vec![row("/tmp/repo-feat", "feat", true)]);
+            let empty = rendered_query(&mut screen);
+            assert_eq!(
+                screen.handle_scoped_key(key(code)),
+                ScopedDashboardAction::Dashboard(DashboardAction::Continue)
+            );
+            assert_eq!(rendered_query(&mut screen), empty);
+            type_query(&mut screen, "feat");
+            if code == KeyCode::Delete {
+                screen.handle_key(key(KeyCode::Left));
+            }
+            assert_eq!(
+                screen.handle_scoped_key(key(code)),
+                ScopedDashboardAction::Dashboard(DashboardAction::Continue)
+            );
+            assert!(rendered_query(&mut screen).contains("Search: fea"));
+        }
+        for shortcut in [
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        ] {
+            let mut screen = shortcut_screen(global, vec![]);
+            type_query(&mut screen, "feat bug");
+            assert_eq!(screen.handle_key(shortcut), DashboardAction::Continue);
+            assert_eq!(rendered_query(&mut screen).trim_end(), "Search: feat");
+        }
+    }
+}
+
+#[test]
+fn delete_shortcuts_do_nothing_without_table_focus_or_visible_rows() {
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    for global in [false, true] {
+        for shortcut in delete_shortcuts() {
+            for query in ["", "feat"] {
+                for focus in [KeyCode::Tab, KeyCode::Enter] {
+                    let mut screen =
+                        shortcut_screen(global, vec![row("/tmp/repo-feat", "feat", true)]);
+                    type_query(&mut screen, query);
+                    screen.handle_key(key(focus));
+                    assert_eq!(
+                        screen.handle_scoped_key(shortcut),
+                        ScopedDashboardAction::Dashboard(DashboardAction::Continue)
+                    );
+                }
+            }
+            let mut screen = shortcut_screen(global, vec![row("/tmp/repo-feat", "feat", true)]);
+            type_query(&mut screen, "no-match");
+            assert_eq!(
+                screen.handle_scoped_key(shortcut),
+                ScopedDashboardAction::Dashboard(DashboardAction::Continue)
+            );
+        }
+    }
+}
+
+fn profile_filter(owner: &str) -> wisetree::config::schema::DashboardFilter {
+    use wisetree::config::schema::{
+        DashboardFilter, DashboardFilterField, DashboardFilterGroup, DashboardFilterOperator,
+        DashboardFilterRule,
+    };
+    DashboardFilter {
+        groups: vec![DashboardFilterGroup {
+            rules: vec![DashboardFilterRule {
+                field: DashboardFilterField::Profile,
+                operator: DashboardFilterOperator::IsAnyOf,
+                values: vec![owner.into()],
+            }],
+        }],
+    }
+}
+
+#[test]
+fn global_filter_button_stays_at_right_and_hover_clears_on_leave() {
+    let mut screen = global_screen(vec![
+        global_row(row("/tmp/alpha/api", "main", true), "alpha", "api", true),
+        global_row(row("/tmp/alpha/bug", "bug", false), "alpha", "api", true),
+    ]);
+    for width in [160, 50, 20] {
+        let rendered = dump_lines(width, 30, |f| screen.render(f, f.area()));
+        assert!(rendered.lines().next().unwrap().ends_with("[ Filter (1) ]"));
+        let button = screen.filter_button_rect().unwrap();
+        assert_eq!(button.right(), width);
+        assert_eq!(button.y, 0);
+    }
+    let plain = dump(160, 30, |f| screen.render(f, f.area()));
+    assert!(plain.contains("1 of 2 worktrees, 1 dirty, 0 PRs open"));
+    assert!(!plain.contains("Status  is none of"));
+    let button = screen.filter_button_rect().unwrap();
+    screen.handle_mouse_move(Position::new(button.x, button.y));
+    let hovered = dump(160, 30, |f| screen.render(f, f.area()));
+    assert!(hovered.contains("Status  is none of  Mother"));
+    assert!(hovered.contains("Showing 1 of 2 worktrees · 1 hidden"));
+    screen.handle_mouse_move(Position::new(0, 2));
+    let left = dump(160, 30, |f| screen.render(f, f.area()));
+    assert!(!left.contains("Status  is none of"));
+    assert!(!left.contains("Showing 1 of 2 worktrees · 1 hidden"));
+}
+
+#[test]
+fn global_default_filter_hides_mothers_but_repository_scope_does_not_filter() {
+    let rows = vec![
+        global_row(row("/tmp/alpha/api", "main", true), "alpha", "api", true),
+        global_row(row("/tmp/alpha/bug", "bug", false), "alpha", "api", true),
+    ];
+    let mut screen = global_screen(rows.clone());
+    assert_eq!(
+        screen.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+        DashboardAction::JumpToDelete("/tmp/alpha/bug".into())
+    );
+    screen.set_rows(vec![rows[0].clone()]);
+    let hidden = dump(160, 30, |f| screen.render(f, f.area()));
+    assert!(hidden.contains(wisetree::messages::GLOBAL_DASHBOARD_FILTER_HIDDEN));
+    assert!(hidden.contains("0 of 1 worktrees"));
+    assert!(!hidden.contains(wisetree::messages::GLOBAL_DASHBOARD_EMPTY));
+
+    let mut repository = DashboardScreen::new(
+        true,
+        true,
+        true,
+        vec!["branch".into(), "status".into()],
+        vec![],
+        true,
+    )
+    .with_filter(profile_filter("nobody"));
+    repository.set_rows(rows);
+    let rendered = dump(160, 30, |f| repository.render(f, f.area()));
+    assert!(rendered.contains("Mother"));
+    assert!(!rendered.contains("Filter ("));
+    assert!(repository.filter_button_rect().is_none());
+}
+
+#[test]
+fn global_filter_and_search_limit_batch_actions_selection_and_row_clicks() {
+    let rows: Vec<_> = [("alpha", "bug"), ("beta", "bug"), ("alpha", "other")]
+        .into_iter()
+        .map(|(owner, branch)| {
+            let row = row_with_pr_state(
+                &format!("/tmp/{owner}/{branch}"),
+                branch,
+                true,
+                PrState::Merged,
+            );
+            global_row(row, owner, "api", true)
+        })
+        .collect();
+    {
+        let mut screen = global_screen(rows.clone()).with_filter(profile_filter("alpha"));
+        for ch in "bug".chars() {
+            screen.handle_key(key(KeyCode::Char(ch)));
+        }
+        let rendered = dump_lines(160, 32, |f| screen.render(f, f.area()));
+        assert!(rendered.contains("1 of 3 worktrees"));
+        assert!(!rendered.contains("beta"));
+        screen.handle_key(key(KeyCode::Tab));
+        match screen.handle_key(key(KeyCode::Enter)) {
+            DashboardAction::BulkDelete(_, paths) => assert_eq!(paths, vec!["/tmp/alpha/bug"]),
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+    let mut screen = global_screen(rows.clone()).with_filter(profile_filter("alpha"));
+    screen.handle_key(key(KeyCode::Down));
+    // A refresh hides the selected row and clamps to the remaining visible row.
+    screen.set_rows(rows[..2].to_vec());
+    assert_eq!(
+        screen.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+        DashboardAction::JumpToDelete("/tmp/alpha/bug".into())
+    );
+    let rendered = dump_lines(160, 32, |f| screen.render(f, f.area()));
+    let y = rendered
+        .lines()
+        .position(|line| line.contains("➤") && line.contains("bug"))
+        .unwrap() as u16;
+    screen.handle_mouse_click(Position::new(2, y));
+    assert!(dump(160, 32, |f| screen.render(f, f.area())).contains("bug"));
+    // Navigate from the clicked row's action menu.
+    assert_eq!(
+        screen.handle_key(key(KeyCode::Enter)),
+        DashboardAction::NavigateTo("/tmp/alpha/bug".into())
+    );
+}
+
+#[test]
+fn global_tooltip_groups_truncation_inactive_loading_and_modal_suppression() {
+    use wisetree::config::schema::{
+        DashboardFilter, DashboardFilterField as F, DashboardFilterOperator as O,
+        DashboardFilterRule,
+    };
+    let mut filter = profile_filter("alpha");
+    filter.groups[0].rules.push(DashboardFilterRule {
+        field: F::Branch,
+        operator: O::Contains,
+        values: vec!["bug".into()],
+    });
+    let mut other = profile_filter("beta").groups.remove(0);
+    other.rules[0].values = (0..30)
+        .map(|n| format!("very-long-profile-value-{n}"))
+        .collect();
+    filter.groups.push(other);
+    assert!(filter
+        .tooltip_lines(26)
+        .iter()
+        .any(|line| line == "+30 more"));
+    let mut screen = global_screen(vec![global_row(
+        row("/tmp/alpha/bug", "bug", false),
+        "alpha",
+        "api",
+        true,
+    )])
+    .with_filter(filter);
+    dump(120, 30, |f| screen.render(f, f.area()));
+    let button = screen.filter_button_rect().unwrap();
+    screen.handle_mouse_move(Position::new(button.x, button.y));
+    let hovered = dump(120, 30, |f| screen.render(f, f.area()));
+    for text in ["AND", "── OR ──", "+29 more", "Filter (3)"] {
+        assert!(hovered.contains(text), "{text}: {hovered}");
+    }
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(!dump(120, 30, |f| screen.render(f, f.area())).contains("── OR ──"));
+
+    let mut screen = global_screen(vec![]).with_filter(DashboardFilter { groups: vec![] });
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| screen.render(f, f.area())).unwrap();
+    let button = screen.filter_button_rect().unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(button.x, button.y)].fg,
+        colors::MUTED
+    );
+    screen.handle_mouse_move(Position::new(button.x, button.y));
+    assert!(dump(120, 30, |f| screen.render(f, f.area()))
+        .contains(wisetree::messages::GLOBAL_FILTER_NONE));
+
+    let mut screen = DashboardScreen::new(true, true, true, vec![], vec![], true)
+        .with_scope(wisetree::tui::screens::dashboard::DashboardScope::Global);
+    let loading = dump_lines(120, 30, |f| screen.render(f, f.area()));
+    assert!(loading.contains("0 of 0 worktrees"));
+    assert!(loading.lines().next().unwrap().ends_with("[ Filter (1) ]"));
+    let button = screen.filter_button_rect().unwrap();
+    screen.handle_mouse_move(Position::new(button.x, button.y));
+    for (width, height) in [(120, 30), (30, 5), (8, 3), (1, 1)] {
+        dump(width, height, |f| screen.render(f, f.area()));
+    }
+}
+
+#[test]
+fn global_filter_tooltip_is_suppressed_by_close_pr_modal() {
+    let mut screen = global_screen(vec![global_row(
+        row_with_pr("/tmp/alpha/bug", "bug", true),
+        "alpha",
+        "api",
+        true,
+    )]);
+    screen.handle_key(key(KeyCode::Enter));
+    let menu = dump_lines(180, 35, |f| screen.render(f, f.area()));
+    let (x, y) = menu
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| {
+            line.find("Close")
+                .map(|byte| (line[..byte].chars().count() as u16, y as u16))
+        })
+        .expect("Close PR command");
+    screen.handle_mouse_click(Position::new(x, y));
+    dump(180, 35, |f| screen.render(f, f.area()));
+    let button = screen.filter_button_rect().unwrap();
+    screen.handle_mouse_move(Position::new(button.x, button.y));
+    let modal = dump(180, 35, |f| screen.render(f, f.area()));
+    assert!(modal.contains("Close Pull Request"));
+    assert!(!modal.contains("Status  is none of"));
+    assert!(!modal.contains("Showing 1 of 1"));
+}
+
+fn filter_ctrl_f(screen: &mut DashboardScreen) {
+    screen.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+}
+
+fn filter_type(screen: &mut DashboardScreen, value: &str) {
+    for c in value.chars() {
+        assert_eq!(
+            screen.handle_key(key(KeyCode::Char(c))),
+            DashboardAction::Continue
+        );
+    }
+}
+
+fn filter_choose_field(screen: &mut DashboardScreen, name: &str) {
+    filter_type(screen, name);
+    screen.handle_key(key(KeyCode::Enter)); // field
+    screen.handle_key(key(KeyCode::Enter)); // first valid operator
+}
+
+fn filter_button(screen: &mut DashboardScreen, label: &str) -> DashboardAction {
+    // Exercise the same mouse hit regions as the application, including after resize.
+    let rendered = dump_lines(120, 35, |f| screen.render(f, f.area()));
+    let (y, line) = rendered
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(label))
+        .unwrap();
+    let x = line.find(label).unwrap();
+    screen.handle_mouse_click(Position::new(x as u16, y as u16))
+}
+
+#[test]
+fn global_filter_editor_builds_and_or_rules_applies_rows_and_persists_json() {
+    use wisetree::config::{
+        schema::{
+            DashboardFilter, DashboardFilterField as F, DashboardFilterGroup,
+            DashboardFilterOperator as O, DashboardFilterRule,
+        },
+        ConfigService,
+    };
+    use wisetree::tui::screens::dashboard::ScopedDashboardAction;
+    let rows = vec![
+        global_row(
+            row_with_pr_state("/tmp/merged-release", "release/one", true, PrState::Merged),
+            "a",
+            "r",
+            true,
+        ),
+        global_row(
+            row_with_pr_state("/tmp/closed-release", "release/two", true, PrState::Closed),
+            "a",
+            "r",
+            true,
+        ),
+        global_row(
+            row_with_pr_state("/tmp/merged-other", "other", true, PrState::Merged),
+            "a",
+            "r",
+            true,
+        ),
+        global_row(
+            row_with_check("/tmp/failed", "fix", true, CheckStatus::Failed),
+            "a",
+            "r",
+            true,
+        ),
+        global_row(row("/tmp/clean", "clean", true), "a", "r", true),
+    ];
+    let mut screen = global_screen(rows.clone());
+    filter_ctrl_f(&mut screen);
+    filter_button(&mut screen, "Clear all");
+    screen.handle_key(key(KeyCode::Char('a')));
+    filter_choose_field(&mut screen, "Status");
+    screen.handle_key(key(KeyCode::Down)); // Merged
+    screen.handle_key(key(KeyCode::Char(' ')));
+    for _ in 0..3 {
+        screen.handle_key(key(KeyCode::Down));
+    } // Closed
+    screen.handle_key(key(KeyCode::Char(' ')));
+    let rendered = dump(120, 35, |f| screen.render(f, f.area()));
+    assert!(rendered.contains("☒ Merged (2)"));
+    assert!(rendered.contains("☒ Closed (1)"));
+    screen.handle_key(key(KeyCode::Enter));
+    screen.handle_key(key(KeyCode::Char('a')));
+    filter_choose_field(&mut screen, "Branch");
+    filter_type(&mut screen, "release");
+    screen.handle_key(key(KeyCode::Enter));
+    screen.handle_key(key(KeyCode::Char('o')));
+    filter_choose_field(&mut screen, "Checks");
+    screen.handle_key(key(KeyCode::Down)); // Failed
+    screen.handle_key(key(KeyCode::Char(' ')));
+    screen.handle_key(key(KeyCode::Enter));
+    let rendered = dump_lines(120, 35, |f| screen.render(f, f.area()));
+    assert!(rendered.contains("Showing 3 of 5 worktrees"));
+    assert_eq!(rendered.matches("Match ALL of").count(), 2);
+    assert!(rendered.contains("OR"));
+    // Latest polling data changes counts without losing the draft.
+    screen.set_rows(rows[..4].to_vec());
+    assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("Showing 3 of 4 worktrees"));
+    // Tab from the focused rule reaches + Rule, then Apply after four more Tabs.
+    for _ in 0..5 {
+        screen.handle_key(key(KeyCode::Tab));
+    }
+    let action = screen.handle_scoped_key(key(KeyCode::Enter));
+    let rule = |field, operator, values: &[&str]| DashboardFilterRule {
+        field,
+        operator,
+        values: values.iter().map(|v| v.to_string()).collect(),
+    };
+    let expected = DashboardFilter {
+        groups: vec![
+            DashboardFilterGroup {
+                rules: vec![
+                    rule(F::Status, O::IsAnyOf, &["Merged", "Closed"]),
+                    rule(F::Branch, O::Contains, &["release"]),
+                ],
+            },
+            DashboardFilterGroup {
+                rules: vec![rule(F::Checks, O::IsAnyOf, &["Failed"])],
+            },
+        ],
+    };
+    assert_eq!(
+        action,
+        ScopedDashboardAction::Dashboard(DashboardAction::PersistFilter(expected.clone()))
+    );
+    assert_eq!(screen.filter(), &expected);
+    let rendered = dump(160, 35, |f| screen.render(f, f.area()));
+    for name in ["merged-release", "closed-release", "failed"] {
+        assert!(rendered.contains(name));
+    }
+    assert!(!rendered.contains("merged-other"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".wisetree/config.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"extra":true,"globalDashboard":{"selectedAccounts":["a"],"future":42}}"#,
+    )
+    .unwrap();
+    let ScopedDashboardAction::Dashboard(DashboardAction::PersistFilter(filter)) = action else {
+        panic!("missing persistence action");
+    };
+    ConfigService::update_global_dashboard_filter_at(&path, filter).unwrap();
+    let document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        document["globalDashboard"]["filter"],
+        serde_json::to_value(expected).unwrap()
+    );
+    assert_eq!(
+        document["globalDashboard"]["selectedAccounts"],
+        serde_json::json!(["a"])
+    );
+    assert_eq!(document["globalDashboard"]["future"], 42);
+    assert_eq!(document["extra"], true);
+}
+
+#[test]
+fn global_filter_editor_cancel_unchanged_apply_clear_and_reset() {
+    use wisetree::config::{schema::DashboardFilter, ConfigService};
+    let mut screen = global_screen(vec![global_row(
+        row("/tmp/mother", "main", true),
+        "a",
+        "r",
+        true,
+    )]);
+    // Mouse opens the editor.
+    dump(120, 35, |f| screen.render(f, f.area()));
+    let button = screen.filter_button_rect().unwrap();
+    screen.handle_mouse_click(Position::new(button.x, button.y));
+    assert_eq!(
+        filter_button(&mut screen, "Apply"),
+        DashboardAction::Continue
+    );
+    filter_ctrl_f(&mut screen);
+    filter_button(&mut screen, "Clear all");
+    assert_eq!(
+        filter_button(&mut screen, "Cancel"),
+        DashboardAction::Continue
+    );
+    assert_eq!(screen.filter(), &DashboardFilter::default());
+    filter_ctrl_f(&mut screen);
+    filter_button(&mut screen, "Clear all");
+    assert_eq!(
+        filter_button(&mut screen, "Apply"),
+        DashboardAction::PersistFilter(DashboardFilter { groups: vec![] })
+    );
+    assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("mother"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    ConfigService::update_global_dashboard_filter_at(&path, screen.filter().clone()).unwrap();
+    assert!(ConfigService::load_global_dashboard_preferences_at(&path)
+        .unwrap()
+        .filter
+        .groups
+        .is_empty());
+    filter_ctrl_f(&mut screen);
+    filter_button(&mut screen, "Reset to default");
+    assert_eq!(
+        filter_button(&mut screen, "Apply"),
+        DashboardAction::PersistFilter(DashboardFilter::default())
+    );
+    // Removing the last rule removes its group and produces the explicit empty filter.
+    filter_ctrl_f(&mut screen);
+    screen.handle_key(key(KeyCode::Backspace));
+    assert_eq!(
+        filter_button(&mut screen, "Apply"),
+        DashboardAction::PersistFilter(DashboardFilter { groups: vec![] })
+    );
+}
+
+#[test]
+fn global_filter_editor_validates_inputs_supports_empty_rows_and_preserves_search_cursor() {
+    let mut screen = global_screen(vec![]);
+    filter_type(&mut screen, "ab");
+    screen.handle_key(key(KeyCode::Left));
+    filter_ctrl_f(&mut screen);
+    screen.handle_key(key(KeyCode::Char('a')));
+    filter_choose_field(&mut screen, "Status");
+    let rendered = dump(120, 35, |f| screen.render(f, f.area()));
+    assert!(rendered.contains("☐ Merged (0)"));
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(dump(120, 35, |f| screen.render(f, f.area()))
+        .contains(wisetree::messages::GLOBAL_FILTER_VALUE_ERROR));
+    // Esc goes back through value → operator → field → overview → dashboard.
+    for _ in 0..4 {
+        screen.handle_key(key(KeyCode::Esc));
+    }
+    screen.handle_key(key(KeyCode::Right));
+    filter_type(&mut screen, "c");
+    assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("Search: abc"));
+    filter_ctrl_f(&mut screen);
+    screen.handle_key(key(KeyCode::Char('a')));
+    filter_choose_field(&mut screen, "Ahead");
+    filter_type(&mut screen, "abc");
+    assert!(dump(120, 35, |f| screen.render(f, f.area()))
+        .contains(wisetree::messages::GLOBAL_FILTER_INTEGER_ERROR));
+    screen.handle_key(key(KeyCode::Enter));
+    assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("3/3"));
+    for _ in 0..3 {
+        screen.handle_key(key(KeyCode::Backspace));
+    }
+    filter_type(&mut screen, "12");
+    screen.handle_key(key(KeyCode::Enter));
+    filter_button(&mut screen, "Apply");
+    assert_eq!(screen.filter().groups[0].rules[1].values, vec!["12"]);
+    filter_ctrl_f(&mut screen);
+    screen.handle_key(key(KeyCode::Char('o')));
+    filter_choose_field(&mut screen, "Profile");
+    filter_type(&mut screen, "custom-owner");
+    screen.handle_key(key(KeyCode::Enter));
+    filter_button(&mut screen, "Apply");
+    assert_eq!(
+        screen.filter().groups[1].rules[0].values,
+        vec!["custom-owner"]
+    );
+    // Loading does not prevent opening the editor; new rows update its counts.
+    let mut loading = DashboardScreen::new(false, false, false, vec![], vec![], true)
+        .with_scope(wisetree::tui::screens::dashboard::DashboardScope::Global);
+    filter_ctrl_f(&mut loading);
+    assert!(dump(120, 35, |f| loading.render(f, f.area())).contains("Showing 0 of 0"));
+    loading.set_rows(vec![row("/tmp/fresh", "feature", true)]);
+    assert!(dump(120, 35, |f| loading.render(f, f.area())).contains("Showing 1 of 1"));
+}
+
+#[test]
+fn global_filter_editor_mouse_rule_edit_and_text_suggestions() {
+    let mut screen = global_screen(vec![global_row(
+        row("/tmp/release", "release/next", true),
+        "a",
+        "r",
+        true,
+    )]);
+    filter_ctrl_f(&mut screen);
+    // Clicking a rule begins the same guided editing flow as Enter.
+    let rendered = dump_lines(120, 35, |f| screen.render(f, f.area()));
+    let y = rendered
+        .lines()
+        .position(|line| line.contains("Status  is none of  Mother"))
+        .unwrap();
+    screen.handle_mouse_click(Position::new(3, y as u16));
+    assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("1/3"));
+    // Switch the existing rule to Branch contains, then complete a suggestion.
+    filter_choose_field(&mut screen, "Branch");
+    screen.handle_key(key(KeyCode::Enter)); // empty text cannot save
+    assert!(dump(120, 35, |f| screen.render(f, f.area()))
+        .contains(wisetree::messages::GLOBAL_FILTER_VALUE_ERROR));
+    filter_type(&mut screen, "release");
+    assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("release/next"));
+    screen.handle_key(key(KeyCode::Tab));
+    screen.handle_key(key(KeyCode::Enter));
+    filter_button(&mut screen, "Apply");
+    assert_eq!(
+        screen.filter().groups[0].rules[0].values,
+        vec!["release/next"]
+    );
+    filter_ctrl_f(&mut screen);
+    screen.handle_key(key(KeyCode::Char('a')));
+    filter_choose_field(&mut screen, "Checks");
+    screen.handle_key(key(KeyCode::Down));
+    screen.handle_key(key(KeyCode::Char(' '))); // Failed
+    screen.set_rows(vec![]);
+    assert!(dump(120, 35, |f| screen.render(f, f.area())).contains("☒ Failed (0)"));
+    // Resizing preserves selection and never invalidates rule/editor state.
+    for (width, height) in [(20, 10), (60, 20), (120, 35)] {
+        dump(width, height, |f| screen.render(f, f.area()));
+    }
+    screen.handle_key(key(KeyCode::Enter));
+    filter_button(&mut screen, "Apply");
+    assert_eq!(screen.filter().groups[0].rules[1].values, vec!["Failed"]);
 }

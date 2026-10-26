@@ -277,8 +277,10 @@ Press **Enter** on a row to open its action menu. **General Commands** is a sear
 
 #### Quick delete and bulk delete
 
-- With the search box empty, **Backspace** or **Delete** on a row jumps straight to the delete confirmation for that worktree.
+- **Ctrl+Backspace** (legacy alias **Ctrl+H**) on a row jumps straight to the delete confirmation in Dashboard and Global Dashboard, with or without search text. The query stays unchanged. Plain Backspace/Delete edit the query; Ctrl+W and Alt+Backspace delete a word.
 - Press **Tab** to focus the footer row **Delete worktrees with status: Merged · Closed · Drafted · Opened · Clean · Dirty**. Use **← / →** to pick a status and press **Enter**. Wisetree lists every worktree with that status and asks you to confirm. The main worktree is never included.
+
+Some terminals send the same byte for Backspace and Ctrl+Backspace, so Wisetree cannot distinguish them. Use **Enter → Delete worktree** from the row actions menu when needed. Legacy terminals can send Ctrl+Backspace as `0x08` (Ctrl+H), which Wisetree accepts as the delete shortcut. If your terminal configures plain Backspace to send `^H`, it also opens the delete confirmation; the confirmation defaults to **No**.
 
 ### Global Dashboard
 
@@ -294,6 +296,30 @@ Press **Enter** on a row to open its action menu. **General Commands** is a sear
 | `Enter` | Saves the selection and opens the dashboard. At least one account is required. |
 | `Esc` | Clears the filter, then returns to the menu without saving. |
 | `Ctrl+R` | Discovers accounts again. |
+
+Click **Filter** at the far right of the status header or press **Ctrl+F** to open the filter editor without changing your search. Rules within each **Match ALL of** card use **AND**; cards are joined with **OR**. Each rule uses a field, an operator, and values. Enum fields (profile, repository, location, status, checks, review and mergeability) offer checkboxes with live counts. Profiles and repositories also accept custom typed values. Text fields (worktree, branch, source branch, last commit and PR title) offer suggestions and case-insensitive comparisons. Numeric fields (ahead, behind, insertions, deletions and PR number) accept integer comparisons.
+
+Use **↑/↓** and **Enter** to edit, **a** to add a rule, **o** to add an OR group, **Delete/Backspace** to remove a rule, **Tab** to reach buttons, and **Esc** to go back or cancel. The editor shows a live match count as rows refresh. **Apply** updates the table immediately and atomically saves **`globalDashboard.filter`** in `~/.wisetree/config.json`; **Cancel** discards edits. Hover over **Filter** to preview the applied rules. Search narrows the filtered results further.
+
+By default, **Status is none of Mother** hides mother worktrees. **Reset to default** restores that rule; **Clear all** followed by **Apply** saves an explicitly empty filter (`{"groups": []}`), showing every status across restarts. For example, this filter shows merged or closed release branches, plus any row with failed checks:
+
+```json
+{
+  "globalDashboard": {
+    "filter": {
+      "groups": [
+        {"rules": [
+          {"field": "status", "operator": "isAnyOf", "values": ["Merged", "Closed"]},
+          {"field": "branch", "operator": "contains", "values": ["release"]}
+        ]},
+        {"rules": [
+          {"field": "checks", "operator": "isAnyOf", "values": ["Failed"]}
+        ]}
+      ]
+    }
+  }
+}
+```
 
 The selection is saved as `globalDashboard.selectedAccounts` in the global `~/.wisetree/config.json`, even when a project config is active. The list opens instantly from `gh`'s response cache and refreshes in the background; `Ctrl+R` fetches it fresh.
 
@@ -685,7 +711,7 @@ Also make sure that `gh auth status` succeeds.
 | Everywhere | `↑` `↓` navigate · `Enter` select · `Esc` back or cancel · `Ctrl+C` quit |
 | Lists | Type to search, on searchable lists |
 | Dialogs | `←` `→` or `Tab` switch buttons · `Enter` confirm · `Esc` cancel |
-| Dashboard | Type to search · `Ctrl+R` refresh · `Enter` action menu · `Backspace`/`Delete` delete the selected worktree (when the search is empty) · `Tab` focus the bulk-delete buttons |
+| Dashboard | Type to search · `Ctrl+R` refresh · `Enter` action menu · `Ctrl+Backspace` / `Ctrl+H` delete the selected visible worktree (with or without search text) · `Tab` focus the bulk-delete buttons |
 | Dashboard action menu | `Tab` switch between General and PR commands · `O` open PR · `M` merge PR · `C` close PR |
 | Shared cache | `R` refresh · `D` delete the entry |
 | Text inputs | `Ctrl`/`Alt` + `←` `→` move by word · `Ctrl+W` / `Alt+Backspace` delete word · `Ctrl+U` / `Ctrl+K` delete to the start or end of the line |

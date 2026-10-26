@@ -517,3 +517,125 @@ fn global_dashboard_config_is_backward_compatible_and_documented_in_schema() {
         "array"
     );
 }
+
+#[test]
+fn global_filter_defaults_normalization_and_empty_reload() {
+    use wisetree::config::schema::{DashboardFilter, GlobalDashboardConfig};
+    let missing: GlobalDashboardConfig = serde_json::from_str("{}").unwrap();
+    assert_eq!(missing.filter, DashboardFilter::default());
+    let normalized: DashboardFilter =
+        serde_json::from_value(serde_json::json!({"groups":[{"rules":[
+            {"field":"status","operator":"isNoneOf","values":["Mother","Mother"]},
+            {"field":"branch","operator":"contains","values":[]}
+        ]}]}))
+        .unwrap();
+    assert_eq!(normalized, DashboardFilter::default());
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    ConfigService::update_global_dashboard_filter_at(&path, DashboardFilter { groups: vec![] })
+        .unwrap();
+    let loaded = ConfigService::load_global_dashboard_preferences_at(&path).unwrap();
+    assert!(loaded.filter.groups.is_empty());
+    let mut service = ConfigService::with_global_config_path(path);
+    let config = service.load_global().unwrap();
+    service.save(&config, None).unwrap();
+    assert!(service
+        .load_global()
+        .unwrap()
+        .global_dashboard
+        .unwrap()
+        .filter
+        .groups
+        .is_empty());
+}
+
+#[test]
+fn invalid_global_filters_fall_back_without_losing_accounts_and_warn() {
+    use wisetree::config::schema::DashboardFilter;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    for filter in [
+        serde_json::json!({"unknown":true}),
+        serde_json::json!({"groups":[{"rules":[{"field":"unknown","operator":"isAnyOf","values":["x"]}]}]}),
+        serde_json::json!({"groups":[{"rules":[{"field":"status","operator":"contains","values":["Mother"]}]}]}),
+        serde_json::json!({"groups":[{"rules":[{"field":"status","operator":"isAnyOf","values":["invalid"]}]}]}),
+        serde_json::json!({"groups":[{"rules":[{"field":"ahead","operator":"equal","values":["NaN"]}]}]}),
+        serde_json::Value::Null,
+    ] {
+        fs::write(&path, serde_json::to_vec(&serde_json::json!({"globalDashboard":{"selectedAccounts":["Alice"],"filter":filter}})).unwrap()).unwrap();
+        let loaded = ConfigService::load_global_dashboard_preferences_at(&path).unwrap();
+        assert_eq!(loaded.selected_accounts, ["Alice"]);
+        assert_eq!(loaded.filter, DashboardFilter::default());
+        let mut service = ConfigService::with_global_config_path(path.clone());
+        assert_eq!(
+            service.load_global().unwrap().global_dashboard.unwrap(),
+            loaded
+        );
+        assert!(service
+            .warnings()
+            .iter()
+            .any(|s| s.contains("globalDashboard.filter")));
+        ConfigService::update_global_dashboard_selected_accounts_at(&path, vec!["Bob".into()])
+            .unwrap();
+        assert_eq!(
+            ConfigService::load_global_dashboard_preferences_at(&path)
+                .unwrap()
+                .selected_accounts,
+            ["Bob"]
+        );
+    }
+}
+
+#[test]
+fn filter_patch_preserves_other_keys_and_settings_keeps_latest_filter() {
+    use wisetree::config::schema::DashboardFilter;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.json");
+    let document = serde_json::json!({
+        "terminalCommand":"editor", "future": {"kept":true},
+        "globalDashboard":{"selectedAccounts":["Alice"],"future":7}
+    });
+    fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let empty = DashboardFilter { groups: vec![] };
+    let saved = ConfigService::update_global_dashboard_filter_at(&path, empty.clone()).unwrap();
+    assert_eq!(saved.selected_accounts, ["Alice"]);
+    let mut expected = document;
+    expected["globalDashboard"]["filter"] = serde_json::to_value(&empty).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap(),
+        expected
+    );
+    // A selection patch leaves an explicitly empty filter intact.
+    let updated =
+        ConfigService::update_global_dashboard_selected_accounts_at(&path, vec!["Bob".into()])
+            .unwrap();
+    assert_eq!(updated.filter, empty);
+    fs::write(
+        &path,
+        r#"{"globalDashboard":{"selectedAccounts":["Alice"]}}"#,
+    )
+    .unwrap();
+    let mut service = ConfigService::with_global_config_path(path.clone());
+    let stale = service.load_global().unwrap();
+    ConfigService::update_global_dashboard_filter_at(&path, empty.clone()).unwrap();
+    service.save(&stale, None).unwrap();
+    assert_eq!(
+        service
+            .load_global()
+            .unwrap()
+            .global_dashboard
+            .unwrap()
+            .filter,
+        empty
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!("../schema.json")).unwrap();
+    let filter = &schema["definitions"]["GlobalDashboardConfig"]["properties"]["filter"];
+    assert_eq!(
+        schema["definitions"]["DashboardFilter"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        filter["default"],
+        serde_json::to_value(DashboardFilter::default()).unwrap()
+    );
+}
