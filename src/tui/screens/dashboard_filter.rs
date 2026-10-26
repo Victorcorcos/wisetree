@@ -392,6 +392,15 @@ impl DashboardFilterEditor {
         }
     }
 
+    fn apply(&self) -> FilterEditorOutcome {
+        let mut filter = self.draft.clone();
+        if filter.normalize().is_ok() {
+            FilterEditorOutcome::Apply(filter)
+        } else {
+            FilterEditorOutcome::Pending
+        }
+    }
+
     fn activate(&mut self) -> FilterEditorOutcome {
         let rules = self.rules();
         if let Some(&(group, rule)) = rules.get(self.focus) {
@@ -410,12 +419,7 @@ impl DashboardFilterEditor {
                     self.focus = 0;
                     self.target.0 = 0;
                 }
-                4 => {
-                    let mut filter = self.draft.clone();
-                    if filter.normalize().is_ok() {
-                        return FilterEditorOutcome::Apply(filter);
-                    }
-                }
+                4 => return self.apply(),
                 5 => return FilterEditorOutcome::Cancel,
                 _ => {}
             }
@@ -532,7 +536,13 @@ impl DashboardFilterEditor {
         key: crossterm::event::KeyEvent,
         rows: &[DashboardRow],
     ) -> FilterEditorOutcome {
-        use crossterm::event::KeyCode;
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if self.step == EditorStep::Overview
+            && key.code == KeyCode::Enter
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return self.apply();
+        }
         if key.code == KeyCode::Esc {
             return self.back();
         }
@@ -1286,6 +1296,26 @@ mod tests {
             field,
             operator,
             values: values.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn ctrl_enter_applies_from_every_overview_focus() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for filter in [
+            DashboardFilter::default(),
+            DashboardFilter { groups: vec![] },
+        ] {
+            let mut editor = DashboardFilterEditor::new(filter.clone());
+            for focus in 0..filter.rule_count() + messages::GLOBAL_FILTER_BUTTONS.len() {
+                editor.focus = focus;
+                let outcome =
+                    editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &[]);
+                let FilterEditorOutcome::Apply(applied) = outcome else {
+                    panic!("Ctrl+Enter should apply from focus {focus}");
+                };
+                assert_eq!(applied, filter);
+            }
         }
     }
 

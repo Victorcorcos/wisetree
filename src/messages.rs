@@ -279,9 +279,10 @@ pub const GLOBAL_FILTER_FIELD_STEP: &str = "1/3 · Choose a field (type to searc
 pub const GLOBAL_FILTER_OPERATOR_STEP: &str = "2/3 · Choose an operator";
 pub const GLOBAL_FILTER_VALUE_STEP: &str = "3/3 · Choose values";
 /// `(key, action)` hints while a rule is focused.
-pub const GLOBAL_FILTER_RULES_HINT: [(&str, &str); 7] = [
+pub const GLOBAL_FILTER_RULES_HINT: [(&str, &str); 8] = [
     ("↑↓", "Move"),
     ("Enter", "Edit"),
+    ("Ctrl+Enter", "Apply"),
     ("a", "Add rule"),
     ("o", "Add OR group"),
     ("Delete", "Remove"),
@@ -289,9 +290,10 @@ pub const GLOBAL_FILTER_RULES_HINT: [(&str, &str); 7] = [
     ("Esc", "Cancel"),
 ];
 /// `(key, action)` hints while a button is focused.
-pub const GLOBAL_FILTER_BUTTONS_HINT: [(&str, &str); 4] = [
+pub const GLOBAL_FILTER_BUTTONS_HINT: [(&str, &str); 5] = [
     ("←→", "Move"),
     ("Enter", "Select"),
+    ("Ctrl+Enter", "Apply"),
     ("Tab/⇧Tab", "Sections"),
     ("Esc", "Cancel"),
 ];
