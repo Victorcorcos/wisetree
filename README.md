@@ -13,7 +13,7 @@ With Wisetree you can:
 - **Act** on a worktree from the Dashboard: jump into it, open it in your editor, copy its path, delete it, or open, close, or squash-merge its pull request.
 - **Clean up** in bulk, for example by deleting every worktree whose PR was merged.
 - **Bootstrap** a project configuration from presets for more than 20 frameworks, or let Wisetree detect them.
-- **Script** it: `create`, `dashboard`, and `cache` also work non-interactively, with JSON output.
+- **Script** it: `create` and `dashboard` also work non-interactively, with JSON dashboard output.
 
 ---
 
@@ -30,7 +30,6 @@ With Wisetree you can:
   - [Global Dashboard](#global-dashboard)
   - [Deleting worktrees](#deleting-worktrees)
   - [Pull request actions](#pull-request-actions)
-  - [Shared cache screen](#shared-cache-screen)
   - [Settings](#settings)
   - [Setup Project Config (presets)](#setup-project-config-presets)
 - [Command-line reference](#command-line-reference)
@@ -41,7 +40,7 @@ With Wisetree you can:
   - [Template variables](#template-variables)
   - [Worktree location (`worktreePathTemplate`)](#worktree-location-worktreepathtemplate)
   - [Copying files (`worktreeCopyPatterns`)](#copying-files-worktreecopypatterns)
-  - [Shared dependency cache (`worktreeLinkPatterns`)](#shared-dependency-cache-worktreelinkpatterns)
+  - [Sharing files and folders (`worktreeLinkPatterns`)](#sharing-files-and-folders-worktreelinkpatterns)
   - [Post-create commands (`postCreateCmd`)](#post-create-commands-postcreatecmd)
   - [Terminal command (`terminalCommand`)](#terminal-command-terminalcommand)
   - [Dashboard settings (`dashboard`)](#dashboard-settings-dashboard)
@@ -156,11 +155,10 @@ The header shows the Wisetree version and the active repository.
 | **Create** | Always | Creates a new worktree. |
 | **Dashboard** | Always | Opens the live worktree overview. |
 | **Global Dashboard** | Always | Opens the [Dashboard across GitHub accounts](#global-dashboard) and their local repositories. |
-| **Shared cache** | When `worktreeLinkPatterns` is not empty | Inspects and cleans the [shared dependency cache](#shared-dependency-cache-worktreelinkpatterns). |
 | **Settings** | Always | Views and edits the configuration. |
 | **Exit** | Always | Quits. `Ctrl+C` quits from any screen. |
 
-You can open a screen directly with `wisetree create`, `wisetree dashboard`, `wisetree cache`, or `wisetree settings`. You can also use `--mode <menu|create|dashboard|cache|settings>`.
+You can open a screen directly with `wisetree create`, `wisetree dashboard`, or `wisetree settings`. You can also use `--mode <menu|create|dashboard|settings>`.
 
 ### Create a worktree
 
@@ -174,7 +172,7 @@ The Create screen is a step-by-step wizard:
 6. **Creation.** A **Terminal Activity** panel streams each step live:
    - `git worktree add …`
    - the files copied by [`worktreeCopyPatterns`](#copying-files-worktreecopypatterns)
-   - the directories linked by [`worktreeLinkPatterns`](#shared-dependency-cache-worktreelinkpatterns)
+   - the files and folders linked directly to Mother by [`worktreeLinkPatterns`](#sharing-files-and-folders-worktreelinkpatterns)
    - the stdout and stderr of every [post-create command](#post-create-commands-postcreatecmd), cleaned of ANSI escape sequences
 7. **Launch.** If [`terminalCommand`](#terminal-command-terminalcommand) is set, Wisetree runs it to open your editor or terminal in the new worktree.
 
@@ -338,7 +336,7 @@ Every deletion requires confirmation.
 - A **dirty** worktree has uncommitted changes. Its dialog is red and the button reads **Force Delete**. Its changes are discarded.
 - When [`deleteBranchWithWorktree`](#configuration-keys) is `true`, Wisetree verifies the branch's merge status before changing the worktree or branch. Squash and rebase merges are verified through `gh` against merged PRs in the configured GitHub remotes, requiring an exact match with the local branch tip.
 - If there are extra commits or the merge cannot be verified, a second confirmation offers **Delete** and **Cancel**, with **Cancel** selected. **Delete** removes both the worktree and its branch; **Cancel** preserves both and stops any remaining bulk deletions. Confirming dirty-file removal does not bypass this commit confirmation. This extra confirmation only applies when `deleteBranchWithWorktree` is enabled.
-- Shared-cache symlinks are removed before the worktree, so cached dependencies are never deleted through a link.
+- Shared symlinks are removed before the worktree, preserving Mother's original files and folders.
 - If Git reports the worktree as corrupted, Wisetree removes the directory and runs `git worktree prune`.
 
 ### Pull request actions
@@ -362,18 +360,6 @@ Runs `gh pr close <number> --repo <owner/repo>` after a confirmation dialog. The
    - **Merge only**: merges what is already on GitHub.
 4. Wisetree runs `gh pr merge <number> --squash --subject "<PR title> (#<number>)" --body "<PR description>" --repo <owner/repo>`. The resulting commit message matches GitHub's own squash convention. The repository is read from the PR's URL, so a PR opened on another remote's repository (such as `kaefer`) is never confused with a same-numbered PR in `gh`'s default repository.
 
-### Shared cache screen
-
-This screen is available when [`worktreeLinkPatterns`](#shared-dependency-cache-worktreelinkpatterns) is configured. It lists every cached directory with its size, its age, and the worktrees that use it.
-
-| Key | Action |
-| --- | --- |
-| `R` | Refresh. |
-| `D` | Delete the selected cache entry. The confirmation warns if worktrees still reference it. |
-| `Esc` | Back. |
-
-For pruning, clearing, and JSON output, use [`wisetree cache`](#cache).
-
 ### Settings
 
 Settings shows every configuration value and lets you edit it in place. Each page shows the file that changes (**Saving to: …**): the project config if one exists, otherwise the global config.
@@ -383,8 +369,6 @@ Settings shows every configuration value and lets you edit it in place. Each pag
 | **Setup Project Config** | Shown when the project has no `.wisetree/config.json`. See [presets](#setup-project-config-presets). |
 | **Dashboard** | Edit the refresh interval, toggle PR data, and choose columns. |
 | **Copy Patterns** / **Ignore Patterns** / **Link Patterns** | Edit the patterns in a multi-line editor with one pattern per line. |
-| **Link Strategy** | Cycle through `CreateEmpty`, `SeedFromSource`, and `SeedIfPresent`. |
-| **Link Cache Dir** | Override the shared-cache root. |
 | **Post-Create Commands** | Add, edit, and remove commands. They run in order. |
 | **Terminal Command** | Set the command that opens your editor or terminal. |
 | **Path Template** | Set where worktrees are created. |
@@ -402,8 +386,8 @@ This flow creates `.wisetree/config.json` for the current project.
 1. **Pick a preset.**
    - **Wise Preset** (default) scans the repository recursively, including monorepo subfolders, while skipping dependency, build, and cache directories. It detects every framework it recognizes and merges their settings, scoped to the right subfolders.
    - Or pick a single preset. A preset whose files are found at the repository root is labeled *detected*.
-2. **Review and edit** four blocks: Copy Patterns, Ignore Patterns, Shared Cache Links, and Post-Create Commands. Each line is one entry.
-3. **Confirm** to write the file. If link patterns are present, the link strategy is set to `SeedFromSource`.
+2. **Review and edit** four blocks: Copy Patterns, Ignore Patterns, Link Patterns, and Post-Create Commands. Each line is one entry.
+3. **Confirm** to write the file. Link patterns share Mother's existing files and folders directly.
 
 Available presets:
 
@@ -419,7 +403,7 @@ For example, the **Ruby on Rails** preset:
 
 - copies `.env*`, `config/master.key`, `config/database.yml`, and similar files
 - ignores `tmp/`, `log/`, `node_modules/`, and similar directories
-- shares dependency folders through the cache
+- symlinks existing dependency folders directly to Mother
 - runs `bundle install`, `yarn install`, and `bin/rails db:prepare`
 
 ---
@@ -437,7 +421,6 @@ wisetree [command] [options]
 | *(none)* | Opens the main menu. | — |
 | `create` | Opens the Create screen. | Creates a worktree non-interactively. |
 | `dashboard` | Opens the Dashboard. | Prints worktree data as JSON. |
-| `cache` | Opens the Shared cache screen. | `cache list`, `cache prune`, `cache clear`, and `cache path` are always non-interactive. |
 | `settings` | Opens Settings. | — |
 
 ### Options
@@ -446,14 +429,13 @@ wisetree [command] [options]
 | --- | --- | --- |
 | `-h`, `--help` | all | Shows help. |
 | `-v`, `--version` | all | Shows the version. |
-| `-m`, `--mode <mode>` | interactive | Initial screen: `menu`, `create`, `dashboard`, `cache`, or `settings`. |
+| `-m`, `--mode <mode>` | interactive | Initial screen: `menu`, `create`, `dashboard`, or `settings`. |
 | `--from-wrapper` | interactive | Used by the shell wrapper. Prints the selected path to stdout. |
 | `-n`, `--name <name>` | `create` | **Required.** Worktree directory name. |
 | `-s`, `--source <branch>` | `create` | **Required.** Existing source branch, local or remote. |
 | `-b`, `--branch <branch>` | `create` | Name of the new branch. Defaults to the value of `--name`. |
-| `--json` | `dashboard`, `cache list` | Prints JSON. |
+| `--json` | `dashboard` | Prints JSON. |
 | `-w`, `--watch` | `dashboard` | Streams snapshots as JSON Lines until you press `Ctrl+C`. |
-| `-f`, `--force` | `cache clear` | Confirms deletion of the cache. |
 
 Values can be given as `--name foo` or `--name=foo`. Unknown flags are errors.
 
@@ -508,15 +490,6 @@ Example output:
 
 When PR data is enabled, each row also has a `pullRequest` object with `number`, `state`, `url`, `title`, and, when available, the base branch, labels, checks, review, and merge status.
 
-### `cache`
-
-| Command | Description |
-| --- | --- |
-| `wisetree cache list [--json]` | Shows the cache root, total size, active worktrees, and each entry's size, age in days, and number of users. |
-| `wisetree cache prune` | Removes entries that **no active worktree uses** and that were **last used more than 14 days ago**. Reports what was removed and what was kept, and why. |
-| `wisetree cache clear --force` | Deletes this repository's entire cache. Refuses to run without `--force`. |
-| `wisetree cache path` | Prints the cache root, for example `~/.wisetree/cache/34e728ff50f6577c`. |
-
 Non-interactive commands print errors to stderr and exit with status `1`.
 
 ---
@@ -540,7 +513,6 @@ Other files in `~/.wisetree/`:
 
 | Path | Contents |
 | --- | --- |
-| `cache/<repo-id>/` | Default shared dependency cache for each repository. `<repo-id>` is a hash of the repository path. |
 | `dashboard_pr_cache.json` | Cached pull request data for the Dashboard. |
 | `repositories.json` | Local repositories remembered for the [Global Dashboard](#global-dashboard). |
 | `global_dashboard_rows.json` | The Global Dashboard's last local rows, shown while it refreshes. |
@@ -554,9 +526,7 @@ A JSON Schema for the configuration is in [`schema.json`](schema.json). Keys use
   "worktreePathTemplate": "$BASE_PATH.worktree",
   "worktreeCopyPatterns": [".env*", ".vscode/**", "config/master.key"],
   "worktreeCopyIgnores": ["**/node_modules/**", "**/dist/**", "**/.git/**", "**/.DS_Store"],
-  "worktreeLinkPatterns": ["node_modules"],
-  "worktreeLinkStrategy": "SeedFromSource",
-  "worktreeLinkCacheDir": null,
+  "worktreeLinkPatterns": ["**/.env*", "**/config/application.yml", "node_modules"],
   "postCreateCmd": ["npm install", "echo Ready: $BRANCH_NAME"],
   "terminalCommand": "code $WORKTREE_PATH",
   "deleteBranchWithWorktree": true,
@@ -575,9 +545,7 @@ A JSON Schema for the configuration is in [`schema.json`](schema.json). Keys use
 | `worktreePathTemplate` | string | `"$BASE_PATH.worktree"` | Folder, relative to the repository's parent directory, where worktrees are created. |
 | `worktreeCopyPatterns` | string[] | `[".env*", ".vscode/**"]` | Globs of files copied from the main worktree into each new worktree. |
 | `worktreeCopyIgnores` | string[] | `["**/node_modules/**", "**/dist/**", "**/.git/**", "**/Thumbs.db", "**/.DS_Store"]` | Globs that are never copied. |
-| `worktreeLinkPatterns` | string[] | `[]` | Directories shared through the cache with symlinks instead of being duplicated. |
-| `worktreeLinkStrategy` | `"CreateEmpty"` \| `"SeedFromSource"` \| `"SeedIfPresent"` | `"CreateEmpty"` | How a cache entry is created the first time it is needed. |
-| `worktreeLinkCacheDir` | string \| null | `null` | Overrides the cache root. Supports template variables. |
+| `worktreeLinkPatterns` | string[] | `[]` | Files and folders symlinked directly to Mother's originals. Edits are shared in both directions. Missing sources are skipped. Link Patterns takes precedence over Copy Patterns. |
 | `postCreateCmd` | string[] | `[]` | Shell commands run in order inside the new worktree. |
 | `terminalCommand` | string | `""` | Command that opens an editor or terminal in a worktree. Empty disables it. |
 | `deleteBranchWithWorktree` | boolean | `false` | Also deletes the branch when a worktree is deleted. |
@@ -588,7 +556,7 @@ A JSON Schema for the configuration is in [`schema.json`](schema.json). Keys use
 
 ### Template variables
 
-`worktreePathTemplate`, `worktreeLinkCacheDir`, `postCreateCmd`, and `terminalCommand` can use these variables:
+`worktreePathTemplate`, `postCreateCmd`, and `terminalCommand` can use these variables:
 
 | Variable | Value |
 | --- | --- |
@@ -623,32 +591,26 @@ Untracked files such as `.env` or local credentials do not exist in a new worktr
 - Matched directories are copied recursively, and `worktreeCopyIgnores` still applies inside them.
 - Errors are reported in the activity log and do not stop worktree creation.
 
-### Shared dependency cache (`worktreeLinkPatterns`)
+### Sharing files and folders (`worktreeLinkPatterns`)
 
-Installing `node_modules`, `vendor/bundle`, or `.venv` separately in every worktree is slow and uses a lot of disk space. Link patterns let all worktrees share one copy.
+Link Patterns symlinks existing files and folders directly to the Mother worktree:
 
-**How it works:**
+```text
+Child/.env         → Mother/.env
+Child/node_modules → Mother/node_modules
+Child/config       → Mother/config
+```
 
-1. For each pattern, which must be a **directory** such as `node_modules`, Wisetree keeps one entry at `<cache root>/entries/<pattern>`.
-2. In the new worktree, it creates a **symlink** from `<pattern>` to that cache entry. On Windows, it uses a junction when symlinks are not permitted.
-3. It records in `<cache root>/metadata.json` which worktrees use the cache, and when each entry was last used.
+Literal paths and globs such as `.env`, `**/.env*`, `**/config/application.yml`, and `**/node_modules` are supported. Edits from Mother or any linked Child are visible to all of them. Installing a package in a Child's linked `node_modules` updates Mother's folder too. Creating another Child from an existing Child still links to Mother.
 
-**`worktreeLinkStrategy`** controls what happens the first time a cache entry is created:
+- Link Patterns takes precedence over Copy Patterns, including recursive copies.
+- Missing source paths are skipped; install dependencies in Mother before creating children that should share them.
+- Existing destination files, folders, and unrelated links are never replaced. Already-correct links are left intact.
+- A linked folder already shares all descendants; overlapping patterns do not create nested links inside Mother.
+- Deleting a Child removes its links and preserves Mother's originals.
+- Source symlinks and paths escaping Mother are not followed.
 
-| Strategy | Behavior when the cache entry does not exist yet |
-| --- | --- |
-| `CreateEmpty` (default) | Creates an empty directory. Your post-create command, for example `npm install`, fills it. |
-| `SeedFromSource` | Copies the directory from the main worktree into the cache. If the directory is missing there, creates an empty entry. |
-| `SeedIfPresent` | Copies the directory from the main worktree if it exists. Otherwise skips linking that pattern. |
-
-After an entry exists, every later worktree links to it directly.
-
-**Cache root:** the default is `~/.wisetree/cache/<repo-id>/`. Set `worktreeLinkCacheDir` to use another location.
-
-**Cleanup:**
-
-- Deleting a worktree removes its symlinks first and unregisters it from the cache. The cached data stays for the other worktrees.
-- To clean the cache, use `wisetree cache prune`, the [Shared cache screen](#shared-cache-screen), or `wisetree cache clear --force`.
+There is no separate dependency cache, Link Strategy, or Link Cache Dir. Existing configs may still contain `worktreeLinkStrategy` and `worktreeLinkCacheDir`; these obsolete keys are ignored on load and omitted on save.
 
 > [!NOTE]
 > All linked worktrees share the same files. Use this for dependency folders that are compatible across your branches. Don't use it for build output that differs per branch.
@@ -694,7 +656,7 @@ Also make sure that `gh auth status` succeeds.
 ## Safety guarantees
 
 - **The main worktree cannot be deleted.** Its row is labeled *Mother*, it has no delete action, and bulk delete never includes it.
-- **Destructive actions always ask first.** This covers single deletes, bulk deletes, closing a PR, merging a PR (default **No**), deleting a cache entry, and `cache clear` (requires `--force`).
+- **Destructive actions always ask first.** This covers single deletes, bulk deletes, closing a PR, and merging a PR (default **No**).
 - **Dirty worktrees are flagged.** Deleting one is shown in red as a *Force Delete*.
 - **Unverified commits require explicit confirmation.** With `deleteBranchWithWorktree` enabled, neither the worktree nor its branch is removed until their commits are verified as merged or you explicitly choose **Delete** in the extra confirmation. **Cancel** is selected by default.
 - **Unpushed commits are not lost on merge.** You are offered **Push & merge** before squash-merging.
@@ -713,7 +675,6 @@ Also make sure that `gh auth status` succeeds.
 | Dialogs | `←` `→` or `Tab` switch buttons · `Enter` confirm · `Esc` cancel |
 | Dashboard | Type to search · `Ctrl+R` refresh · `Enter` action menu · `Ctrl+X` delete the selected visible worktree (with or without search text) · `Tab` focus the bulk-delete buttons |
 | Dashboard action menu | `Tab` switch between General and PR commands · `O` open PR · `M` merge PR · `C` close PR |
-| Shared cache | `R` refresh · `D` delete the entry |
 | Text inputs | `Ctrl`/`Alt` + `←` `→` move by word · `Ctrl+W` / `Alt+Backspace` delete word · `Ctrl+U` / `Ctrl+K` delete to the start or end of the line |
 
 **Mouse:** click buttons and rows, scroll with the wheel, and drag to select text. The selection is copied to the clipboard.
@@ -725,11 +686,10 @@ Also make sure that `gh auth status` succeeds.
 | Problem | Solution |
 | --- | --- |
 | `Current directory is not a git repository` | Run Wisetree inside a repository or one of its worktrees. |
-| `wisetree requires a TTY for interactive mode` | You are piping or redirecting. Use `create`, `dashboard`, or `cache` with flags. |
+| `wisetree requires a TTY for interactive mode` | You are piping or redirecting. Use `create` or `dashboard` with flags. |
 | No PR data on the Dashboard | Set `dashboard.showPullRequests` to `true`, install `gh`, and run `gh auth login`. |
 | `gh CLI not found - PR column hidden.` | `gh` is not on your `PATH`. |
 | Wisetree does not change your directory | Install [shell integration](#shell-integration), reload your shell, and run `wisetree` with **no arguments**. |
-| **Shared cache** is missing from the menu | It appears only when `worktreeLinkPatterns` is not empty. |
 | `Branch 'x' already exists` | Pick another name, or leave the new-branch field blank to check out an existing branch. |
 | The configuration file fails to parse | Fix the JSON at the path shown. If the broken file is the global config, you can press `R` on the error screen to reset it to the defaults. |
 
@@ -755,7 +715,7 @@ Project layout:
 | --- | --- |
 | `src/cli/` | Argument parsing and non-interactive commands. |
 | `src/tui/` | App, event loop, screens, and widgets. |
-| `src/git/`, `src/worktree/`, `src/files/` | Git operations, worktree creation and deletion, copying, and the shared cache. |
+| `src/git/`, `src/worktree/`, `src/files/` | Git operations, worktree creation and deletion, copying, and direct Mother links. |
 | `src/services/dashboard.rs` | Dashboard polling and GitHub pull request operations. |
 | `src/services/presets/` | Project setup presets and detection. |
 | `src/services/shell_integration.rs` | Installation of the shell wrapper. |

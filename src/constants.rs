@@ -15,9 +15,6 @@ pub const GLOBAL_CONFIG_DIR_NAME: &str = ".wisetree";
 /// same schema and differ only in scope, so they read as one concept.
 pub const GLOBAL_CONFIG_FILE_NAME: &str = "config.json";
 
-/// Subdirectory under `~/.wisetree/` that stores per-repository shared caches.
-pub const CACHE_DIR_NAME: &str = "cache";
-
 /// Filename of the dashboard pull-request cache.
 pub const DASHBOARD_PR_CACHE_FILE_NAME: &str = "dashboard_pr_cache.json";
 
@@ -49,11 +46,6 @@ pub fn global_config_dir() -> PathBuf {
 /// Path to the global config file (`~/.wisetree/config.json`).
 pub fn global_config_file() -> PathBuf {
     global_config_dir().join(GLOBAL_CONFIG_FILE_NAME)
-}
-
-/// Path to the cache root (`~/.wisetree/cache/`).
-pub fn global_cache_dir() -> PathBuf {
-    global_config_dir().join(CACHE_DIR_NAME)
 }
 
 /// Path to the dashboard PR cache (`~/.wisetree/dashboard_pr_cache.json`).

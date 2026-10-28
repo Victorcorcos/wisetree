@@ -77,30 +77,13 @@
         "type": "string"
       }
     },
-    "worktreeLinkCacheDir": {
-      "description": "Optional override for the shared cache root.",
-      "default": null,
-      "type": [
-        "string",
-        "null"
-      ]
-    },
     "worktreeLinkPatterns": {
-      "description": "Directory patterns to symlink into new worktrees from the shared cache.",
+      "description": "File and directory patterns to symlink directly to the Mother worktree.",
       "default": [],
       "type": "array",
       "items": {
         "type": "string"
       }
-    },
-    "worktreeLinkStrategy": {
-      "description": "Strategy used when a link pattern is missing in the source worktree.",
-      "default": "CreateEmpty",
-      "allOf": [
-        {
-          "$ref": "#/definitions/LinkStrategy"
-        }
-      ]
     },
     "worktreePathTemplate": {
       "description": "Template for worktree directory names. Variables: $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH.",
@@ -266,31 +249,6 @@
         }
       },
       "additionalProperties": false
-    },
-    "LinkStrategy": {
-      "oneOf": [
-        {
-          "description": "Create an empty cache directory and link to it.",
-          "type": "string",
-          "enum": [
-            "CreateEmpty"
-          ]
-        },
-        {
-          "description": "Seed the cache from the source worktree when present.",
-          "type": "string",
-          "enum": [
-            "SeedFromSource"
-          ]
-        },
-        {
-          "description": "Seed only when the source directory already exists.",
-          "type": "string",
-          "enum": [
-            "SeedIfPresent"
-          ]
-        }
-      ]
     }
   }
 }

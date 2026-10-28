@@ -10,7 +10,6 @@ pub enum Screen {
     Dashboard,
     GlobalAccounts,
     Delete,
-    Cache,
     MergePullRequest,
 
     Settings,
@@ -24,7 +23,6 @@ impl Screen {
             AppMode::Menu => Self::Menu,
             AppMode::Create => Self::Create,
             AppMode::Dashboard => Self::Dashboard,
-            AppMode::Cache => Self::Cache,
             AppMode::Settings => Self::Settings,
         }
     }
@@ -36,7 +34,6 @@ impl Screen {
             Self::Dashboard => "dashboard",
             Self::GlobalAccounts => "global_accounts",
             Self::Delete => "delete",
-            Self::Cache => "cache",
             Self::MergePullRequest => "merge_pull_request",
 
             Self::Settings => "settings",

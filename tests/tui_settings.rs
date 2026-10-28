@@ -144,30 +144,13 @@ fn ready_with_patterns(copy_patterns: &[&str], ignore_patterns: &[&str]) -> Sett
     SettingsScreen::new(cfg, "/tmp/.wisetree/config.json".into())
 }
 
-fn ready_with_link_settings(
-    strategy: wisetree::config::schema::LinkStrategy,
-    cache_dir: Option<&str>,
-) -> SettingsScreen {
-    let cfg = WorktreeConfig {
-        worktree_link_strategy: strategy,
-        worktree_link_cache_dir: cache_dir.map(|value| value.to_string()),
-        post_create_cmd: vec!["bun install".into()],
-        terminal_command: "code $WORKTREE_PATH".into(),
-        delete_branch_with_worktree: true,
-        ..Default::default()
-    };
-    SettingsScreen::new(cfg, "/tmp/.wisetree/config.json".into())
-}
-
 const COPY_PATTERNS_INDEX: usize = 1;
 const IGNORE_PATTERNS_INDEX: usize = 2;
-const LINK_STRATEGY_INDEX: usize = 4;
-const LINK_CACHE_DIR_INDEX: usize = 5;
-const POST_CMD_INDEX: usize = 6;
-const TERMINAL_CMD_INDEX: usize = 7;
-const PATH_TEMPLATE_INDEX: usize = 8;
-const COPY_SETTINGS_INDEX: usize = 9;
-const DELETE_BRANCH_INDEX: usize = 10;
+const POST_CMD_INDEX: usize = 4;
+const TERMINAL_CMD_INDEX: usize = 5;
+const PATH_TEMPLATE_INDEX: usize = 6;
+const COPY_SETTINGS_INDEX: usize = 7;
+const DELETE_BRANCH_INDEX: usize = 8;
 
 #[test]
 fn menu_renders_with_config_path() {
@@ -178,7 +161,8 @@ fn menu_renders_with_config_path() {
     assert!(dumped.contains("➤"));
     assert!(dumped.contains("Copy Patterns"));
     assert!(dumped.contains("Link Patterns"));
-    assert!(dumped.contains("Link Strategy"));
+    assert!(!dumped.contains("Link Strategy"));
+    assert!(!dumped.contains("Link Cache Dir"));
     assert!(dumped.contains("Copy Settings"));
     assert!(!dumped.contains("Check for Updates"));
     assert!(dumped.contains("Dashboard"));
@@ -350,119 +334,6 @@ fn ignore_patterns_enter_on_rect_starts_editing() {
     let action = s.handle_key(key(KeyCode::Enter));
     assert_eq!(action, SettingsAction::Continue);
     assert!(s.pattern_list_editor().unwrap().editing());
-}
-
-fn enter_link_strategy(s: &mut SettingsScreen) {
-    for _ in 0..LINK_STRATEGY_INDEX {
-        s.handle_key(key(KeyCode::Down));
-    }
-    s.handle_key(key(KeyCode::Enter));
-    assert_eq!(s.step(), SettingsStep::LinkStrategy);
-}
-
-fn enter_link_cache_dir(s: &mut SettingsScreen) {
-    for _ in 0..LINK_CACHE_DIR_INDEX {
-        s.handle_key(key(KeyCode::Down));
-    }
-    s.handle_key(key(KeyCode::Enter));
-    assert_eq!(s.step(), SettingsStep::LinkCacheDir);
-}
-
-#[test]
-fn link_strategy_renders_editor_and_didactic_copy() {
-    let mut s =
-        ready_with_link_settings(wisetree::config::schema::LinkStrategy::SeedFromSource, None);
-    enter_link_strategy(&mut s);
-
-    let dumped = dump(100, 18, |f| s.render(f, f.area()));
-    assert!(dumped.contains("Link Strategy"));
-    assert!(dumped.contains("Save"));
-    assert!(dumped.contains("SeedFromSource"));
-    assert!(dumped.contains("Link Options"));
-    assert!(dumped.contains("CreateEmpty"));
-    assert!(dumped.contains("SeedIfPresent"));
-    assert!(dumped.contains("Shared links let heavy dependency folders be installed once"));
-}
-
-#[test]
-fn link_strategy_save_button_emits_enum_action() {
-    let mut s =
-        ready_with_link_settings(wisetree::config::schema::LinkStrategy::SeedFromSource, None);
-    enter_link_strategy(&mut s);
-
-    let action = s.handle_key(key(KeyCode::Enter));
-    assert_eq!(
-        action,
-        SettingsAction::SaveLinkStrategy(wisetree::config::schema::LinkStrategy::SeedFromSource)
-    );
-}
-
-#[test]
-fn link_strategy_enter_on_rect_cycles_option_and_marks_modified() {
-    let mut s = ready_with_link_settings(wisetree::config::schema::LinkStrategy::CreateEmpty, None);
-    enter_link_strategy(&mut s);
-
-    s.handle_key(key(KeyCode::Up));
-    s.handle_key(key(KeyCode::Enter));
-
-    let editor = s.link_strategy_editor().expect("editor present");
-    assert_eq!(editor.value, "SeedFromSource");
-    assert_eq!(
-        editor.status,
-        wisetree::tui::screens::settings::LinkStrategyRectStatus::Modified
-    );
-}
-
-#[test]
-fn link_cache_dir_renders_editor_and_didactic_copy() {
-    let mut s = ready_with_link_settings(
-        wisetree::config::schema::LinkStrategy::CreateEmpty,
-        Some("/Volumes/cache/wisetree"),
-    );
-    enter_link_cache_dir(&mut s);
-
-    let dumped = dump(110, 20, |f| s.render(f, f.area()));
-    assert!(dumped.contains("Link Cache Dir"));
-    assert!(dumped.contains("Save"));
-    assert!(dumped.contains("/Volumes/cache/wisetree"));
-    assert!(dumped.contains("faster disk or larger volume"));
-    assert!(dumped.contains("$BASE_PATH"));
-}
-
-#[test]
-fn link_cache_dir_blank_renders_none_placeholder() {
-    let mut s = ready_with_link_settings(wisetree::config::schema::LinkStrategy::CreateEmpty, None);
-    enter_link_cache_dir(&mut s);
-
-    let buffer = render(100, 18, |f| s.render(f, f.area()));
-    assert_text_fg(&buffer, "(none)", colors::MUTED);
-}
-
-#[test]
-fn link_cache_dir_save_button_emits_string_action() {
-    let mut s = ready_with_link_settings(
-        wisetree::config::schema::LinkStrategy::CreateEmpty,
-        Some("/Volumes/cache/wisetree"),
-    );
-    enter_link_cache_dir(&mut s);
-
-    let action = s.handle_key(key(KeyCode::Enter));
-    assert_eq!(
-        action,
-        SettingsAction::SaveLinkCacheDir("/Volumes/cache/wisetree".into())
-    );
-}
-
-#[test]
-fn link_cache_dir_save_blank_emits_empty_string() {
-    let mut s = ready_with_link_settings(
-        wisetree::config::schema::LinkStrategy::CreateEmpty,
-        Some("   "),
-    );
-    enter_link_cache_dir(&mut s);
-
-    let action = s.handle_key(key(KeyCode::Enter));
-    assert_eq!(action, SettingsAction::SaveLinkCacheDir(String::new()));
 }
 
 #[test]

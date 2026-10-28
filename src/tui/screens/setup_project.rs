@@ -1019,7 +1019,7 @@ impl SetupProjectScreen {
                 Style::default().fg(colors::MUTED),
             )),
             Line::from(Span::styled(
-                "Shared cache links default to SeedFromSource so an installed source checkout can seed later worktrees.",
+                "Link patterns share Mother's existing files and folders directly with child worktrees.",
                 Style::default().fg(colors::MUTED),
             )),
             Line::from(Span::styled(
@@ -1128,7 +1128,7 @@ impl SetupProjectScreen {
 
         frame.render_widget(
             Paragraph::new(
-                "Shared cache links will set worktreeLinkStrategy to SeedFromSource, reusing installed dependency directories across worktrees.",
+                "Link patterns share Mother's existing files and folders directly with every child worktree. Edits are shared in both directions.",
             )
             .style(Style::default().fg(colors::MUTED).add_modifier(Modifier::DIM)),
             chunks[1],

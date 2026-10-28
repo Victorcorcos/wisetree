@@ -857,10 +857,8 @@ impl CreateScreen {
 
                 if self.summary_rows.is_empty() {
                     frame.render_widget(
-                        Paragraph::new(
-                            "No copy, shared cache link, or post-create steps were configured.",
-                        )
-                        .style(Style::default().fg(colors::MUTED)),
+                        Paragraph::new("No copy, link, or post-create steps were configured.")
+                            .style(Style::default().fg(colors::MUTED)),
                         chunks[2],
                     );
                 } else {

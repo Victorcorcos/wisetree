@@ -11,8 +11,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::messages::{
-    colors, MENU_CACHE, MENU_CREATE, MENU_DASHBOARD, MENU_EXIT, MENU_GLOBAL_DASHBOARD,
-    MENU_SETTINGS, MENU_SETUP, MENU_TITLE,
+    colors, MENU_CREATE, MENU_DASHBOARD, MENU_EXIT, MENU_GLOBAL_DASHBOARD, MENU_SETTINGS,
+    MENU_SETUP, MENU_TITLE,
 };
 use crate::tui::router::Screen;
 use crate::tui::widgets::welcome_header::{fold_home, WelcomeHeader};
@@ -22,7 +22,6 @@ use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt, SelectStyle
 pub enum MenuChoice {
     Setup,
     Create,
-    Cache,
     Dashboard,
     GlobalDashboard,
     Settings,
@@ -48,7 +47,6 @@ impl MenuScreen {
         default_index: usize,
         git_root: Option<String>,
         shell_installed: Option<bool>,
-        has_cache_entry: bool,
     ) -> Self {
         let has_setup_entry = matches!(shell_installed, Some(false));
         let mut options: Vec<SelectOption<MenuChoice>> = Vec::new();
@@ -65,9 +63,6 @@ impl MenuScreen {
             MENU_GLOBAL_DASHBOARD,
             MenuChoice::GlobalDashboard,
         ));
-        if has_cache_entry {
-            options.push(SelectOption::new(MENU_CACHE, MenuChoice::Cache));
-        }
         options.push(SelectOption::new(MENU_SETTINGS, MenuChoice::Settings));
         options.push(SelectOption::new(MENU_EXIT, MenuChoice::Exit));
 

@@ -3,7 +3,7 @@ use std::fs;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use tempfile::TempDir;
-use wisetree::config::{LinkStrategy, WorktreeConfig};
+use wisetree::config::WorktreeConfig;
 use wisetree::constants::local_config_file;
 use wisetree::git::types::WorktreeCreateOptions;
 use wisetree::worktree::WorktreeService;
@@ -307,12 +307,13 @@ fn create_worktree_populates_link_report_when_link_patterns_enabled() {
     with_isolated_home(|| {
         let body = async {
             let fx = build_fixture();
+            fs::create_dir_all(fx.repo.join("node_modules/pkg")).unwrap();
+            fs::write(fx.repo.join("node_modules/pkg/index.js"), "initial").unwrap();
             let mut svc = WorktreeService::new(Some(fx.repo.clone()));
             svc.initialize().await.expect("init");
             svc.config_service_mut().update(|c| {
                 c.worktree_copy_patterns = Vec::new();
                 c.worktree_link_patterns = vec!["node_modules".to_string()];
-                c.worktree_link_strategy = LinkStrategy::CreateEmpty;
             });
 
             let opts = WorktreeCreateOptions {
@@ -338,6 +339,61 @@ fn create_worktree_populates_link_report_when_link_patterns_enabled() {
                 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
                 assert!(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0);
             }
+            let mut child_svc = WorktreeService::new(Some(outcome.worktree_path.clone()));
+            child_svc.initialize().await.unwrap();
+            child_svc.config_service_mut().update(|config| {
+                config.worktree_link_patterns = vec!["node_modules".into()];
+            });
+            let sibling = child_svc
+                .create_worktree(
+                    &WorktreeCreateOptions {
+                        name: "linked-sibling".into(),
+                        source_branch: "main".into(),
+                        new_branch: "linked-sibling".into(),
+                        base_path: String::new(),
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                fs::read_link(sibling.worktree_path.join("node_modules")).unwrap(),
+                fx.repo.join("node_modules").canonicalize().unwrap()
+            );
+            fs::write(
+                outcome.worktree_path.join("node_modules/pkg/index.js"),
+                "child edit",
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(fx.repo.join("node_modules/pkg/index.js")).unwrap(),
+                "child edit"
+            );
+            assert_eq!(
+                fs::read_to_string(sibling.worktree_path.join("node_modules/pkg/index.js"))
+                    .unwrap(),
+                "child edit"
+            );
+            fs::write(fx.repo.join("node_modules/pkg/index.js"), "mother edit").unwrap();
+            assert_eq!(
+                fs::read_to_string(sibling.worktree_path.join("node_modules/pkg/index.js"))
+                    .unwrap(),
+                "mother edit"
+            );
+            svc.delete_worktree(&outcome.worktree_path.to_string_lossy(), true)
+                .await
+                .unwrap();
+            assert!(!outcome.worktree_path.exists());
+            assert_eq!(
+                fs::read_to_string(fx.repo.join("node_modules/pkg/index.js")).unwrap(),
+                "mother edit"
+            );
+            assert_eq!(
+                fs::read_to_string(sibling.worktree_path.join("node_modules/pkg/index.js"))
+                    .unwrap(),
+                "mother edit"
+            );
         };
         tokio::runtime::Runtime::new().unwrap().block_on(body);
     });
