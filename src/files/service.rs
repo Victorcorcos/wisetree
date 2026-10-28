@@ -80,7 +80,16 @@ pub async fn copy_files(
         &config.worktree_copy_ignores,
     );
 
+    let linked_paths =
+        super::links::expand_source_patterns(source_dir, &config.worktree_link_patterns);
     for rel in files {
+        if linked_paths
+            .iter()
+            .any(|linked| Path::new(&rel).starts_with(linked))
+        {
+            report.skipped.push(rel);
+            continue;
+        }
         let source_path = source_dir.join(&rel);
         let target_path = target_dir.join(&rel);
 
@@ -115,6 +124,7 @@ pub async fn copy_files(
                     &mut report,
                     &config.worktree_copy_ignores,
                     source_dir,
+                    &linked_paths,
                 )
                 .await;
             }
@@ -204,6 +214,7 @@ async fn copy_directory_recursive(
     report: &mut CopyReport,
     ignores: &[String],
     base_root: &Path,
+    linked_paths: &[String],
 ) {
     if let Err(e) = tokio::fs::create_dir_all(target_dir).await {
         report
@@ -233,7 +244,11 @@ async fn copy_directory_recursive(
                     .map(|p| p.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_else(|_| source_path.to_string_lossy().into_owned());
 
-                if should_ignore_file(&relative, ignores) {
+                if should_ignore_file(&relative, ignores)
+                    || linked_paths
+                        .iter()
+                        .any(|linked| Path::new(&relative).starts_with(linked))
+                {
                     report.skipped.push(relative);
                     continue;
                 }
@@ -269,6 +284,7 @@ async fn copy_directory_recursive(
                     report,
                     ignores,
                     base_root,
+                    linked_paths,
                 ))
                 .await;
             }

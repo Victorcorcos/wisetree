@@ -15,7 +15,6 @@ pub enum AppMode {
     Menu,
     Create,
     Dashboard,
-    Cache,
     Settings,
 }
 
@@ -25,7 +24,6 @@ impl AppMode {
             Self::Menu => "menu",
             Self::Create => "create",
             Self::Dashboard => "dashboard",
-            Self::Cache => "cache",
             Self::Settings => "settings",
         }
     }
@@ -35,28 +33,7 @@ impl AppMode {
             "menu" => Some(Self::Menu),
             "create" => Some(Self::Create),
             "dashboard" => Some(Self::Dashboard),
-            "cache" => Some(Self::Cache),
             "settings" => Some(Self::Settings),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheAction {
-    List,
-    Prune,
-    Clear,
-    Path,
-}
-
-impl CacheAction {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "list" => Some(Self::List),
-            "prune" => Some(Self::Prune),
-            "clear" => Some(Self::Clear),
-            "path" => Some(Self::Path),
             _ => None,
         }
     }
@@ -67,7 +44,6 @@ impl CacheAction {
 pub enum CliCommand {
     Create,
     Dashboard,
-    Cache { action: CacheAction },
 }
 
 /// Flags supplied alongside a non-interactive subcommand.
@@ -79,7 +55,6 @@ pub struct CliArgs {
     pub branch: Option<String>,
     pub json: bool,
     pub watch: bool,
-    pub force: bool,
 }
 
 /// Result of parsing the process command line. The dispatcher acts on this.
@@ -134,7 +109,6 @@ where
     let mut branch: Option<String> = None;
     let mut json = false;
     let mut watch = false;
-    let mut force = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -146,7 +120,6 @@ where
             "--from-wrapper" => from_wrapper = true,
             "--json" => json = true,
             "-w" | "--watch" => watch = true,
-            "-f" | "--force" => force = true,
             "-m" | "--mode" => {
                 mode_arg = Some(parse_value_arg(&raw, &mut i, token, "--mode")?);
             }
@@ -198,24 +171,13 @@ where
         }
     }
 
-    let cache_action = positional
-        .get(1)
-        .and_then(|value| CacheAction::parse(value));
-
     // Detect non-interactive CLI subcommand.
     let cli_command = match mode {
         AppMode::Create => Some(CliCommand::Create),
         AppMode::Dashboard => Some(CliCommand::Dashboard),
-        AppMode::Cache => cache_action.map(|action| CliCommand::Cache { action }),
         _ => None,
     };
-    let has_cli_flags = name.is_some()
-        || source.is_some()
-        || branch.is_some()
-        || json
-        || watch
-        || force
-        || cache_action.is_some();
+    let has_cli_flags = name.is_some() || source.is_some() || branch.is_some() || json || watch;
 
     let cli_args = match mode {
         AppMode::Create | AppMode::Dashboard => match (cli_command, has_cli_flags) {
@@ -226,19 +188,9 @@ where
                 branch,
                 json,
                 watch,
-                force,
             }),
             _ => None,
         },
-        AppMode::Cache => cli_command.map(|cmd| CliArgs {
-            command: cmd,
-            name,
-            source,
-            branch,
-            json,
-            watch,
-            force,
-        }),
         _ => None,
     };
 
@@ -284,7 +236,6 @@ Usage:\n  wisetree [command] [options]\n\n\
 Commands:\n  \
 create     Create a new worktree\n  \
 dashboard  Live worktree dashboard\n  \
-cache      Inspect or clean the shared dependency cache\n  \
 settings   Manage configuration\n  \
 (no command) Start interactive menu\n\n\
 Interactive Options:\n  \
@@ -296,30 +247,19 @@ Non-Interactive Options:\n  \
 -n, --name <name>      Worktree directory name (create)\n  \
 -s, --source <branch>  Source branch (create)\n  \
 -b, --branch <branch>  New branch name; defaults to source (create)\n  \
--f, --force            Skip confirmation for cache clear\n  \
 --json                 Output as JSON (dashboard)\n  \
 -w, --watch            Stream JSON Lines (dashboard)\n\n\
-Cache Subcommands:\n  \
-wisetree cache list    Show cache entries and users\n  \
-wisetree cache prune   Remove orphaned cache entries older than 14 days\n  \
-wisetree cache clear   Delete the entire cache for this repo (requires --force)\n  \
-wisetree cache path    Print the cache root path\n\n\
 Interactive Examples:\n  \
 wisetree                # Start interactive menu\n  \
 wisetree create         # Go directly to create worktree flow\n  \
 wisetree dashboard      # Open the live dashboard\n  \
 wisetree --from-wrapper # Used by shell wrapper to enable directory switching\n  \
-wisetree cache          # Open the shared cache screen\n  \
 wisetree settings       # Open settings menu\n\n\
 Non-Interactive Examples:\n  \
 wisetree create -n my-feature -s main              # Create worktree from main\n  \
 wisetree create -n my-feature -s main -b feat/foo  # Create with new branch\n  \
-wisetree cache list --json                         # Show cache details as JSON\n  \
-wisetree cache clear --force                       # Remove this repo's shared cache\n\n\
 wisetree dashboard --json                          # Snapshot dashboard as JSON\n  \
 wisetree dashboard --watch                         # Stream dashboard snapshots\n\n\
-wisetree cache list --json                         # Show cache details as JSON\n  \
-wisetree cache clear --force                       # Remove this repo's shared cache\n\n\
 Shell Integration:\n  \
 Run 'wisetree' and select \"Setup Shell Integration\" to enable quick directory switching.\n  \
 After setup, just run 'wisetree' to quickly change to any worktree directory.\n\n\

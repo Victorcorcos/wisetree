@@ -5,7 +5,7 @@
 use assert_cmd::Command;
 use predicates::str::contains;
 use tempfile::TempDir;
-use wisetree::config::{LinkStrategy, WorktreeConfig};
+use wisetree::config::WorktreeConfig;
 
 mod support;
 
@@ -151,10 +151,12 @@ fn dashboard_json_outputs_array_with_expected_length() {
 }
 
 #[test]
-fn cache_list_json_outputs_object() {
+fn create_links_folders_directly_to_mother() {
     let fx = repo_with_commit();
     let home = isolated_home();
 
+    std::fs::create_dir_all(fx.repo.join("node_modules/pkg")).unwrap();
+    std::fs::write(fx.repo.join("node_modules/pkg/index.js"), "original").unwrap();
     let config_path = fx.repo.join(".wisetree").join("config.json");
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
     std::fs::write(
@@ -162,7 +164,6 @@ fn cache_list_json_outputs_object() {
         serde_json::to_string_pretty(&WorktreeConfig {
             worktree_copy_patterns: Vec::new(),
             worktree_link_patterns: vec!["node_modules".into()],
-            worktree_link_strategy: LinkStrategy::CreateEmpty,
             ..WorktreeConfig::default()
         })
         .unwrap(),
@@ -171,25 +172,23 @@ fn cache_list_json_outputs_object() {
 
     Command::cargo_bin("wisetree")
         .unwrap()
-        .args(["create", "-n", "feat-cache", "-s", "main"])
+        .args(["create", "-n", "feat-link", "-s", "main"])
         .current_dir(&fx.repo)
         .env("HOME", home.path())
         .assert()
         .success();
 
-    let output = Command::cargo_bin("wisetree")
-        .unwrap()
-        .args(["cache", "list", "--json"])
-        .current_dir(&fx.repo)
-        .env("HOME", home.path())
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let parsed: serde_json::Value = serde_json::from_slice(&output).expect("valid json");
-    assert!(parsed.is_object(), "expected JSON object, got {parsed:?}");
-    assert!(parsed["entries"].is_array());
+    let child = fx.repo.with_file_name("repo.worktree").join("feat-link");
+    assert_eq!(
+        std::fs::read_link(child.join("node_modules")).unwrap(),
+        fx.repo.join("node_modules").canonicalize().unwrap()
+    );
+    std::fs::write(child.join("node_modules/pkg/index.js"), "child edit").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fx.repo.join("node_modules/pkg/index.js")).unwrap(),
+        "child edit"
+    );
+    assert!(!home.path().join(".wisetree/cache").exists());
 }
 
 #[test]

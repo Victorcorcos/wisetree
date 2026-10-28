@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
 use tempfile::TempDir;
-use wisetree::config::schema::{clamp_dashboard_refresh_interval, LinkStrategy};
+use wisetree::config::schema::clamp_dashboard_refresh_interval;
 use wisetree::config::{ConfigService, WorktreeConfig};
 
 const BASIC_CONFIG_KEYS: &[&str] = &[
@@ -13,9 +13,7 @@ const BASIC_CONFIG_KEYS: &[&str] = &[
     "terminalCommand",
     "worktreeCopyIgnores",
     "worktreeCopyPatterns",
-    "worktreeLinkCacheDir",
     "worktreeLinkPatterns",
-    "worktreeLinkStrategy",
     "worktreePathTemplate",
 ];
 const BASIC_DASHBOARD_KEYS: &[&str] = &["columns", "refreshIntervalMs", "showPullRequests"];
@@ -29,9 +27,7 @@ const SCHEMA_CONFIG_KEYS: &[&str] = &[
     "terminalCommand",
     "worktreeCopyIgnores",
     "worktreeCopyPatterns",
-    "worktreeLinkCacheDir",
     "worktreeLinkPatterns",
-    "worktreeLinkStrategy",
     "worktreePathTemplate",
 ];
 
@@ -80,14 +76,28 @@ fn project_config(root: &std::path::Path) -> std::path::PathBuf {
 fn link_fields_round_trip() {
     let cfg = WorktreeConfig {
         worktree_link_patterns: vec!["node_modules".into(), "target".into()],
-        worktree_link_strategy: LinkStrategy::SeedIfPresent,
-        worktree_link_cache_dir: Some("$BASE_PATH/.cache/wisetree".into()),
         ..WorktreeConfig::default()
     };
 
     let raw = serde_json::to_string(&cfg).unwrap();
     let round_trip: WorktreeConfig = serde_json::from_str(&raw).unwrap();
     assert_eq!(round_trip, cfg);
+}
+
+#[test]
+fn obsolete_cache_settings_are_ignored_and_omitted_on_save() {
+    let config: WorktreeConfig = serde_json::from_str(
+        r#"{
+        "worktreeLinkPatterns": [".env", "node_modules"],
+        "worktreeLinkStrategy": "SeedFromSource",
+        "worktreeLinkCacheDir": "/old/cache"
+    }"#,
+    )
+    .unwrap();
+    assert_eq!(config.worktree_link_patterns, vec![".env", "node_modules"]);
+    let saved = serde_json::to_value(config).unwrap();
+    assert!(saved.get("worktreeLinkStrategy").is_none());
+    assert!(saved.get("worktreeLinkCacheDir").is_none());
 }
 
 #[test]

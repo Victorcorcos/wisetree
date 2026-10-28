@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::config::schema::{DashboardConfig, LinkStrategy, WorktreeConfig};
+use crate::config::schema::{DashboardConfig, WorktreeConfig};
 use crate::messages::colors;
 
 use crate::tui::widgets::{
@@ -30,8 +30,6 @@ pub enum SettingsStep {
     SetupProject,
     CopyPatterns,
     LinkPatterns,
-    LinkStrategy,
-    LinkCacheDir,
     IgnorePatterns,
     PathTemplate,
     Dashboard,
@@ -65,8 +63,6 @@ pub enum SettingsAction {
     SavePostCreateCommands(Vec<String>),
     SaveTerminalCommand(String),
     SavePathTemplate(String),
-    SaveLinkStrategy(LinkStrategy),
-    SaveLinkCacheDir(String),
     SaveDashboard(Box<DashboardConfig>),
 
     CopySettings(CopyDirection),
@@ -421,119 +417,6 @@ impl PathTemplateEditor {
 
     fn template_to_save(&self) -> String {
         self.template.trim().to_string()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkStrategyRectStatus {
-    Unchanged,
-    Modified,
-    Saved,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkStrategySelection {
-    Rect,
-    Save,
-}
-
-pub struct LinkStrategyEditor {
-    pub value: String,
-    pub status: LinkStrategyRectStatus,
-    pub selection: LinkStrategySelection,
-}
-
-impl LinkStrategyEditor {
-    pub fn new(strategy: LinkStrategy) -> Self {
-        Self {
-            value: link_strategy_label(strategy).to_string(),
-            status: LinkStrategyRectStatus::Saved,
-            selection: LinkStrategySelection::Save,
-        }
-    }
-
-    fn move_up(&mut self) {
-        if matches!(self.selection, LinkStrategySelection::Save) {
-            self.selection = LinkStrategySelection::Rect;
-        }
-    }
-
-    fn move_down(&mut self) {
-        if matches!(self.selection, LinkStrategySelection::Rect) {
-            self.selection = LinkStrategySelection::Save;
-        }
-    }
-
-    fn strategy_to_save(&self) -> LinkStrategy {
-        parse_link_strategy(&self.value).unwrap_or(LinkStrategy::CreateEmpty)
-    }
-
-    fn toggle_value(&mut self) {
-        let next = match self.strategy_to_save() {
-            LinkStrategy::CreateEmpty => LinkStrategy::SeedFromSource,
-            LinkStrategy::SeedFromSource => LinkStrategy::SeedIfPresent,
-            LinkStrategy::SeedIfPresent => LinkStrategy::CreateEmpty,
-        };
-        self.value = link_strategy_label(next).to_string();
-        self.status = LinkStrategyRectStatus::Modified;
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkCacheDirRectStatus {
-    Unchanged,
-    Editing,
-    Modified,
-    Saved,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkCacheDirSelection {
-    Rect,
-    Save,
-}
-
-pub struct LinkCacheDirEditor {
-    pub value: String,
-    pub status: LinkCacheDirRectStatus,
-    pub selection: LinkCacheDirSelection,
-    edit_backup: Option<(String, LinkCacheDirRectStatus)>,
-}
-
-impl LinkCacheDirEditor {
-    pub fn new(value: Option<String>) -> Self {
-        let value = value.unwrap_or_default();
-        let status = if value.is_empty() {
-            LinkCacheDirRectStatus::Unchanged
-        } else {
-            LinkCacheDirRectStatus::Saved
-        };
-        Self {
-            value,
-            status,
-            selection: LinkCacheDirSelection::Save,
-            edit_backup: None,
-        }
-    }
-
-    pub fn editing(&self) -> bool {
-        self.status == LinkCacheDirRectStatus::Editing
-    }
-
-    fn move_up(&mut self) {
-        if matches!(self.selection, LinkCacheDirSelection::Save) {
-            self.selection = LinkCacheDirSelection::Rect;
-        }
-    }
-
-    fn move_down(&mut self) {
-        if matches!(self.selection, LinkCacheDirSelection::Rect) {
-            self.selection = LinkCacheDirSelection::Save;
-        }
-    }
-
-    fn cache_dir_to_save(&self) -> String {
-        self.value.trim().to_string()
     }
 }
 
@@ -971,8 +854,6 @@ enum SettingsMouseTarget {
     PostCmdCreate,
     PostCmdSave,
     TerminalCmdSave,
-    LinkStrategySave,
-    LinkCacheDirSave,
     DashboardSave,
 
     PathTemplateSave,
@@ -1067,9 +948,6 @@ pub struct SettingsScreen {
     terminal_cmd_input: Option<InputPrompt>,
     path_template_editor: Option<PathTemplateEditor>,
     path_template_input: Option<InputPrompt>,
-    link_strategy_editor: Option<LinkStrategyEditor>,
-    link_cache_dir_editor: Option<LinkCacheDirEditor>,
-    link_cache_dir_input: Option<InputPrompt>,
     dashboard_editor: Option<DashboardEditor>,
     dashboard_input: Option<InputPrompt>,
 
@@ -1097,9 +975,6 @@ impl SettingsScreen {
             terminal_cmd_input: None,
             path_template_editor: None,
             path_template_input: None,
-            link_strategy_editor: None,
-            link_cache_dir_editor: None,
-            link_cache_dir_input: None,
             dashboard_editor: None,
             dashboard_input: None,
 
@@ -1152,14 +1027,6 @@ impl SettingsScreen {
         self.path_template_editor.as_ref()
     }
 
-    pub fn link_strategy_editor(&self) -> Option<&LinkStrategyEditor> {
-        self.link_strategy_editor.as_ref()
-    }
-
-    pub fn link_cache_dir_editor(&self) -> Option<&LinkCacheDirEditor> {
-        self.link_cache_dir_editor.as_ref()
-    }
-
     pub fn dashboard_editor(&self) -> Option<&DashboardEditor> {
         self.dashboard_editor.as_ref()
     }
@@ -1197,9 +1064,6 @@ impl SettingsScreen {
         self.terminal_cmd_input = None;
         self.path_template_editor = None;
         self.path_template_input = None;
-        self.link_strategy_editor = None;
-        self.link_cache_dir_editor = None;
-        self.link_cache_dir_input = None;
         self.dashboard_editor = None;
         self.dashboard_input = None;
 
@@ -1255,21 +1119,6 @@ impl SettingsScreen {
         self.step = SettingsStep::Menu;
     }
 
-    pub fn mark_link_strategy_saved(&mut self, strategy: LinkStrategy) {
-        self.config.worktree_link_strategy = strategy;
-        self.select = Some(self.build_menu());
-        self.link_strategy_editor = None;
-        self.step = SettingsStep::Menu;
-    }
-
-    pub fn mark_link_cache_dir_saved(&mut self, cache_dir: Option<String>) {
-        self.config.worktree_link_cache_dir = cache_dir;
-        self.select = Some(self.build_menu());
-        self.link_cache_dir_editor = None;
-        self.link_cache_dir_input = None;
-        self.step = SettingsStep::Menu;
-    }
-
     /// Mirror a successful dashboard save back into the settings menu.
     pub fn mark_dashboard_saved(&mut self, dashboard: DashboardConfig) {
         self.config.dashboard = dashboard;
@@ -1302,14 +1151,6 @@ impl SettingsScreen {
             ),
             SelectOption::new("Link Patterns", SettingsStep::LinkPatterns).with_description(
                 format!("{} patterns", self.config.worktree_link_patterns.len()),
-            ),
-            SelectOption::new("Link Strategy", SettingsStep::LinkStrategy)
-                .with_description(link_strategy_label(self.config.worktree_link_strategy)),
-            SelectOption::new("Link Cache Dir", SettingsStep::LinkCacheDir).with_description(
-                self.config
-                    .worktree_link_cache_dir
-                    .clone()
-                    .unwrap_or_else(|| "(default)".to_string()),
             ),
             SelectOption::new("Post-Create Commands", SettingsStep::PostCmd)
                 .with_description(format!("{} commands", self.config.post_create_cmd.len())),
@@ -1370,8 +1211,6 @@ impl SettingsScreen {
             SettingsStep::CopySettings => self.handle_copy_settings(key),
             SettingsStep::PostCmd => self.handle_post_cmd(key),
             SettingsStep::TerminalCmd => self.handle_terminal_cmd(key),
-            SettingsStep::LinkStrategy => self.handle_link_strategy(key),
-            SettingsStep::LinkCacheDir => self.handle_link_cache_dir(key),
             SettingsStep::PathTemplate => self.handle_path_template(key),
             SettingsStep::Dashboard => self.handle_dashboard(key),
         }
@@ -1419,15 +1258,6 @@ impl SettingsScreen {
                         if matches!(value, SettingsStep::TerminalCmd) {
                             self.terminal_cmd_editor =
                                 Some(TerminalCmdEditor::new(self.config.terminal_command.clone()));
-                        }
-                        if matches!(value, SettingsStep::LinkStrategy) {
-                            self.link_strategy_editor =
-                                Some(LinkStrategyEditor::new(self.config.worktree_link_strategy));
-                        }
-                        if matches!(value, SettingsStep::LinkCacheDir) {
-                            self.link_cache_dir_editor = Some(LinkCacheDirEditor::new(
-                                self.config.worktree_link_cache_dir.clone(),
-                            ));
                         }
                         if matches!(value, SettingsStep::PathTemplate) {
                             self.path_template_editor = Some(PathTemplateEditor::new(
@@ -1522,18 +1352,6 @@ impl SettingsScreen {
                 }
                 self.handle_terminal_cmd(enter)
             }
-            SettingsMouseTarget::LinkStrategySave => {
-                if let Some(editor) = self.link_strategy_editor.as_mut() {
-                    editor.selection = LinkStrategySelection::Save;
-                }
-                self.handle_link_strategy(enter)
-            }
-            SettingsMouseTarget::LinkCacheDirSave => {
-                if let Some(editor) = self.link_cache_dir_editor.as_mut() {
-                    editor.selection = LinkCacheDirSelection::Save;
-                }
-                self.handle_link_cache_dir(enter)
-            }
             SettingsMouseTarget::DashboardSave => {
                 if let Some(editor) = self.dashboard_editor.as_mut() {
                     editor.selection = DashboardSelection::Save;
@@ -1590,15 +1408,6 @@ impl SettingsScreen {
                 if matches!(value, SettingsStep::TerminalCmd) {
                     self.terminal_cmd_editor =
                         Some(TerminalCmdEditor::new(self.config.terminal_command.clone()));
-                }
-                if matches!(value, SettingsStep::LinkStrategy) {
-                    self.link_strategy_editor =
-                        Some(LinkStrategyEditor::new(self.config.worktree_link_strategy));
-                }
-                if matches!(value, SettingsStep::LinkCacheDir) {
-                    self.link_cache_dir_editor = Some(LinkCacheDirEditor::new(
-                        self.config.worktree_link_cache_dir.clone(),
-                    ));
                 }
                 if matches!(value, SettingsStep::PathTemplate) {
                     self.path_template_editor = Some(PathTemplateEditor::new(
@@ -2088,169 +1897,6 @@ impl SettingsScreen {
         }
     }
 
-    fn handle_link_strategy(&mut self, key: KeyEvent) -> SettingsAction {
-        let editor = match self.link_strategy_editor.as_mut() {
-            Some(e) => e,
-            None => {
-                self.step = SettingsStep::Menu;
-                return SettingsAction::Continue;
-            }
-        };
-
-        match key.code {
-            KeyCode::Esc => {
-                self.link_strategy_editor = None;
-                self.step = SettingsStep::Menu;
-                SettingsAction::Continue
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                editor.move_up();
-                SettingsAction::Continue
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                editor.move_down();
-                SettingsAction::Continue
-            }
-            KeyCode::Enter => match editor.selection {
-                LinkStrategySelection::Rect => {
-                    editor.toggle_value();
-                    SettingsAction::Continue
-                }
-                LinkStrategySelection::Save => {
-                    SettingsAction::SaveLinkStrategy(editor.strategy_to_save())
-                }
-            },
-            _ => SettingsAction::Continue,
-        }
-    }
-
-    fn handle_link_cache_dir(&mut self, key: KeyEvent) -> SettingsAction {
-        let is_editing = self
-            .link_cache_dir_editor
-            .as_ref()
-            .map(|e| e.editing())
-            .unwrap_or(false);
-        if is_editing {
-            return self.handle_link_cache_dir_editing(key);
-        }
-
-        let editor = match self.link_cache_dir_editor.as_mut() {
-            Some(e) => e,
-            None => {
-                self.step = SettingsStep::Menu;
-                return SettingsAction::Continue;
-            }
-        };
-
-        let mut start_editing = false;
-        let action = match key.code {
-            KeyCode::Esc => {
-                self.link_cache_dir_editor = None;
-                self.link_cache_dir_input = None;
-                self.step = SettingsStep::Menu;
-                SettingsAction::Continue
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                editor.move_up();
-                SettingsAction::Continue
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                editor.move_down();
-                SettingsAction::Continue
-            }
-            KeyCode::Enter => match editor.selection {
-                LinkCacheDirSelection::Rect => {
-                    start_editing = true;
-                    SettingsAction::Continue
-                }
-                LinkCacheDirSelection::Save => {
-                    SettingsAction::SaveLinkCacheDir(editor.cache_dir_to_save())
-                }
-            },
-            _ => SettingsAction::Continue,
-        };
-
-        if start_editing {
-            self.start_link_cache_dir_editing();
-        }
-
-        action
-    }
-
-    fn start_link_cache_dir_editing(&mut self) {
-        let editor = match self.link_cache_dir_editor.as_mut() {
-            Some(editor) => editor,
-            None => return,
-        };
-        editor.selection = LinkCacheDirSelection::Rect;
-        editor.edit_backup = Some((editor.value.clone(), editor.status));
-        editor.status = LinkCacheDirRectStatus::Editing;
-        self.link_cache_dir_input = Some(build_link_cache_dir_input(&editor.value));
-    }
-
-    fn handle_link_cache_dir_editing(&mut self, key: KeyEvent) -> SettingsAction {
-        let (outcome, current_value) = match self.link_cache_dir_input.as_mut() {
-            Some(prompt) => {
-                let outcome = prompt.handle_key(key);
-                let current_value = prompt.value.clone();
-                (outcome, current_value)
-            }
-            None => {
-                if let Some(editor) = self.link_cache_dir_editor.as_mut() {
-                    editor.status = LinkCacheDirRectStatus::Unchanged;
-                    editor.edit_backup = None;
-                }
-                return SettingsAction::Continue;
-            }
-        };
-
-        match outcome {
-            InputOutcome::Cancelled => {
-                let editor = match self.link_cache_dir_editor.as_mut() {
-                    Some(editor) => editor,
-                    None => return SettingsAction::Continue,
-                };
-                if let Some((value, prior)) = editor.edit_backup.take() {
-                    editor.value = value;
-                    editor.status = prior;
-                } else {
-                    editor.status = LinkCacheDirRectStatus::Unchanged;
-                }
-                self.link_cache_dir_input = None;
-                SettingsAction::Continue
-            }
-            InputOutcome::Submitted(value) => {
-                let editor = match self.link_cache_dir_editor.as_mut() {
-                    Some(editor) => editor,
-                    None => return SettingsAction::Continue,
-                };
-                let next_status = editor
-                    .edit_backup
-                    .take()
-                    .map(|(original, prior)| {
-                        if value == original {
-                            prior
-                        } else {
-                            LinkCacheDirRectStatus::Modified
-                        }
-                    })
-                    .unwrap_or(LinkCacheDirRectStatus::Modified);
-                editor.value = value;
-                editor.status = next_status;
-                self.link_cache_dir_input = None;
-                SettingsAction::Continue
-            }
-            InputOutcome::Pending => {
-                let editor = match self.link_cache_dir_editor.as_mut() {
-                    Some(editor) => editor,
-                    None => return SettingsAction::Continue,
-                };
-                editor.value = current_value;
-                SettingsAction::Continue
-            }
-        }
-    }
-
     fn handle_path_template(&mut self, key: KeyEvent) -> SettingsAction {
         let is_editing = self
             .path_template_editor
@@ -2590,8 +2236,6 @@ impl SettingsScreen {
             SettingsStep::SetupProject => 6,
             SettingsStep::CopyPatterns => self.pattern_list_preferred_height(),
             SettingsStep::LinkPatterns => self.pattern_list_preferred_height(),
-            SettingsStep::LinkStrategy => self.link_strategy_preferred_height(),
-            SettingsStep::LinkCacheDir => self.link_cache_dir_preferred_height(),
             SettingsStep::IgnorePatterns => self.pattern_list_preferred_height(),
             SettingsStep::Dashboard => self.dashboard_preferred_height(),
 
@@ -2643,21 +2287,6 @@ impl SettingsScreen {
         count + 10
     }
 
-    fn link_strategy_preferred_height(&self) -> u16 {
-        // Title + description + 1 rectangle (3 rows) + per-field hint
-        // + blank line + section title + 3 option lines + spacer (1) +
-        // Save button (3 rows) + footer blurb + saving-to line + footer
-        // hint.
-        18
-    }
-
-    fn link_cache_dir_preferred_height(&self) -> u16 {
-        // Title + description + 1 rectangle (3 rows) + per-field hint
-        // + blank line + section title + 4 didactic lines + spacer (1)
-        // + Save button (3 rows) + saving-to line + footer hint.
-        18
-    }
-
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         self.mouse_targets.borrow_mut().clear();
         if let Some(err) = &self.error {
@@ -2669,8 +2298,6 @@ impl SettingsScreen {
             SettingsStep::SetupProject => self.render_menu(frame, area),
             SettingsStep::CopyPatterns => self.render_copy_patterns(frame, area),
             SettingsStep::LinkPatterns => self.render_link_patterns(frame, area),
-            SettingsStep::LinkStrategy => self.render_link_strategy(frame, area),
-            SettingsStep::LinkCacheDir => self.render_link_cache_dir(frame, area),
             SettingsStep::IgnorePatterns => self.render_ignore_patterns(frame, area),
             SettingsStep::PathTemplate => self.render_path_template(frame, area),
             SettingsStep::Dashboard => self.render_dashboard(frame, area),
@@ -2766,10 +2393,10 @@ impl SettingsScreen {
             frame,
             area,
             "Link Patterns",
-            "Directories shared through Wisetree's dependency cache instead of duplicated per worktree:",
+            "Files and folders symlinked directly to the Mother worktree:",
             "worktreeLinkPatterns",
             colors::BRAND,
-            Some("These are usually heavy dependency folders like node_modules, target, vendor, or .venv that you want to install once and reuse."),
+            Some("Share node_modules, .env, or **/config/application.yml. Edits affect Mother and all linked children. Missing sources are skipped."),
         );
     }
 
@@ -2848,375 +2475,6 @@ impl SettingsScreen {
             "↑↓ move • Enter edit/Save • Esc back"
         };
         frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[7]);
-    }
-
-    fn render_link_strategy(&self, frame: &mut Frame, area: Rect) {
-        let editor = match &self.link_strategy_editor {
-            Some(e) => e,
-            None => return,
-        };
-
-        let title_style = Style::default()
-            .fg(colors::INFO)
-            .add_modifier(Modifier::BOLD);
-        let muted_style = Style::default().fg(colors::MUTED);
-        let info_style = Style::default().fg(colors::INFO);
-        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line("Link Strategy", title_style))),
-            chunks[0],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "How Wisetree prepares the shared cache before linking it into each worktree:",
-                muted_style,
-            ))),
-            chunks[1],
-        );
-
-        let is_selected = matches!(editor.selection, LinkStrategySelection::Rect);
-        let is_focused = is_selected;
-        let border_color = match editor.status {
-            LinkStrategyRectStatus::Unchanged => colors::WHITE,
-            LinkStrategyRectStatus::Modified => colors::ACCENT,
-            LinkStrategyRectStatus::Saved => colors::SUCCESS,
-        };
-        let show_selection_marker = is_selected;
-        let content_style = if is_focused {
-            Style::default()
-                .fg(colors::WHITE)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(colors::WHITE)
-        };
-        let border_style = Style::default().fg(border_color);
-        let inner_line = Line::from(Span::styled(editor.value.clone(), content_style));
-        let title_line = if show_selection_marker {
-            Line::from(vec![
-                Span::styled(
-                    POST_CMD_SELECTION_MARKER,
-                    Style::default().fg(colors::ACCENT),
-                ),
-                Span::styled("worktreeLinkStrategy ", info_style),
-            ])
-        } else {
-            Line::from(Span::styled(" worktreeLinkStrategy ", info_style))
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .border_style(border_style)
-            .padding(Padding::horizontal(1))
-            .title(title_line);
-        frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
-
-        let hint_line = Line::from(vec![
-            Span::styled("  ↳ ", muted_style),
-            Span::styled(
-                "Press Enter to cycle between the three strategies",
-                muted_style,
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
-
-        frame.render_widget(Paragraph::new(""), chunks[4]);
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line("Link Options", info_style))),
-            chunks[5],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "  • CreateEmpty: start with an empty shared directory; installs fill it later.",
-                muted_style,
-            ))),
-            chunks[6],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "  • SeedFromSource: seed the cache from this checkout first, then reuse it.",
-                muted_style,
-            ))),
-            chunks[7],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "  • SeedIfPresent: only link when the source directory already exists locally.",
-                muted_style,
-            ))),
-            chunks[8],
-        );
-
-        self.render_link_strategy_save_button(frame, chunks[10], editor);
-
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "Shared links let heavy dependency folders be installed once and reused across worktrees.",
-                dim_muted_style,
-            ))),
-            chunks[11],
-        );
-
-        let target = self.config_path.clone();
-        let saving_line = Line::from(vec![
-            Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
-            Span::styled(target, Style::default().fg(colors::EMPHASIS)),
-        ]);
-        frame.render_widget(Paragraph::new(saving_line), chunks[12]);
-
-        let hint = "↑↓ to move • Enter to toggle/Save • Esc to go back";
-        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[13]);
-    }
-
-    fn render_link_cache_dir(&self, frame: &mut Frame, area: Rect) {
-        let editor = match &self.link_cache_dir_editor {
-            Some(e) => e,
-            None => return,
-        };
-
-        let title_style = Style::default()
-            .fg(colors::INFO)
-            .add_modifier(Modifier::BOLD);
-        let muted_style = Style::default().fg(colors::MUTED);
-        let info_style = Style::default().fg(colors::INFO);
-        let dim_muted_style = muted_style.add_modifier(Modifier::DIM);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(3),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line("Link Cache Dir", title_style))),
-            chunks[0],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "Optional override for the shared dependency cache root:",
-                muted_style,
-            ))),
-            chunks[1],
-        );
-
-        let is_editing = editor.editing();
-        let is_selected = matches!(editor.selection, LinkCacheDirSelection::Rect);
-        let is_focused = is_selected || is_editing;
-        let border_color = match editor.status {
-            LinkCacheDirRectStatus::Unchanged => colors::WHITE,
-            LinkCacheDirRectStatus::Editing => colors::WARNING,
-            LinkCacheDirRectStatus::Modified => colors::ACCENT,
-            LinkCacheDirRectStatus::Saved => colors::SUCCESS,
-        };
-        let show_selection_marker = is_selected && !is_editing;
-        let content_style = if is_focused {
-            Style::default()
-                .fg(colors::WHITE)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(colors::WHITE)
-        };
-        let border_style = Style::default().fg(border_color);
-        let inner_line = if is_editing {
-            self.link_cache_dir_input
-                .as_ref()
-                .map(|prompt| prompt.inline_line())
-                .unwrap_or_else(|| Line::from(Span::raw(editor.value.clone())))
-        } else if editor.value.is_empty() {
-            let placeholder = Style::default()
-                .fg(colors::MUTED)
-                .add_modifier(Modifier::DIM);
-            Line::from(Span::styled("(none)", placeholder))
-        } else {
-            Line::from(Span::styled(editor.value.clone(), content_style))
-        };
-        let title_line = if show_selection_marker {
-            Line::from(vec![
-                Span::styled(
-                    POST_CMD_SELECTION_MARKER,
-                    Style::default().fg(colors::ACCENT),
-                ),
-                Span::styled("worktreeLinkCacheDir ", info_style),
-            ])
-        } else {
-            Line::from(Span::styled(" worktreeLinkCacheDir ", info_style))
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .border_style(border_style)
-            .padding(Padding::horizontal(1))
-            .title(title_line);
-        frame.render_widget(Paragraph::new(inner_line).block(block), chunks[2]);
-
-        let hint_line = Line::from(vec![
-            Span::styled("  ↳ ", muted_style),
-            Span::styled(
-                "Leave blank to use Wisetree's default per-repository cache root",
-                muted_style,
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(hint_line), chunks[3]);
-
-        frame.render_widget(Paragraph::new(""), chunks[4]);
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line("Why this exists:", info_style))),
-            chunks[5],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "  • The shared cache avoids reinstalling heavy dependencies in every worktree.",
-                muted_style,
-            ))),
-            chunks[6],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "  • Override it when you want the cache on a faster disk or larger volume.",
-                muted_style,
-            ))),
-            chunks[7],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "  • Default: ~/.wisetree/cache/<repo-id>",
-                muted_style,
-            ))),
-            chunks[8],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(branded_line(
-                "  • Variables: $BASE_PATH, $WORKTREE_PATH, $BRANCH_NAME, $SOURCE_BRANCH",
-                muted_style,
-            ))),
-            chunks[9],
-        );
-
-        self.render_link_cache_dir_save_button(frame, chunks[11], editor);
-
-        let target = self.config_path.clone();
-        let saving_line = Line::from(vec![
-            Span::styled("Saving to: ", Style::default().fg(colors::MUTED)),
-            Span::styled(target, Style::default().fg(colors::EMPHASIS)),
-        ]);
-        frame.render_widget(Paragraph::new(saving_line), chunks[12]);
-
-        let hint = if is_editing {
-            "Editing: same cursor shortcuts as other inputs. Enter confirms, Esc cancels"
-        } else {
-            "↑↓ to move • Enter to edit/Save • Esc to go back"
-        };
-        frame.render_widget(Paragraph::new(hint).style(dim_muted_style), chunks[13]);
-    }
-
-    fn render_link_strategy_save_button(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        editor: &LinkStrategyEditor,
-    ) {
-        let save_label = "Save";
-        let save_width = save_label.chars().count() as u16 + 4;
-        let side = area.width.saturating_sub(save_width) / 2;
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(side),
-                Constraint::Length(save_width),
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        let save_selected = editor.selection == LinkStrategySelection::Save;
-        let save_text_style = if save_selected {
-            Style::default()
-                .fg(colors::WHITE)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(colors::MUTED)
-        };
-        let save_border = Style::default().fg(colors::SUCCESS);
-
-        let save_box = Paragraph::new(Line::from(Span::styled(save_label, save_text_style))).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Plain)
-                .border_style(save_border)
-                .padding(Padding::horizontal(1)),
-        );
-        frame.render_widget(save_box, cols[1]);
-        self.push_mouse_target(SettingsMouseTarget::LinkStrategySave, cols[1]);
-    }
-
-    fn render_link_cache_dir_save_button(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        editor: &LinkCacheDirEditor,
-    ) {
-        let save_label = "Save";
-        let save_width = save_label.chars().count() as u16 + 4;
-        let side = area.width.saturating_sub(save_width) / 2;
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(side),
-                Constraint::Length(save_width),
-                Constraint::Min(0),
-            ])
-            .split(area);
-
-        let save_selected = editor.selection == LinkCacheDirSelection::Save;
-        let save_text_style = if save_selected {
-            Style::default()
-                .fg(colors::WHITE)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(colors::MUTED)
-        };
-        let save_border = Style::default().fg(colors::SUCCESS);
-
-        let save_box = Paragraph::new(Line::from(Span::styled(save_label, save_text_style))).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Plain)
-                .border_style(save_border)
-                .padding(Padding::horizontal(1)),
-        );
-        frame.render_widget(save_box, cols[1]);
-        self.push_mouse_target(SettingsMouseTarget::LinkCacheDirSave, cols[1]);
     }
 
     fn render_pattern_list_save_button(
@@ -4154,14 +3412,6 @@ Safety features:\n\
     }
 }
 
-fn link_strategy_label(strategy: LinkStrategy) -> &'static str {
-    match strategy {
-        LinkStrategy::CreateEmpty => "CreateEmpty",
-        LinkStrategy::SeedFromSource => "SeedFromSource",
-        LinkStrategy::SeedIfPresent => "SeedIfPresent",
-    }
-}
-
 fn render_pattern_list_block(
     frame: &mut Frame,
     area: Rect,
@@ -4281,20 +3531,6 @@ fn pattern_list_cursor_line(text: &str, col: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-fn parse_link_strategy(value: &str) -> Option<LinkStrategy> {
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "createempty" | "create_empty" | "create-empty" => Some(LinkStrategy::CreateEmpty),
-        "seedfromsource" | "seed_from_source" | "seed-from-source" => {
-            Some(LinkStrategy::SeedFromSource)
-        }
-        "seedifpresent" | "seed_if_present" | "seed-if-present" => {
-            Some(LinkStrategy::SeedIfPresent)
-        }
-        _ => None,
-    }
-}
-
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -4308,12 +3544,6 @@ fn build_post_cmd_input(value: &str) -> InputPrompt {
 fn build_terminal_cmd_input(value: &str) -> InputPrompt {
     InputPrompt::new("")
         .with_placeholder("Type command (e.g. code $WORKTREE_PATH)")
-        .with_default(value.to_string())
-}
-
-fn build_link_cache_dir_input(value: &str) -> InputPrompt {
-    InputPrompt::new("")
-        .with_placeholder("Leave blank for ~/.wisetree/cache/<repo-id>")
         .with_default(value.to_string())
 }
 
