@@ -125,6 +125,37 @@ fn select_source_branch_advances_to_new_branch_with_directory_default() {
 }
 
 #[test]
+fn source_branch_search_selects_exact_match_before_fuzzy_matches() {
+    let mut s = CreateScreen::new();
+    let remote = branches().pop().unwrap();
+    s.set_branches(
+        [
+            "remote/feat/menu-integration",
+            "remote/fix/maintain-index",
+            "remote/main",
+        ]
+        .into_iter()
+        .map(|name| GitBranch {
+            name: name.into(),
+            ..remote.clone()
+        })
+        .collect(),
+    );
+    type_str(&mut s, "my-worktree");
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), CreateStep::SourceBranch);
+    type_str(&mut s, "remote/main");
+    let rendered = dump(100, 16, |f| s.render(f, f.area()));
+    assert!(
+        rendered.find("remote/main (remote)").unwrap()
+            < rendered.find("remote/feat/menu-integration").unwrap()
+    );
+    s.handle_key(key(KeyCode::Enter));
+    assert_eq!(s.step(), CreateStep::NewBranch);
+    assert_eq!(s.source_branch, "remote/main");
+}
+
+#[test]
 fn custom_ref_path_takes_user_to_input() {
     let mut s = ready_screen();
     type_str(&mut s, "feat-login");
