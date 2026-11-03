@@ -29,13 +29,11 @@ use crate::messages::{
     DELETE_UNMERGED_TITLE, DELETE_UNMERGED_WARNING, DELETE_WARNING, LOADING_WORKTREES,
 };
 use crate::services::DashboardRepository;
-use crate::tui::widgets::delete_progress::{
-    DeleteProgress, DeleteProgressItem, DeleteProgressStatus,
-};
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
     branded_line, BulkConfirmDialog, BulkConfirmItem, BulkConfirmOutcome, ConfirmVariant,
-    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, Status, StatusIndicator,
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, LoadingPage, LoadingStep, Status,
+    StatusIndicator, StepStatus,
 };
 
 const BULK_DELETE_CONFIRM_PROMPT: &str = "Are you sure you want to delete all these worktrees?";
@@ -99,7 +97,8 @@ pub struct DeleteScreen {
     /// that should be surfaced after the run completes.
     bulk_warnings: Vec<String>,
     progress_started: Option<Instant>,
-    finished_items: Vec<(DeleteOutcome, Option<String>)>,
+    /// Finish times delimit the duration of each sequential deletion.
+    finished_items: Vec<(DeleteOutcome, Option<String>, Instant)>,
     pub tick: usize,
 }
 
@@ -338,10 +337,10 @@ impl DeleteScreen {
 
     /// Keep the service result for every finished target, including branch warnings.
     pub fn record_item_outcome(&mut self, outcome: DeleteOutcome, warning: Option<String>) {
-        self.finished_items.push((outcome, warning));
+        self.finished_items.push((outcome, warning, Instant::now()));
     }
 
-    fn progress_items(&self) -> Vec<DeleteProgressItem> {
+    fn progress_steps(&self) -> Vec<LoadingStep> {
         let paths: Vec<&str> = if self.is_bulk() {
             self.bulk_paths.iter().map(String::as_str).collect()
         } else {
@@ -369,49 +368,71 @@ impl DeleteScreen {
                     }
                     None => label,
                 };
-                let status = if let Some((outcome, warning)) = self.finished_items.get(index) {
-                    if outcome.worktree_deleted {
-                        DeleteProgressStatus::Deleted {
-                            note: warning.clone().unwrap_or_else(|| {
-                                if outcome.branch_deleted {
-                                    progress_messages::BRANCH_DELETED
-                                } else {
-                                    progress_messages::BRANCH_KEPT
-                                }
-                                .to_string()
-                            }),
-                            warning: warning.is_some(),
-                        }
+                let started = match index {
+                    0 => self.progress_started,
+                    _ => self.finished_items.get(index - 1).map(|item| item.2),
+                };
+                if let Some((outcome, warning, finished)) = self.finished_items.get(index) {
+                    let step = if !outcome.worktree_deleted {
+                        LoadingStep::new(label, StepStatus::Failed)
+                            .note(warning.clone().unwrap_or_default())
+                    } else if let Some(warning) = warning {
+                        LoadingStep::new(label, StepStatus::Warning).note(warning.clone())
                     } else {
-                        DeleteProgressStatus::Failed(warning.clone().unwrap_or_default())
-                    }
+                        LoadingStep::new(label, StepStatus::Done).note(if outcome.branch_deleted {
+                            progress_messages::BRANCH_DELETED
+                        } else {
+                            progress_messages::BRANCH_KEPT
+                        })
+                    };
+                    step.duration(started.map(|started| finished.duration_since(started)))
                 } else if let Some(error) = &self.error {
                     if index == self.finished_items.len() {
-                        DeleteProgressStatus::Failed(error.clone())
+                        LoadingStep::new(label, StepStatus::Failed).note(error.clone())
                     } else {
-                        DeleteProgressStatus::Skipped
+                        LoadingStep::new(label, StepStatus::Skipped)
+                            .note(progress_messages::SKIPPED)
                     }
                 } else if index == self.finished_items.len() {
-                    DeleteProgressStatus::Running
+                    LoadingStep::new(label, StepStatus::Running)
+                        .duration(started.map(|started| started.elapsed()))
                 } else {
-                    DeleteProgressStatus::Pending
-                };
-                DeleteProgressItem { label, status }
+                    LoadingStep::new(label, StepStatus::Pending)
+                }
             })
             .collect()
     }
 
-    fn render_progress(&self, frame: &mut Frame, area: Rect) {
-        DeleteProgress {
-            items: &self.progress_items(),
-            elapsed: self
-                .progress_started
-                .map(|start| start.elapsed())
-                .unwrap_or_default(),
-            tick: self.tick,
-            error: self.error.as_deref(),
+    fn progress_page<'a>(&self, steps: &'a [LoadingStep]) -> LoadingPage<'a> {
+        let count = |status: StepStatus| steps.iter().filter(|s| s.status == status).count();
+        let warnings = count(StepStatus::Warning);
+        let remaining = count(StepStatus::Pending) + count(StepStatus::Running);
+        let page = LoadingPage::new(progress_messages::header(steps.len()))
+            .tick(self.tick)
+            .steps(steps)
+            .tally(
+                count(StepStatus::Done) + warnings,
+                progress_messages::DELETED,
+                colors::SUCCESS,
+            )
+            .tally(
+                warnings,
+                progress_messages::warnings(warnings),
+                colors::WARNING,
+            )
+            .tally(remaining, progress_messages::REMAINING, colors::INFO);
+        match (&self.error, self.progress_started) {
+            (Some(error), _) => page
+                .error(error.clone())
+                .hint(progress_messages::ERROR_HINT),
+            (None, Some(started)) => page.elapsed(started.elapsed()),
+            (None, None) => page,
         }
-        .render(frame, area);
+    }
+
+    fn render_progress(&self, frame: &mut Frame, area: Rect) {
+        let steps = self.progress_steps();
+        self.progress_page(&steps).render(frame, area);
     }
 
     /// Marks the bulk run as finished. Transitions to `Success` and
@@ -710,10 +731,8 @@ impl DeleteScreen {
         if self.progress_started.is_some()
             && (self.step == DeleteStep::Deleting || self.error.is_some())
         {
-            return DeleteProgress::preferred_content_height(
-                self.progress_items().len(),
-                self.error.is_some(),
-            );
+            let steps = self.progress_steps();
+            return self.progress_page(&steps).content_height();
         }
         if self.loading || self.error.is_some() {
             return 4;
@@ -738,8 +757,8 @@ impl DeleteScreen {
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if self.loading {
-            StatusIndicator::new(Status::Loading, LOADING_WORKTREES)
-                .with_tick(self.tick)
+            LoadingPage::new(LOADING_WORKTREES)
+                .tick(self.tick)
                 .render(frame, area);
             return;
         }
@@ -843,5 +862,43 @@ impl DeleteScreen {
             Some(o) => self.success_message_for(o),
             None => DELETE_SUCCESS.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn sequential_deletions_keep_each_duration_and_branch_warning() {
+        let mut screen = DeleteScreen::new(true);
+        screen.bulk_paths = vec![
+            "/tmp/first".into(),
+            "/tmp/second".into(),
+            "/tmp/third".into(),
+        ];
+        screen.bulk_total = 3;
+        let started = Instant::now() - Duration::from_secs(10);
+        screen.progress_started = Some(started);
+        let deleted = DeleteOutcome {
+            worktree_deleted: true,
+            ..Default::default()
+        };
+        screen.record_item_outcome(deleted.clone(), None);
+        screen.record_item_outcome(deleted, Some("branch could not be deleted".into()));
+        // Pin finish times so durations are checked without sleeps or timing tolerances.
+        screen.finished_items[0].2 = started + Duration::from_secs(2);
+        screen.finished_items[1].2 = started + Duration::from_secs(5);
+
+        let steps = screen.progress_steps();
+        assert_eq!(steps[0].status, StepStatus::Done);
+        assert_eq!(steps[0].note, progress_messages::BRANCH_KEPT);
+        assert_eq!(steps[0].duration, Some(Duration::from_secs(2)));
+        assert_eq!(steps[1].status, StepStatus::Warning);
+        assert_eq!(steps[1].note, "branch could not be deleted");
+        assert_eq!(steps[1].duration, Some(Duration::from_secs(3)));
+        assert_eq!(steps[2].status, StepStatus::Running);
+        assert!(steps[2].duration.unwrap() >= Duration::from_secs(5));
     }
 }

@@ -191,6 +191,8 @@ pub mod colors {
     pub const STATUS_BG: Color = BG_SELECTED;
     /// Status bar foreground.
     pub const STATUS_TEXT: Color = GRAY_LIGHT;
+    /// Quiet track behind the loading page's accent-colored progress.
+    pub const PROGRESS_TRACK: Color = Color::Rgb(0x4a, 0x4b, 0x43);
 }
 
 // Global Dashboard GitHub setup
@@ -234,16 +236,38 @@ pub mod delete_progress {
         format!("Deleting {count} {label}")
     }
 
-    pub fn tally(deleted: usize, warnings: usize, remaining: usize) -> String {
-        let label = if warnings == 1 { "warning" } else { "warnings" };
-        format!("{deleted} deleted · {warnings} {label} · {remaining} remaining")
-    }
+    pub const DELETED: &str = "deleted";
+    pub const REMAINING: &str = "remaining";
 
+    pub fn warnings(count: usize) -> &'static str {
+        if count == 1 {
+            "warning"
+        } else {
+            "warnings"
+        }
+    }
+}
+
+/// Shared copy for the loading page.
+pub mod loading_page {
     pub fn more(count: usize, above: bool) -> String {
         let arrow = if above { "↑" } else { "↓" };
         format!("{arrow} {count} more")
     }
+
+    pub fn time_left(estimate: &str) -> String {
+        format!("~{estimate} left")
+    }
+
+    pub fn starting_mode(mode: &str) -> String {
+        format!("Starting in {mode} mode")
+    }
 }
+
+pub const LOADING_POST_CREATE_COMMANDS: &str = "Running post-create commands";
+pub const LOADING_SHELL_INSTALL: &str = "Installing shell integration...";
+pub const LOADING_WISE_PRESET: &str = "Wise Preset is researching the repository...";
+pub const LOADING_WISE_PRESET_DETAIL: &str = "Scanning nested apps and framework-specific folders.";
 
 // Global Dashboard filter preview
 pub const GLOBAL_FILTER_BUTTON: &str = "Filter";

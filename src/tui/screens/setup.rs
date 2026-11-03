@@ -22,8 +22,8 @@ use ratatui::Frame;
 use crate::messages::colors;
 use crate::services::{Shell, ShellIntegrationStatus};
 use crate::tui::widgets::{
-    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, SelectOption, SelectOutcome,
-    SelectPrompt, Status, StatusIndicator,
+    ConfirmationChoice, ConfirmationModal, ConfirmationOutcome, LoadingPage, SelectOption,
+    SelectOutcome, SelectPrompt, Status, StatusIndicator,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,8 +289,8 @@ impl SetupScreen {
                 }
             }
             SetupStep::Installing => {
-                StatusIndicator::new(Status::Loading, "Installing shell integration...")
-                    .with_tick(self.tick)
+                LoadingPage::new(crate::messages::LOADING_SHELL_INSTALL)
+                    .tick(self.tick)
                     .render(frame, area);
             }
             SetupStep::Success => self.render_success(frame, area),

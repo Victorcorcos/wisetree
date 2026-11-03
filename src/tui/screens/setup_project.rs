@@ -30,8 +30,7 @@ use ratatui::Frame;
 use crate::messages::colors;
 use crate::services::presets::{catalog, detect, Preset, PresetId, WisePresetDiscovery};
 use crate::tui::widgets::{
-    branded_line, ConfirmationChoice, SelectOption, SelectOutcome, SelectPrompt, Status,
-    StatusIndicator,
+    branded_line, ConfirmationChoice, LoadingPage, SelectOption, SelectOutcome, SelectPrompt,
 };
 
 const WISE_PRESET_LIST_LABEL: &str = "Wise Preset";
@@ -944,7 +943,7 @@ impl SetupProjectScreen {
                 let rows = self.select.options.len().min(12) as u16;
                 3 + rows + 5
             }
-            SetupProjectStep::Discovering => 3,
+            SetupProjectStep::Discovering => self.discovering_page().content_height(),
             SetupProjectStep::Confirm => 20,
         }
     }
@@ -1036,29 +1035,13 @@ impl SetupProjectScreen {
         self.confirm_block_rects
             .set([Rect::default(); CONFIRM_BLOCK_COUNT]);
         self.confirm_button_rects.set([Rect::default(); 2]);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(0),
-            ])
-            .split(area);
+        self.discovering_page().render(frame, area);
+    }
 
-        StatusIndicator::new(
-            Status::Loading,
-            "Wise Preset is researching the repository...",
-        )
-        .with_tick(self.tick)
-        .render(frame, chunks[0]);
-        frame.render_widget(
-            Paragraph::new("Scanning nested apps and framework-specific folders.").style(
-                Style::default()
-                    .fg(colors::MUTED)
-                    .add_modifier(Modifier::DIM),
-            ),
-            chunks[1],
-        );
+    fn discovering_page(&self) -> LoadingPage<'static> {
+        LoadingPage::new(crate::messages::LOADING_WISE_PRESET)
+            .tick(self.tick)
+            .detail(crate::messages::LOADING_WISE_PRESET_DETAIL)
     }
 
     fn render_confirm(&self, frame: &mut Frame, area: Rect) {

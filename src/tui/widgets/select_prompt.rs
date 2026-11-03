@@ -174,7 +174,9 @@ impl<T: Clone> SelectPrompt<T> {
     }
 
     /// Indices of the options that survive the current search, in display
-    /// order. Callers that mirror the rendered list (to map `selected` back to
+    /// order: exact labels, prefixes, substrings, contiguous query tokens,
+    /// then fuzzy matches. Ties retain the original option order.
+    /// Callers that mirror the rendered list (to map `selected` back to
     /// an original option) must use this rather than re-implementing it.
     pub fn filtered_indices(&self) -> Vec<usize> {
         if !self.searchable || self.query().is_empty() {
@@ -185,7 +187,9 @@ impl<T: Clone> SelectPrompt<T> {
         if tokens.is_empty() {
             return (0..self.options.len()).collect();
         }
-        self.options
+        let query = query.trim();
+        let mut matches: Vec<_> = self
+            .options
             .iter()
             .enumerate()
             .filter_map(|(i, o)| {
@@ -199,12 +203,28 @@ impl<T: Clone> SelectPrompt<T> {
                     }
                 }
                 let haystack = haystack.to_lowercase();
-                tokens
-                    .iter()
-                    .all(|token| fuzzy_matches(&haystack, token))
-                    .then_some(i)
+                if !tokens.iter().all(|token| fuzzy_matches(&haystack, token)) {
+                    return None;
+                }
+                // Rank labels separately so row numbers and descriptions cannot
+                // hide an exact label match. Fuzzy matching stays a fallback.
+                let label = o.label.to_lowercase();
+                let rank = if label == query {
+                    0
+                } else if label.starts_with(query) {
+                    1
+                } else if label.contains(query) {
+                    2
+                } else if tokens.iter().all(|token| haystack.contains(token)) {
+                    3
+                } else {
+                    4
+                };
+                Some((rank, i))
             })
-            .collect()
+            .collect();
+        matches.sort_by_key(|&(rank, _)| rank);
+        matches.into_iter().map(|(_, i)| i).collect()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SelectOutcome<T> {
@@ -684,6 +704,53 @@ mod tests {
         options.push(SelectOption::new("Feat-5.6 Bug", 4023).with_description("Remote origin"));
         options.push(SelectOption::new("Shared cache", 4024).with_description("Local storage"));
         SelectPrompt::new("Select cache:", options).search_description()
+    }
+
+    #[test]
+    fn search_ranks_exact_prefix_and_substring_before_fuzzy_matches() {
+        let mut prompt = SelectPrompt::new(
+            "Select source branch:",
+            vec![
+                SelectOption::new("remote/feat/menu-integration", 0),
+                SelectOption::new("archive/remote/main", 1),
+                SelectOption::new("remote/main-backup", 2),
+                SelectOption::new("remote/main", 3).with_description("remote"),
+                SelectOption::new("remote/main-next", 4),
+            ],
+        )
+        .searchable();
+        prompt.set_query("  REMOTE/MAIN  ");
+        assert_eq!(prompt.filtered_indices(), vec![3, 2, 4, 1, 0]);
+        assert!(matches!(
+            prompt.handle_key(key(KeyCode::Enter)),
+            SelectOutcome::Selected(3, 3)
+        ));
+        prompt.handle_key(key(KeyCode::Down));
+        assert!(matches!(
+            prompt.handle_key(key(KeyCode::Enter)),
+            SelectOutcome::Selected(2, 2)
+        ));
+        prompt.set_query("");
+        assert_eq!(prompt.filtered_indices(), vec![0, 1, 2, 3, 4]);
+        prompt.set_query("   ");
+        assert_eq!(prompt.filtered_indices(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn search_ranks_contiguous_tokens_before_fuzzy_tokens() {
+        let mut prompt = SelectPrompt::new(
+            "Select provider:",
+            vec![
+                SelectOption::new("File Store", 0).with_description("Local storage"),
+                SelectOption::new("Local", 1).with_description("FileStore"),
+                SelectOption::new("FileStore Local", 2),
+            ],
+        )
+        .search_description();
+        prompt.set_query("local filestore");
+        assert_eq!(prompt.filtered_indices(), vec![1, 2, 0]);
+        prompt.set_query("local");
+        assert_eq!(prompt.filtered_indices(), vec![1, 2, 0]);
     }
 
     #[test]

@@ -32,7 +32,7 @@ use crate::services::CheckStatus;
 use crate::tui::screens::dashboard::MergePullRequestRequest;
 use crate::tui::widgets::{
     labeled_line, labeled_spans, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
-    PrConfirmView, Status, StatusIndicator,
+    LoadingPage, PrConfirmView,
 };
 
 const MERGE_LOADING_MESSAGE: &str = "Loading pull request details...";
@@ -293,8 +293,8 @@ impl MergePullRequestScreen {
         }
         match self.step {
             MergeStep::Loading => {
-                StatusIndicator::new(Status::Loading, MERGE_LOADING_MESSAGE)
-                    .with_tick(self.tick)
+                LoadingPage::new(MERGE_LOADING_MESSAGE)
+                    .tick(self.tick)
                     .render(frame, area);
             }
             MergeStep::Merging => {
@@ -303,8 +303,8 @@ impl MergePullRequestScreen {
                 } else {
                     MERGE_RUNNING_MESSAGE
                 };
-                StatusIndicator::new(Status::Loading, message)
-                    .with_tick(self.tick)
+                LoadingPage::new(message)
+                    .tick(self.tick)
                     .render(frame, area);
             }
             MergeStep::Confirm | MergeStep::ConfirmPush => self.render_confirm(frame, area),
