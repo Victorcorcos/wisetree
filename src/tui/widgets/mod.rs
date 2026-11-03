@@ -5,11 +5,10 @@
 
 pub mod border;
 pub mod bulk_confirm_dialog;
-pub mod command_list_progress;
 pub mod command_progress;
 pub mod confirmation_modal;
-pub mod delete_progress;
 pub mod input_prompt;
+pub mod loading_page;
 pub mod pr_confirm;
 pub mod scrollbar;
 pub mod select_prompt;
@@ -23,10 +22,10 @@ pub use border::BorderState;
 pub use bulk_confirm_dialog::{
     BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome, ConfirmVariant,
 };
-pub use command_list_progress::CommandListProgress;
 pub use command_progress::CommandProgress;
 pub use confirmation_modal::{ConfirmationChoice, ConfirmationModal, ConfirmationOutcome};
 pub use input_prompt::{InputOutcome, InputPrompt};
+pub use loading_page::{LoadingPage, LoadingStep, StepStatus};
 pub use pr_confirm::{
     code_lines, code_spans, code_style, labeled_line, labeled_spans, will_run_lines, PrConfirmView,
 };

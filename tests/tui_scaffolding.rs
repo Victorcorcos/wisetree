@@ -50,7 +50,7 @@ fn loading_screen_renders_spinner_and_mode() {
         .map(|c| c.symbol())
         .collect::<String>();
     assert!(dump.contains("Loading git information"));
-    assert!(dump.contains("(menu)"));
+    assert!(dump.contains("Starting in menu mode"));
 }
 
 #[test]

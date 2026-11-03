@@ -24,8 +24,7 @@ use crate::services::{
 use crate::tui::widgets::welcome_header::fold_home;
 use crate::tui::widgets::{
     code_spans, code_style, fuzzy_matches, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Status,
-    StatusIndicator,
+    ConfirmationOutcome, InputPrompt, LoadingPage, SelectOption, SelectOutcome, SelectPrompt,
 };
 
 const SELECT_MARKER: &str = " ➤ ";
@@ -770,8 +769,8 @@ impl DashboardScreen {
             } else {
                 area
             };
-            StatusIndicator::new(Status::Loading, "Loading dashboard...")
-                .with_tick(self.tick)
+            LoadingPage::new("Loading dashboard...")
+                .tick(self.tick)
                 .render(frame, loading_area);
             if self.scope == DashboardScope::Global {
                 self.render_status_banner(

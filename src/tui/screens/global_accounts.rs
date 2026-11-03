@@ -8,8 +8,7 @@ use ratatui::Frame;
 
 use crate::messages::{self, colors};
 use crate::services::global_dashboard::github::{AccountDiscovery, GitHubError};
-use crate::tui::screens::loading::spinner_frames;
-use crate::tui::widgets::{SelectOption, SelectOutcome, SelectPrompt};
+use crate::tui::widgets::{LoadingPage, SelectOption, SelectOutcome, SelectPrompt};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum GlobalAccountsAction {
@@ -146,8 +145,13 @@ impl GlobalAccountsScreen {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let loading_page = LoadingPage::new(messages::GLOBAL_ACCOUNTS_LOADING).tick(self.tick);
         let chunks = Layout::vertical([
-            Constraint::Length(u16::from(self.loading)),
+            Constraint::Length(if self.loading {
+                loading_page.content_height()
+            } else {
+                0
+            }),
             Constraint::Min(0),
             Constraint::Length(if self.error.is_some() { 3 } else { 0 }),
             Constraint::Length(u16::from(self.warning.is_some())),
@@ -155,12 +159,7 @@ impl GlobalAccountsScreen {
         ])
         .split(area);
         if self.loading {
-            let spinner = spinner_frames()[self.tick % spinner_frames().len()];
-            frame.render_widget(
-                Paragraph::new(format!("{spinner} {}", messages::GLOBAL_ACCOUNTS_LOADING))
-                    .style(Style::default().fg(colors::INFO)),
-                chunks[0],
-            );
+            loading_page.render(frame, chunks[0]);
         }
         self.select.render(frame, chunks[1]);
         if let Some(error) = &self.error {

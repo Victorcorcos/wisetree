@@ -1,30 +1,28 @@
 //! Full-screen loading splash. Shown during `WorktreeService::initialize`.
 
-use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::layout::Rect;
 use ratatui::Frame;
 
-use crate::messages::{colors, LOADING_GIT_INFO};
+use crate::messages::{loading_page, LOADING_GIT_INFO};
+use crate::tui::widgets::LoadingPage;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn draw(frame: &mut Frame, area: Rect, tick: usize, mode: &str) {
-    let frame_idx = tick % SPINNER_FRAMES.len();
-    let line = Line::from(vec![
-        Span::styled(
-            SPINNER_FRAMES[frame_idx],
-            Style::default()
-                .fg(colors::PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::raw(LOADING_GIT_INFO),
-        Span::raw(format!(" ({mode})")),
-    ]);
-    let paragraph = Paragraph::new(line).alignment(Alignment::Center);
-    frame.render_widget(paragraph, area);
+    let page = LoadingPage::new(LOADING_GIT_INFO)
+        .tick(tick)
+        .detail(loading_page::starting_mode(mode));
+    let width = area.width.min(56);
+    let height = area.height.min(page.content_height());
+    page.render(
+        frame,
+        Rect {
+            x: area.x + (area.width - width) / 2,
+            y: area.y + (area.height - height) / 2,
+            width,
+            height,
+        },
+    );
 }
 
 pub fn spinner_frames() -> &'static [&'static str] {

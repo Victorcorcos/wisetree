@@ -5,6 +5,7 @@
 //! `post_create_progress`, `mark_complete`, and `set_error` setters.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -19,11 +20,12 @@ use crate::messages::{
     colors, CREATE_CONFIRM_TITLE, CREATE_CREATING, CREATE_DIRECTORY_PLACEHOLDER,
     CREATE_DIRECTORY_PROMPT, CREATE_NAVIGATE_PROMPT, CREATE_NAVIGATE_TITLE,
     CREATE_NEW_BRANCH_PLACEHOLDER, CREATE_SOURCE_BRANCH_PROMPT, CREATE_SUCCESS, LOADING_BRANCHES,
+    LOADING_POST_CREATE_COMMANDS,
 };
 use crate::tui::widgets::{
-    branded_line, render_summary_table, CommandListProgress, ConfirmationChoice, ConfirmationModal,
-    ConfirmationOutcome, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt,
-    Status, StatusIndicator, SummaryRow,
+    branded_line, render_summary_table, ConfirmationChoice, ConfirmationModal, ConfirmationOutcome,
+    InputOutcome, InputPrompt, LoadingPage, LoadingStep, SelectOption, SelectOutcome, SelectPrompt,
+    Status, StatusIndicator, StepStatus, SummaryRow,
 };
 use crate::utils::validation::{
     normalize_branch_name, validate_branch_name, validate_directory_name, validate_source_ref,
@@ -114,8 +116,7 @@ pub struct CreateScreen {
     /// path from the template.
     created_worktree_path: Option<String>,
 
-    // Post-create progress (CommandListProgress is built each render from
-    // these slices).
+    // Post-create progress (loading-page steps are built each render from these slices).
     pub post_create_commands: Vec<String>,
     pub completed_commands: Vec<String>,
     pub failed_commands: Vec<String>,
@@ -133,6 +134,9 @@ pub struct CreateScreen {
     /// the live tail (default); a positive value holds the view in place as
     /// new output streams in so the user can read earlier command output.
     terminal_scroll: u16,
+
+    /// When creation began, for the loading page's clock.
+    creating_started: Option<Instant>,
 
     pub tick: usize,
 }
@@ -163,6 +167,7 @@ impl CreateScreen {
             summary_rows: Vec::new(),
             terminal_log: Vec::new(),
             terminal_scroll: 0,
+            creating_started: None,
             tick: 0,
         }
     }
@@ -237,6 +242,7 @@ impl CreateScreen {
     /// Caller invoked after Confirmed — moves to the spinner step.
     pub fn start_creating(&mut self) {
         self.step = CreateStep::Creating;
+        self.creating_started = Some(Instant::now());
         // The Confirm + NavigateConfirm steps rendered the new-branch
         // form behind their modal; drop it now that we're moving on to
         // the spinner.
@@ -730,7 +736,10 @@ impl CreateScreen {
                 let terminal_rows = (self.terminal_log.len() as u16 + 2).clamp(5, 20);
                 3 + terminal_rows
             }
-            CreateStep::RunningCommands => 4 + (self.post_create_commands.len() as u16).min(10),
+            CreateStep::RunningCommands => {
+                let steps = self.command_steps();
+                self.commands_page(&steps).content_height()
+            }
             // Success layout = 3 (status banner) + 2 (worktree path + spacer)
             // + table (2 chrome rows + N data rows, capped) + 1 (footer hint).
             CreateStep::Success => {
@@ -745,10 +754,37 @@ impl CreateScreen {
         }
     }
 
+    fn command_steps(&self) -> Vec<LoadingStep> {
+        self.post_create_commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| {
+                let status = if self.failed_commands.contains(command) {
+                    StepStatus::Failed
+                } else if self.completed_commands.contains(command)
+                    || index < self.current_command_index
+                {
+                    StepStatus::Done
+                } else if index == self.current_command_index {
+                    StepStatus::Running
+                } else {
+                    StepStatus::Pending
+                };
+                LoadingStep::new(command.clone(), status)
+            })
+            .collect()
+    }
+
+    fn commands_page<'a>(&self, steps: &'a [LoadingStep]) -> LoadingPage<'a> {
+        LoadingPage::new(LOADING_POST_CREATE_COMMANDS)
+            .tick(self.tick)
+            .steps(steps)
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         if self.loading {
-            StatusIndicator::new(Status::Loading, LOADING_BRANCHES)
-                .with_tick(self.tick)
+            LoadingPage::new(LOADING_BRANCHES)
+                .tick(self.tick)
                 .render(frame, area);
             return;
         }
@@ -814,9 +850,12 @@ impl CreateScreen {
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(3), Constraint::Min(3)])
                     .split(area);
-                StatusIndicator::new(Status::Loading, CREATE_CREATING)
-                    .with_tick(self.tick)
-                    .render(frame, chunks[0]);
+                let page = LoadingPage::new(CREATE_CREATING).tick(self.tick);
+                match self.creating_started {
+                    Some(started) => page.elapsed(started.elapsed()),
+                    None => page,
+                }
+                .render(frame, chunks[0]);
                 render_terminal_activity(
                     &self.terminal_log,
                     self.terminal_scroll,
@@ -825,11 +864,8 @@ impl CreateScreen {
                 );
             }
             CreateStep::RunningCommands => {
-                CommandListProgress::new(&self.post_create_commands, self.current_command_index)
-                    .with_completed(&self.completed_commands)
-                    .with_failed(&self.failed_commands)
-                    .with_tick(self.tick)
-                    .render(frame, area);
+                let steps = self.command_steps();
+                self.commands_page(&steps).render(frame, area);
             }
             CreateStep::Success => {
                 let chunks = Layout::default()

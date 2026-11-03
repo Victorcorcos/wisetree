@@ -476,7 +476,7 @@ fn bulk_deleting_renders_progress() {
     s.start_deleting();
     let dumped = dump(80, 7, |f| s.render(f, f.area()));
     assert!(dumped.contains("Deleting 2 worktrees"));
-    assert!(dumped.contains("0/2 · 0%"));
+    assert!(dumped.contains("0/2    0%"));
     assert!(dumped.contains("repo-feat [feat]"));
 }
 
@@ -582,13 +582,17 @@ fn bulk_progress_shows_outcomes_bar_icons_and_tally() {
     screen.bulk_record_progress(deleted(true), None);
     screen.bulk_record_progress(deleted(false), Some("branch could not be deleted".into()));
     let rendered = dump(100, 10, |f| screen.render(f, f.area()));
-    assert!(rendered.contains("Deleting 5 worktrees · 00:00"));
-    assert!(rendered.contains("████████████░░░░░░░░░░░░░░░░░░░░  2/5 · 40%"));
-    assert!(rendered.contains("✓ task-0 [branch-0] · branch deleted"));
-    assert!(rendered.contains("✓ task-1 [branch-1] · branch could not be deleted"));
+    assert!(rendered.contains("Deleting 5 worktrees"));
+    assert!(rendered.contains("0:00"));
+    assert!(rendered.contains('━'));
+    assert!(rendered.contains("2/5   40%"));
+    assert!(rendered.contains("✓ task-0 [branch-0]"));
+    assert!(rendered.contains("branch deleted"));
+    assert!(rendered.contains("! task-1 [branch-1]"));
+    assert!(rendered.contains("branch could not be deleted"));
     assert!(rendered.contains("⠋ task-2 [branch-2]"));
     assert!(rendered.contains("○ task-3 [branch-3]"));
-    assert!(rendered.contains("2 deleted · 1 warning · 3 remaining"));
+    assert!(rendered.contains("2 deleted  ·  1 warning  ·  3 remaining"));
     screen.bulk_record_progress(deleted(false), None);
     let rendered = dump(100, 10, |f| screen.render(f, f.area()));
     assert!(rendered.contains("branch kept"));
@@ -620,8 +624,8 @@ fn global_single_and_bulk_progress_keep_repository_labels() {
         let rendered = dump(90, 6, |f| screen.render(f, f.area()));
         assert!(rendered.contains("Deleting 1 worktree"));
         assert!(rendered.contains("owner/repo: feature [feature]"));
-        assert!(rendered.contains("0/1 · 0%"));
-        assert!(rendered.contains("0 deleted · 0 warnings · 1 remaining"));
+        assert!(rendered.contains("0/1    0%"));
+        assert!(rendered.contains("0 deleted  ·  0 warnings  ·  1 remaining"));
     }
 }
 
@@ -632,11 +636,13 @@ fn failure_progress_shows_failed_and_skipped_rows_and_dismisses_on_key() {
     screen.set_error("permission denied (1 deleted successfully before failure)".into());
     let rendered = dump(120, 10, |f| screen.render(f, f.area()));
     assert!(rendered.contains("✓ task-0"));
-    assert!(rendered.contains("✗ task-1 [branch-1] · permission denied"));
-    assert!(rendered.contains("○ task-2 [branch-2] · skipped"));
+    assert!(rendered.contains("✗ task-1 [branch-1]"));
+    assert!(rendered.contains("permission denied"));
+    assert!(rendered.contains("– task-2 [branch-2]"));
+    assert!(rendered.contains("skipped"));
     assert!(rendered.contains("(1 deleted successfully before failure)"));
     assert!(rendered.contains("Press any key"));
-    assert!(rendered.contains("1 deleted · 0 warnings · 0 remaining"));
+    assert!(rendered.contains("1 deleted  ·  0 warnings  ·  0 remaining"));
     screen.handle_key(key(KeyCode::Char('x')));
     assert!(screen.error().is_none());
 }
@@ -652,7 +658,7 @@ fn progress_scrolls_to_current_row_and_handles_tiny_areas() {
     assert!(rendered.contains("↑ 9 more"));
     assert!(rendered.contains("⠋ task-10 [branch-10]"));
     assert!(rendered.contains("↓ 8 more"));
-    assert_eq!(initial_height, 23);
+    assert_eq!(initial_height, 18);
     for width in 0..4 {
         for height in 0..6 {
             dump(width, height, |f| screen.render(f, f.area()));
@@ -684,5 +690,5 @@ fn unmerged_confirmation_resumes_same_row_without_extra_completion() {
     assert_eq!(screen.bulk_progress(), Some((1, 3)));
     let rendered = dump(100, 8, |f| screen.render(f, f.area()));
     assert!(rendered.contains("⠋ task-1 [branch-1]"));
-    assert!(rendered.contains("1/3 · 33%"));
+    assert!(rendered.contains("1/3   33%"));
 }

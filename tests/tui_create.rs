@@ -365,7 +365,8 @@ fn start_creating_then_running_then_complete_renders_each_step() {
     s.start_running_commands(vec!["bun install".into(), "bun build".into()]);
     s.post_create_progress("bun install", 0);
     let dumped = dump(60, 8, |f| s.render(f, f.area()));
-    assert!(dumped.contains("Running post-create commands (0/2)"));
+    assert!(dumped.contains("Running post-create commands"));
+    assert!(dumped.contains("0/2"));
     assert!(dumped.contains("bun install"));
 
     s.post_create_progress("bun build", 1);

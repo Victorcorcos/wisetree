@@ -8,9 +8,9 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 use wisetree::tui::widgets::{
-    BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome, CommandListProgress,
-    CommandProgress, InputOutcome, InputPrompt, SelectOption, SelectOutcome, SelectPrompt, Spinner,
-    Status, StatusIndicator, SPINNER_FRAMES,
+    BulkConfirmDialog, BulkConfirmFocus, BulkConfirmItem, BulkConfirmOutcome, CommandProgress,
+    InputOutcome, InputPrompt, LoadingPage, LoadingStep, SelectOption, SelectOutcome, SelectPrompt,
+    Spinner, Status, StatusIndicator, StepStatus, SPINNER_FRAMES,
 };
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -446,7 +446,7 @@ fn select_render_uses_arrow_cursor_symbol() {
     assert!(dumped.contains("➤"));
 }
 
-// -- Spinner / Status / CommandListProgress / CommandProgress ----------------
+// -- Spinner / Status / LoadingPage / CommandProgress -------------------------
 
 #[test]
 fn spinner_advances_through_all_frames() {
@@ -485,27 +485,30 @@ fn status_indicator_success_uses_label_token() {
 }
 
 #[test]
-fn command_list_progress_renders_per_row_status() {
-    let cmds: Vec<String> = vec!["bun install".into(), "bun test".into(), "bun build".into()];
-    let dumped = dump(60, 8, |f| {
-        CommandListProgress::new(&cmds, 1).render(f, f.area())
-    });
-    assert!(dumped.contains("Running post-create commands (1/3)"));
-    assert!(dumped.contains("bun install"));
-    assert!(dumped.contains("✓"));
-    assert!(dumped.contains("○"));
+fn loading_page_renders_per_row_status() {
+    let steps = vec![
+        LoadingStep::new("bun install", StepStatus::Done),
+        LoadingStep::new("bun test", StepStatus::Running),
+        LoadingStep::new("bun build", StepStatus::Pending),
+    ];
+    let page = LoadingPage::new("Running post-create commands").steps(&steps);
+    let dumped = dump(60, 8, |f| page.render(f, f.area()));
+    assert!(dumped.contains("Running post-create commands"));
+    assert!(dumped.contains("1/3"));
+    assert!(dumped.contains("✓ bun install"));
+    assert!(dumped.contains("○ bun build"));
 }
 
 #[test]
-fn command_list_progress_marks_failed_rows() {
-    let cmds: Vec<String> = vec!["a".into(), "b".into()];
-    let failed = vec!["a".to_string()];
-    let dumped = dump(60, 6, |f| {
-        CommandListProgress::new(&cmds, 1)
-            .with_failed(&failed)
-            .render(f, f.area())
-    });
-    assert!(dumped.contains("✗"));
+fn loading_page_marks_failed_rows() {
+    let steps = vec![
+        LoadingStep::new("a", StepStatus::Failed).note("exit 1"),
+        LoadingStep::new("b", StepStatus::Running),
+    ];
+    let page = LoadingPage::new("Running post-create commands").steps(&steps);
+    let dumped = dump(60, 6, |f| page.render(f, f.area()));
+    assert!(dumped.contains("✗ a"));
+    assert!(dumped.contains("exit 1"));
 }
 
 #[test]
